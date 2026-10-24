@@ -110,8 +110,10 @@ bin/README.md, bin/CLAUDE.md
   The four flows:
   1. `connect_engine` succeeds.
   2. `open_sequence_file` succeeds on `DemoTestsequenz.seq`.
-  3. `load_module_prototype` with `isolate:true` on a non-LabVIEW step returns
-     `prototypeLoaded: true` with `executionMode: "worker"`. This proves the worker re-launch works.
+  3. `load_module_prototype` with `isolate:true` on a LabVIEW step whose VI does not exist returns
+     `executionMode: "worker"` and `workerOutcome: "not-loaded"`, with the worker's own note (not
+     `crashed`, `timeout` or a launch failure). `isolate` applies only to LabVIEW steps. This proves
+     the worker relaunched from `Environment.ProcessPath`, started its own engine and reported back.
      `.lvlibp` panes are not covered.
   4. An execution started with `start_execution` reaches `Done`.
 
