@@ -853,7 +853,7 @@ Feature: Only well-formed, CI-built releases go live
 ### Slice 7: GitHub Actions — PR check and release
 
 **Depends-on:** 5, 6, 9
-**Files:** `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `build/Invoke-ScriptTests.ps1`
+**Files:** `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `build/Invoke-ScriptTests.ps1`, `build/tests/ScriptTestRunner.Tests.ps1`, `build/tests/Workflows.Tests.ps1`, and (verifier changes the workflows need) `build/Assert-PublishedRelease.ps1`, `build/ReleaseAssets.psm1`, `build/ReleaseVerdict.psm1`, `build/tests/ReleaseAssets.Tests.ps1`
 
 **Behavior:**
 
@@ -892,12 +892,12 @@ Feature: Workflows run the same scripts a maintainer runs
 
 **Complexity**: standard
 **IMPLEMENT**:
-- `Invoke-ScriptTests.ps1` runs every `build/tests/*.Tests.ps1`, `Test-SkillSources.ps1` and `py -m unittest .github/stats/test_collect.py`. Each PowerShell test runs under `powershell.exe` and `pwsh`.
-- `ci.yml` triggers on `pull_request` and `push` to `main`, on windows-latest. Its steps: setup-dotnet 8, setup-python 3.12, `dotnet test --filter Category=EngineFree`, `Invoke-ScriptTests.ps1`, `Build-PluginArchive.ps1 -Version 0.0.0-ci`, then `upload-artifact`.
-- `permissions: contents: read`.
-**TEST**: `actionlint` locally. Open the PR, then confirm a green run and an artifact holding the zip.
+- `Invoke-ScriptTests.ps1` runs every `build/tests/*.Tests.ps1` and `Test-SkillSources.ps1`. Each PowerShell script runs under `powershell.exe` and `pwsh`; one that declares `#Requires -Version 7` runs under `pwsh` only. A missing `pwsh` is a visible SKIP locally and a failure when `TESTSTAND_MCP_REQUIRE_PWSH=1` (the CI step sets it). The Python stats tests are a step of `ci.yml` itself: `python -m unittest discover -s .github/stats`.
+- `ci.yml` triggers on `pull_request` and `push` to `main`, on windows-latest. Its steps: setup-dotnet 8, setup-python 3.12, `dotnet test --filter Category=EngineFree` (built AnyCPU, so no x86 runtime is needed), `Invoke-ScriptTests.ps1`, the stats tests, `Build-PluginArchive.ps1 -Version 0.0.0-ci` into a clean `-OutDir`, then `upload-artifact` with the four assets.
+- `permissions: contents: read`. The engine-free tests and the packaging smoke tests need no TestStand (they never connect the engine); the first run on a runner is where that is proved.
+**TEST**: `ScriptTestRunner.Tests.ps1` runs the runner against fixture scripts (pass, fail, timeout, `#Requires`, pwsh missing with and without the require variable, default discovery). `Workflows.Tests.ps1` pins the contract of every workflow as text, because `actionlint` is not installed and is not downloaded: SHA pins with a version comment, no `${{` inside a `run:` block, permissions and a timeout per job, and for `ci.yml` the triggers, read-only token, step order and artifact. A mutation pass over a broken copy of `ci.yml` shows each rule fails when broken. **The fork rehearsal is where these workflows first run for real** (see "Fork rehearsal before PR A"); until then neither text tests nor a local run can prove that GitHub accepts them.
 **REFACTOR**: Workflow-level env for the shared values.
-**Files**: `build/Invoke-ScriptTests.ps1`, `.github/workflows/ci.yml`
+**Files**: `build/Invoke-ScriptTests.ps1`, `build/tests/ScriptTestRunner.Tests.ps1`, `build/tests/Workflows.Tests.ps1`, `.github/workflows/ci.yml`
 **Commit**: `ci: run unit tests, script tests and packaging on every PR`
 
 #### Step 7.2: release.yml
@@ -1318,8 +1318,8 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
 - Verifier wording: the Fix line says "delete the draft first" even when the release is already published (seen on the live `v1.8.6` check). Word it by `release.draft` when slice 7 touches the verifier.
 - Slice 11 README: auto-allowed reads of a .seq inside the project still run its SequenceFileLoad callback; open only files you trust
 - Slice 7: `release.yml` uploads an artifact named exactly `own-downloads` holding `own-downloads.json` (AC-18 schema, at most 1 MiB) with `if: always()`; its `run_id` is `"${{ github.run_id }}"` as a string. Only runs of `.github/workflows/release.yml` in this repository, started by `push` or `workflow_dispatch`, are accepted by the collector.
-- Slice 7: `ci.yml` runs `python -m unittest discover -s .github/stats` from the repository root, and `actionlint` covers `pages.yml` too.
-- Slice 7: a pre-release build (`-Version 0.0.0-ci`) names its versioned copy after the numeric core: `teststand-mcp-v0.0.0.zip` (the verifier and the tag format know only `X.Y.Z`). The PR check must verify with that name; use a clean `-OutDir`, because assets of another version are not removed.
+- Slice 7: `ci.yml` runs `python -m unittest discover -s .github/stats` from the repository root, and `actionlint` covers `pages.yml` too. (Done in slice 7, step 7.1: `actionlint` is not installed and is not downloaded, so `Workflows.Tests.ps1` pins the shared rules for all three workflows, `pages.yml` included.)
+- Slice 7: a pre-release build (`-Version 0.0.0-ci`) names its versioned copy after the numeric core: `teststand-mcp-v0.0.0.zip` (the verifier and the tag format know only `X.Y.Z`). The PR check must verify with that name; use a clean `-OutDir`, because assets of another version are not removed. (Done in slice 7, step 7.1: `ci.yml` packages into `artifacts/ci` of a fresh checkout.)
 
 ### Fork rehearsal before PR A (added 2026-10-24 at the user's request)
 
