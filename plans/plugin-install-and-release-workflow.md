@@ -1293,10 +1293,10 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
   - [x] Step 9.2: build.py and pages.yml
 
 #### Wave 3
-- [ ] Slice 5: Packaging script
-  - [ ] Step 5.1: Source checks and publish
-  - [ ] Step 5.2: Stage, convert, resolve, stamp, assert
-  - [ ] Step 5.3: Smoke tests, zip, digests, local verify
+- [x] Slice 5: Packaging script
+  - [x] Step 5.1: Source checks and publish
+  - [x] Step 5.2: Stage, convert, resolve, stamp, assert
+  - [x] Step 5.3: Smoke tests, zip, digests, local verify
 
 #### Wave 4
 - [ ] Slice 7: GitHub Actions — PR check and release
@@ -1320,3 +1320,15 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
 - Slice 7: `release.yml` uploads an artifact named exactly `own-downloads` holding `own-downloads.json` (AC-18 schema, at most 1 MiB) with `if: always()`; its `run_id` is `"${{ github.run_id }}"` as a string. Only runs of `.github/workflows/release.yml` in this repository, started by `push` or `workflow_dispatch`, are accepted by the collector.
 - Slice 7: `ci.yml` runs `python -m unittest discover -s .github/stats` from the repository root, and `actionlint` covers `pages.yml` too.
 - Slice 7: a pre-release build (`-Version 0.0.0-ci`) names its versioned copy after the numeric core: `teststand-mcp-v0.0.0.zip` (the verifier and the tag format know only `X.Y.Z`). The PR check must verify with that name; use a clean `-OutDir`, because assets of another version are not removed.
+
+### Fork rehearsal before PR A (added 2026-10-24 at the user's request)
+
+The user does not want the real repository to carry an unusable release, so the post-merge dry runs move before PR A and run in a throw-away public fork on this station:
+
+1. The maintainer creates the fork and enables Actions in it (Pages optional).
+2. A fork-only commit, never merged, points `marketplace.json`, `plugin.json` `repository` and the release-repo constant at the fork.
+3. Push `v1.9.0` in the fork: the release workflow builds, verifies and publishes.
+4. In an isolated `CLAUDE_CONFIG_DIR` profile, add the fork's marketplace, install the plugin and run the AC-10 checks (server start, tools, hooks, skill, agents). The dev registration stays untouched.
+5. Publish `v1.9.1` in the fork: the update notice, then the auto-update (AC-12, AC-13).
+6. Run `pages.yml` by hand in the fork (Pages optional).
+7. Every failure is fixed on this branch and the fork rerun until all of it passes. Only then is PR A opened against the real repository.
