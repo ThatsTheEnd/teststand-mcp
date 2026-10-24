@@ -1233,9 +1233,9 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
 - [x] Slice 3: Rules skill as the single source of user-facing rules
   - [x] Step 3.1: Write the skill and its source check
   - [x] Step 3.2: CLAUDE.md imports the skill
-- [ ] Slice 6: Release assets, tag gate and release verifier
-  - [ ] Step 6.1: ReleaseAssets module and tag gate
-  - [ ] Step 6.2: Release verifier
+- [x] Slice 6: Release assets, tag gate and release verifier
+  - [x] Step 6.1: ReleaseAssets module and tag gate
+  - [x] Step 6.2: Release verifier
 
 #### Wave 2
 - [ ] Slice 4: Plugin hooks
@@ -1265,3 +1265,9 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
 #### Wave 6
 - [ ] Slice 11: README Quickstart (PR B, after the first release)
   - [ ] Step 11.1: README
+
+### Carry-overs into later slices
+
+- Slice 7: publish by the verifier's `release_id` output, and pass the verified archive digest to the final `-Latest` check. Without it, `-Latest` passes while `releases/latest` still points at the previous release (both old files agree).
+- Slice 7: a rehearsal tag (`v<X.Y.Z>-rehearsal`) gives the gate's plain `version` output, so its versioned archive is named `teststand-mcp-vX.Y.Z.zip`.
+- Verifier wording: the Fix line says "delete the draft first" even when the release is already published (seen on the live `v1.8.6` check). Word it by `release.draft` when slice 7 touches the verifier.

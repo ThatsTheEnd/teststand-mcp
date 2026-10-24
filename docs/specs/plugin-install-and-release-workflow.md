@@ -314,10 +314,12 @@ bin/README.md, bin/CLAUDE.md
   Every download a workflow makes is recorded per asset and per date in one run artifact: each
   verify attempt, the retry, and the final public fetch. The collector subtracts those counts per
   asset and per date, clamped at zero. A test on the shared fixture checks that the subtracted value
-  equals the recorded count. Every draft-phase download is recorded with `"draft": true`. Whether
+  equals the recorded count. The record is
+  `{ "run_id", "counts": { "<YYYY-MM-DD>": { "<asset>": { "draft": n, "published": m } } } }`, so
+  each download carries its own date and phase. Whether
   downloads of a *draft* raise `download_count` is measured on the first release, and the
-  collector has a switch for both outcomes. If they count, draft records are subtracted like any
-  other. If they do not, records with `"draft": true` are excluded from the subtraction. The
+  collector has a switch for both outcomes. If they count, the `draft` counts are subtracted with
+  the `published` ones. If they do not, only the `published` counts are subtracted. The
   measured outcome sets the switch's committed default, and the fixture test covers both settings. Repository traffic is
   included only when the optional `STATS_TRAFFIC_TOKEN` secret exists, and the page says so in
   visible text when it does not. The chart has an accessible title and description, a visible data
