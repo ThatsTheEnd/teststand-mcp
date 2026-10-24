@@ -4,7 +4,7 @@
       "command": "${CLAUDE_PLUGIN_ROOT}/bin/TestStandMCP.exe",
       "args": [],
       "env": {
-        "TESTSTAND_MCP_TestStand__EnvironmentPath": "${user_config.tsenv_path}"
+        "TESTSTAND_MCP_TestStand__PluginEnvironmentPath": "${user_config.tsenv_path}"
       }
     }
   }

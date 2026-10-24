@@ -1,9 +1,12 @@
 # ============================================================================
-#  PluginIdentity.psm1 - the plugin's name, server key and tool prefix
+#  PluginIdentity.psm1 - two responsibilities that share one source of truth:
+#    1. the plugin identity: name, server key and tool prefixes, READ from
+#       plugin/.claude-plugin/plugin.json and plugin/.mcp.json;
+#    2. agent flavour conversion: source agents (direct tool prefix, CLAUDE.md)
+#       <-> plugin agents (plugin tool prefix, rules skill), driven by that identity.
+#  Nothing else in the repository retypes the tool prefix.
 #  Compatible with Windows PowerShell 5.1 and PowerShell 7.
-#  The identity is READ from plugin/.claude-plugin/plugin.json and
-#  plugin/.mcp.json; nothing else in the repository retypes the tool prefix.
-#  Files are read and written with explicit .NET UTF-8 (no BOM) APIs: never
+#  Files are read with explicit .NET UTF-8 (no BOM added or dropped) APIs: never
 #  use Get-Content / Set-Content -Encoding UTF8 here (5.1 writes a BOM).
 # ============================================================================
 Set-StrictMode -Version 2.0
@@ -18,6 +21,9 @@ $script:DirectToolPrefixFormat = 'mcp__{0}__'
 
 $script:StrictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
 
+# ----------------------------------------------------------------------------
+#  File and JSON reading
+# ----------------------------------------------------------------------------
 function Read-Utf8Text {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "File not found: $Path" }
@@ -25,6 +31,28 @@ function Read-Utf8Text {
     return $script:StrictUtf8.GetString([IO.File]::ReadAllBytes($Path))
 }
 
+function Read-JsonFile {
+    param([Parameter(Mandatory)][string]$Path)
+    $text = Read-Utf8Text $Path
+    try {
+        return ($text | ConvertFrom-Json)
+    } catch {
+        throw "Invalid JSON in ${Path}: $($_.Exception.Message)"
+    }
+}
+
+# Under Set-StrictMode a missing property throws a terse engine error, so look it up explicitly.
+function Get-JsonProperty {
+    param($Object, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Object) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+# ----------------------------------------------------------------------------
+#  Plugin identity
+# ----------------------------------------------------------------------------
 function Get-PluginIdentity {
     [CmdletBinding()]
     param(
@@ -32,20 +60,20 @@ function Get-PluginIdentity {
         [string]$McpJsonPath = $script:DefaultMcpJsonPath
     )
 
-    $pluginJson = Read-Utf8Text $PluginJsonPath | ConvertFrom-Json
-    $pluginName = $pluginJson.name
-    if ([string]::IsNullOrWhiteSpace($pluginName)) { throw "No plugin name in $PluginJsonPath" }
+    $pluginName = Get-JsonProperty (Read-JsonFile $PluginJsonPath) 'name'
+    if ([string]::IsNullOrWhiteSpace($pluginName)) { throw "No plugin name ('name') in $PluginJsonPath" }
 
-    $mcpJson = Read-Utf8Text $McpJsonPath | ConvertFrom-Json
-    $serverKeys = @($mcpJson.mcpServers.PSObject.Properties.Name)
+    $servers = Get-JsonProperty (Read-JsonFile $McpJsonPath) 'mcpServers'
+    if ($null -eq $servers) { throw "No 'mcpServers' object in $McpJsonPath" }
+    $serverKeys = @($servers.PSObject.Properties | ForEach-Object { $_.Name })
     if ($serverKeys.Count -ne 1) { throw "Expected exactly one MCP server in $McpJsonPath but found $($serverKeys.Count)" }
     $serverKey = $serverKeys[0]
 
     return [pscustomobject]@{
-        name         = $pluginName
-        serverKey    = $serverKey
-        toolPrefix   = ($script:PluginToolPrefixFormat -f $pluginName, $serverKey)
-        directPrefix = ($script:DirectToolPrefixFormat -f $serverKey)
+        name             = $pluginName
+        serverKey        = $serverKey
+        pluginToolPrefix = ($script:PluginToolPrefixFormat -f $pluginName, $serverKey)
+        directToolPrefix = ($script:DirectToolPrefixFormat -f $serverKey)
     }
 }
 
@@ -58,13 +86,14 @@ $script:RulesFileReference = 'CLAUDE.md'
 $script:RulesSkillName = 'teststand-rules'
 $script:RulesSkillReference = "the $($script:RulesSkillName) skill"   # exact, so the round trip is byte-identical
 
-$script:FrontmatterPattern = '(?s)\A---\r?\n(.*?)\r?\n---'
+# An optional BOM (U+FEFF) may precede the opening fence; it stays in the text untouched.
+$script:FrontmatterPattern = '(?s)\A' + [regex]::Escape([string][char]0xFEFF) + '?---\r?\n(.*?)\r?\n---'
 $script:ToolsLinePattern = '(?m)^tools:'
 
-function Get-AgentMappings {
+function Get-AgentMappingTable {
     param([Parameter(Mandatory)]$Identity)
     return @(
-        [pscustomobject]@{ Direct = $Identity.directPrefix; Plugin = $Identity.toolPrefix }
+        [pscustomobject]@{ Direct = $Identity.directToolPrefix; Plugin = $Identity.pluginToolPrefix }
         [pscustomobject]@{ Direct = $script:RulesFileReference; Plugin = $script:RulesSkillReference }
     )
 }
@@ -78,28 +107,28 @@ function Assert-HasToolsLine {
 }
 
 function Assert-ContainsNone {
-    param([string]$Text, [string[]]$Needles, [string]$Path, [string]$Reason)
-    foreach ($needle in $Needles) {
-        if ($Text.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-            throw "Agent contains '$needle' ($Reason): $Path"
+    param([string]$Text, [string[]]$Terms, [string]$Path, [string]$Reason)
+    foreach ($term in $Terms) {
+        if ($Text.IndexOf($term, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            throw "Agent contains '$term' ($Reason): $Path"
         }
     }
 }
 
+# $Terms: objects with From (what to find) and To (what to put there).
 function Convert-AgentText {
     param(
-        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string[]]$FromTerms,
-        [Parameter(Mandatory)][string[]]$ToTerms
+        [Parameter(Mandatory)]$Terms
     )
     # The target terms must be absent first, or the reverse conversion could not restore the source.
-    Assert-ContainsNone $Text $ToTerms $Path 'already in the target flavour, so the conversion would not round trip'
-    for ($index = 0; $index -lt $FromTerms.Count; $index++) {
-        $Text = $Text.Replace($FromTerms[$index], $ToTerms[$index])
+    Assert-ContainsNone $Text @($Terms | ForEach-Object { $_.To }) $Path 'already in the target flavour, so the conversion does not round trip'
+    foreach ($term in $Terms) {
+        $Text = $Text.Replace($term.From, $term.To)
     }
     # Only the exact spelling is mapped; any other case variant would survive, so refuse it.
-    Assert-ContainsNone $Text $FromTerms $Path 'in a spelling the mapping does not cover'
+    Assert-ContainsNone $Text @($Terms | ForEach-Object { $_.From }) $Path 'in a spelling the mapping does not cover'
     return $Text
 }
 
@@ -110,16 +139,16 @@ function Invoke-AgentConversion {
         $Identity
     )
     if ($null -eq $Identity) { $Identity = Get-PluginIdentity }
-    $mappings = Get-AgentMappings $Identity
-    $directTerms = @($mappings | ForEach-Object { $_.Direct })
-    $pluginTerms = @($mappings | ForEach-Object { $_.Plugin })
     $text = Read-Utf8Text $Path
+    if ($text.Length -eq 0) { throw "Agent file is empty: $Path" }
 
-    if ($Direction -eq 'ToPlugin') {
-        Assert-HasToolsLine $text $Path
-        return Convert-AgentText -Text $text -Path $Path -FromTerms $directTerms -ToTerms $pluginTerms
-    }
-    return Convert-AgentText -Text $text -Path $Path -FromTerms $pluginTerms -ToTerms $directTerms
+    $toPlugin = ($Direction -eq 'ToPlugin')
+    if ($toPlugin) { Assert-HasToolsLine $text $Path }
+    $terms = @(Get-AgentMappingTable $Identity | ForEach-Object {
+        if ($toPlugin) { [pscustomobject]@{ From = $_.Direct; To = $_.Plugin } }
+        else           { [pscustomobject]@{ From = $_.Plugin; To = $_.Direct } }
+    })
+    return Convert-AgentText -Text $text -Path $Path -Terms $terms
 }
 
 function ConvertTo-PluginAgent {
