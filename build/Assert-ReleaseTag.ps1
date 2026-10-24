@@ -7,29 +7,32 @@
 #  Run:  powershell.exe -NoProfile -ExecutionPolicy Bypass -File build\Assert-ReleaseTag.ps1 -Tag v1.9.0
 #  In CI pass the tag through the environment, never inline: tag names are user input.
 #    -Tag $env:TAG
+#  -Rehearsal also accepts v<X.Y.Z>-rehearsal (the dry-run tag); it adds "rehearsal=true" to the
+#  output, and "version" is still the plain X.Y.Z.
 #  -Commit is the commit the retag commands point at (default: GITHUB_SHA when set).
 #  Windows PowerShell 5.1 and PowerShell 7 compatible.
 # ============================================================================
 param(
     [AllowNull()][AllowEmptyString()][string]$Tag = '',
-    [string]$Commit = $env:GITHUB_SHA
+    [string]$Commit = $env:GITHUB_SHA,
+    [switch]$Rehearsal
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+Import-Module (Join-Path $PSScriptRoot 'BuildCommon.psm1') -Force
 try {
     Import-Module (Join-Path $PSScriptRoot 'ReleaseAssets.psm1') -Force
 
-    $result = ConvertFrom-ReleaseTag -Tag $Tag
-    if (-not $result.Valid) {
+    $result = ConvertFrom-ReleaseTag -Tag $Tag -AllowRehearsal:$Rehearsal
+    if (-not $result.IsValid) {
         $failure = Get-TagRejection -Result $result -Commit $Commit
         Write-BuildFailure @failure
     }
 
-    if ($env:GITHUB_OUTPUT) {
-        # No BOM: the runner would read it as part of the first key.
-        [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$($result.Version)`ntag=$($result.Tag)`n", (New-Object System.Text.UTF8Encoding($false)))
-    }
+    Add-GitHubOutput -Name 'version' -Value $result.Version
+    Add-GitHubOutput -Name 'tag' -Value $result.Tag
+    if ($result.IsRehearsal) { Add-GitHubOutput -Name 'rehearsal' -Value 'true' }
     Write-Host "Tag $($result.Tag) is valid: version $($result.Version)"
     exit 0
 } catch {

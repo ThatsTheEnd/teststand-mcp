@@ -128,9 +128,10 @@ if ($DefinitionsOnly) { return }
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
+Import-Module (Join-Path $PSScriptRoot 'BuildCommon.psm1')   # Read-Utf8Text: strict UTF-8, BOM kept
+
 if (-not $SkillRoot) { $SkillRoot = Join-Path $RepoRoot 'plugin\skills\teststand-rules' }
 $ClaudeMdPath = Join-Path $RepoRoot 'CLAUDE.md'
-$StrictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
 $FrontmatterPattern = '^' + [regex]::Escape($Bom) + '?---\r?\n(.*?)\r?\n---\r?\n'
 
 # ----------------------------------------------------------------------------
@@ -152,7 +153,7 @@ function Write-Result {
 function Get-FileText {
     param([string]$Path)
     if (-not $script:TextCache.ContainsKey($Path)) {
-        $text = $StrictUtf8.GetString([IO.File]::ReadAllBytes($Path))
+        $text = Read-Utf8Text $Path
         # Ordinal on purpose: a culture-sensitive StartsWith treats U+FEFF as ignorable and is true for every string.
         if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
         $script:TextCache[$Path] = $text

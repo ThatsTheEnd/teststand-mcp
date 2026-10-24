@@ -154,6 +154,27 @@ try {
         Assert-Throws { Get-PluginIdentity @files } 'absent.mcp.json' 'File not found'
     }
 
+    # Configuration errors are build failures with the three parts: What / Why / Fix.
+    Invoke-Case 'identity: every configuration error carries a What, a Why and a Fix' {
+        $absent = Join-Path (New-TempDir) 'absent.json'
+        $cases = @{
+            'no plugin name'      = (New-IdentityFiles '{"version":"1.0.0"}' '{"mcpServers":{"srv":{}}}')
+            'no mcpServers'       = (New-IdentityFiles '{"name":"p"}' '{}')
+            'two servers'         = (New-IdentityFiles '{"name":"p"}' '{"mcpServers":{"a":{},"b":{}}}')
+            'invalid JSON'        = (New-IdentityFiles '{ not json' '{"mcpServers":{"srv":{}}}')
+            'missing file'        = @{ PluginJsonPath = $absent; McpJsonPath = $absent }
+        }
+        foreach ($name in $cases.Keys) {
+            $files = $cases[$name]
+            $message = $null
+            try { [void](Get-PluginIdentity @files) } catch { $message = $_.Exception.Message }
+            Assert-True ($null -ne $message) "$name : expected a failure"
+            foreach ($label in @('What', 'Why', 'Fix')) {
+                Assert-True ($message -cmatch "(?m)^${label}: +\S") "$name : no '${label}:' line with content. Message was:`n$message"
+            }
+        }
+    }
+
     # --- Scenario: The marketplace points at the fixed latest URL -------------
     Invoke-Case 'marketplace: one plugin teststand-mcp with the fixed latest archive URL' {
         $marketplace = Read-JsonFile $MarketplacePath

@@ -719,7 +719,7 @@ Feature: One script produces the plugin archive
 ### Slice 6: Release assets, tag gate and release verifier
 
 **Depends-on:** none
-**Files:** `build/ReleaseAssets.psm1`, `build/Assert-ReleaseTag.ps1`, `build/Assert-PublishedRelease.ps1`, `build/tests/ReleaseAssets.Tests.ps1`, `build/tests/fixtures/own-downloads.json`
+**Files:** `build/BuildCommon.psm1`, `build/ReleaseAssets.psm1`, `build/ReleaseVerdict.psm1`, `build/Assert-ReleaseTag.ps1`, `build/Assert-PublishedRelease.ps1`, `build/tests/ReleaseAssets.Tests.ps1`, `build/tests/fixtures/own-downloads.json`
 
 **Behavior:**
 
@@ -797,19 +797,19 @@ Feature: Only well-formed, CI-built releases go live
 #### Step 6.1: ReleaseAssets module and tag gate
 
 **Complexity**: standard
-**IMPLEMENT**: The module holds the asset-name constants, `ConvertFrom-ReleaseTag`, `New-ArchiveDigest`/`New-ArchiveManifest`, `Test-ArchiveManifest`, and the own-downloads record format (`own-downloads.json`: `{ "run_id", "date": "YYYY-MM-DD", "assets": { "<asset name>": n } }`). `Add-OwnDownload` increments it, and every workflow-side download calls it: each verify attempt including the retry, and the final public fetch. That format is pinned by one committed fixture, `build/tests/fixtures/own-downloads.json`, which the PowerShell tests and `test_collect.py` both read. The module also holds `Write-BuildFailure -What -Why -Fix`, which every `build/*.ps1` uses for its failures. One test runs each script's fault fixtures and asserts that all three parts are present. `Assert-ReleaseTag.ps1` writes `version`/`tag` to `$GITHUB_OUTPUT`.
-**TEST**: `ReleaseAssets.Tests.ps1`: the tag table, the retag-order text, a manifest round trip, and an own-downloads record built from a verify, a retry and a final fetch. That record must count 3 for `teststand-mcp.zip` and must match the shared fixture's shape.
+**IMPLEMENT**: The module holds the asset-name constants, `ConvertFrom-ReleaseTag`, `New-ArchiveDigest`/`New-ArchiveManifest`, `Test-ArchiveManifest`, and the own-downloads record format (`own-downloads.json`: `{ "run_id", "counts": { "<YYYY-MM-DD>": { "<asset name>": { "draft": n, "published": m } } } }`, so each download carries its own date and phase). `Add-OwnDownload -Asset -Phase draft|published` increments the right cell with an atomic write, and every workflow-side download calls it immediately before the request: each verify download including the retry, and the final public fetch (`Assert-PublishedRelease.ps1 -Latest`). That format is pinned by one committed fixture, `build/tests/fixtures/own-downloads.json`, which the PowerShell tests and `test_collect.py` both read. `BuildCommon.psm1` holds `Write-BuildFailure -What -Why -Fix`, which every `build/*.ps1` uses for its failures, plus the shared file, path and step-output helpers. The tag rule exists once (`ConvertFrom-ReleaseTag`, with `-AllowRehearsal` for the dry-run tag). One test runs each script's fault fixtures and asserts that all three parts are present. `Assert-ReleaseTag.ps1` writes `version`/`tag` to `$GITHUB_OUTPUT`.
+**TEST**: `ReleaseAssets.Tests.ps1`: the tag table, the retag-order text, a manifest round trip, and an own-downloads record built from a verify, a retry and a final fetch. That record must equal the shared fixture cell for cell (`teststand-mcp.zip`: 2 draft downloads on the verify date, 1 published on the next day).
 **REFACTOR**: Keep the diagnosis texts in one map.
-**Files**: `build/ReleaseAssets.psm1`, `build/Assert-ReleaseTag.ps1`, `build/tests/ReleaseAssets.Tests.ps1`, `build/tests/fixtures/own-downloads.json`
+**Files**: `build/BuildCommon.psm1`, `build/ReleaseAssets.psm1`, `build/Assert-ReleaseTag.ps1`, `build/tests/ReleaseAssets.Tests.ps1`, `build/tests/fixtures/own-downloads.json`
 **Commit**: `feat: release asset contract and tag gate`
 
 #### Step 6.2: Release verifier
 
 **Complexity**: standard
-**IMPLEMENT**: Parameters `-Repo -Tag -Token` (drafts are readable with the token) or `-LocalDir`. "Fetch" and "judge" are separate functions. Write `own-downloads.json`.
+**IMPLEMENT**: Parameters `-Repo -Tag -Token` (drafts are readable with the token), `-LocalDir` (with `-Tag` or `-Version`) or `-Latest`. "Fetch" (the script) and "judge" (`ReleaseVerdict.psm1`, no network) are separate. Listing faults are judged before any download, the retry fetches only the failed assets, and the verified release id is written as step output. Write `own-downloads.json`.
 **TEST**: `-LocalDir` fixtures for each Outline row, fake release JSON for the uploader, and an injectable fetch for the retry cases. `Invoke-ScriptTests.ps1` never calls the network. The live read-only run against `v1.8.6` is a manual check, recorded in the PR.
 **REFACTOR**: The judge takes plain data, with no network.
-**Files**: `build/Assert-PublishedRelease.ps1`, `build/tests/ReleaseAssets.Tests.ps1`
+**Files**: `build/Assert-PublishedRelease.ps1`, `build/ReleaseVerdict.psm1`, `build/tests/ReleaseAssets.Tests.ps1`
 **Commit**: `feat: verify a release draft as a user would download it`
 
 ### Slice 7: GitHub Actions — PR check and release

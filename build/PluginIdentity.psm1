@@ -11,6 +11,8 @@
 # ============================================================================
 Set-StrictMode -Version 2.0
 
+Import-Module (Join-Path $PSScriptRoot 'BuildCommon.psm1')
+
 $script:RepoRoot = Split-Path -Parent $PSScriptRoot
 $script:DefaultPluginJsonPath = Join-Path $script:RepoRoot 'plugin\.claude-plugin\plugin.json'
 $script:DefaultMcpJsonPath = Join-Path $script:RepoRoot 'plugin\.mcp.json'
@@ -19,35 +21,19 @@ $script:DefaultMcpJsonPath = Join-Path $script:RepoRoot 'plugin\.mcp.json'
 $script:PluginToolPrefixFormat = 'mcp__plugin_{0}_{1}__'
 $script:DirectToolPrefixFormat = 'mcp__{0}__'
 
-$script:StrictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
-
 # ----------------------------------------------------------------------------
-#  File and JSON reading
+#  File and JSON reading (Read-Utf8Text and Get-JsonProperty come from BuildCommon.psm1)
 # ----------------------------------------------------------------------------
-function Read-Utf8Text {
-    param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "File not found: $Path" }
-    # GetString keeps a BOM as U+FEFF instead of dropping it, so a re-write stays byte-identical.
-    return $script:StrictUtf8.GetString([IO.File]::ReadAllBytes($Path))
-}
-
 function Read-JsonFile {
     param([Parameter(Mandatory)][string]$Path)
     $text = Read-Utf8Text $Path
     try {
         return ($text | ConvertFrom-Json)
     } catch {
-        throw "Invalid JSON in ${Path}: $($_.Exception.Message)"
+        Write-BuildFailure -What "Invalid JSON in ${Path}: $($_.Exception.Message)" `
+            -Why 'The plugin identity (name, server key, tool prefix) is read from this file, so nothing can be built without it.' `
+            -Fix 'Fix the JSON syntax of the file.'
     }
-}
-
-# Under Set-StrictMode a missing property throws a terse engine error, so look it up explicitly.
-function Get-JsonProperty {
-    param($Object, [Parameter(Mandatory)][string]$Name)
-    if ($null -eq $Object) { return $null }
-    $property = $Object.PSObject.Properties[$Name]
-    if ($null -eq $property) { return $null }
-    return $property.Value
 }
 
 # ----------------------------------------------------------------------------
@@ -61,12 +47,24 @@ function Get-PluginIdentity {
     )
 
     $pluginName = Get-JsonProperty (Read-JsonFile $PluginJsonPath) 'name'
-    if ([string]::IsNullOrWhiteSpace($pluginName)) { throw "No plugin name ('name') in $PluginJsonPath" }
+    if ([string]::IsNullOrWhiteSpace($pluginName)) {
+        Write-BuildFailure -What "No plugin name ('name') in $PluginJsonPath" `
+            -Why 'The plugin name is part of every tool prefix the agents use (mcp__plugin_<name>_<server>__).' `
+            -Fix "Add a non-empty 'name' to the plugin manifest."
+    }
 
     $servers = Get-JsonProperty (Read-JsonFile $McpJsonPath) 'mcpServers'
-    if ($null -eq $servers) { throw "No 'mcpServers' object in $McpJsonPath" }
+    if ($null -eq $servers) {
+        Write-BuildFailure -What "No 'mcpServers' object in $McpJsonPath" `
+            -Why 'The server key is part of every tool prefix the agents use, and it is read from this object.' `
+            -Fix "Add an 'mcpServers' object with exactly one server."
+    }
     $serverKeys = @($servers.PSObject.Properties | ForEach-Object { $_.Name })
-    if ($serverKeys.Count -ne 1) { throw "Expected exactly one MCP server in $McpJsonPath but found $($serverKeys.Count)" }
+    if ($serverKeys.Count -ne 1) {
+        Write-BuildFailure -What "Expected exactly one MCP server in $McpJsonPath but found $($serverKeys.Count)" `
+            -Why 'The tool prefix is derived from the one server key; with none or several it would be ambiguous.' `
+            -Fix "Keep exactly one entry under 'mcpServers'."
+    }
     $serverKey = $serverKeys[0]
 
     return [pscustomobject]@{
