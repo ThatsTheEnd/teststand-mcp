@@ -1,54 +1,51 @@
 # ============================================================================
 #  Test-SkillSources.ps1 - source check for the teststand-rules skill.
 #  Four groups of checks, each printed as PASS/FAIL; exit code 1 on any FAIL:
-#    A  required rules are present across the skill, and SKILL.md's first
-#       section holds exactly the four never-do rules plus the pointers
+#    A  every required rule is present in a references file, and SKILL.md's
+#       first section holds exactly the never-do rules plus the pointers
 #    B  the developer-only deny-list matches nothing in the skill files
-#    C  no rule is kept twice: moved CLAUDE.md headings stay out of CLAUDE.md
-#       and the other tracked markdown (outside plugin/skills, docs/specs, plans)
-#    D  every @path import line in CLAUDE.md resolves, and the skill files are imported
+#    C  no moved heading remains in CLAUDE.md or the other tracked markdown
+#       (sentence-level duplication is NOT detected here: that is a review
+#       responsibility)
+#    D  CLAUDE.md wraps its skill imports in begin/end markers, every @path
+#       import resolves, and every skill file is imported
 #  Run:  powershell.exe -NoProfile -ExecutionPolicy Bypass -File build\Test-SkillSources.ps1
-#  -RepoRoot / -SkillRoot let the tests point it at fixtures.
+#  -RepoRoot / -SkillRoot let the tests point it at fixtures. -DefinitionsOnly
+#  returns right after the tables below, so a test can dot-source the script and
+#  derive its expectations from them.
 #  Windows PowerShell 5.1 compatible. ASCII only on purpose: 5.1 reads a BOM-less
-#  script as ANSI, so the one non-ASCII character (the em dash in headings) is a
-#  <EM> token replaced from its code point.
+#  script as ANSI, so non-ASCII characters (the em dash in headings, the BOM) are
+#  built from code points.
 # ============================================================================
 param(
     [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot),
-    [string]$SkillRoot
+    [string]$SkillRoot,
+    [switch]$DefinitionsOnly
 )
-$ErrorActionPreference = 'Stop'
-Set-StrictMode -Version 2.0
 
-if (-not $SkillRoot) { $SkillRoot = Join-Path $RepoRoot 'plugin\skills\teststand-rules' }
-$ClaudeMdPath = Join-Path $RepoRoot 'CLAUDE.md'
-$StrictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
 $EmDash = [string][char]0x2014
+$Bom = [string][char]0xFEFF
 
-# --- Group A data: required rules (all patterns of a rule must match somewhere in the skill) ---
-$RequiredRules = @(
+# --- Group A: ONE rule table. A rule hits when ONE references file contains all of its
+# patterns. NeverDoOrder (when set) marks the rules SKILL.md's first section must list,
+# in that order; each listed item must match the same patterns. ---
+$RuleTable = @(
+    @{ Name = 'builder runs in the main thread'; NeverDoOrder = 1; Patterns = @('teststand-sequence-builder', 'AskUserQuestion', 'main thread') }
+    @{ Name = 'NI_Flow_* mandate'; NeverDoOrder = 2; Patterns = @('NI_Flow_\*', 'Goto') }
+    @{ Name = '.lvlibp clone-not-load'; NeverDoOrder = 3; Patterns = @('\.lvlibp', 'copy_step_module', 'never load') }
+    @{ Name = 'diff plus audit_type_consistency'; NeverDoOrder = 4; Patterns = @('diff_sequence_files', 'audit_type_consistency') }
     @{ Name = 'export/import first'; Patterns = @('export_sequence_file', 'import_sequence_file') }
-    @{ Name = '.lvlibp clone-not-load'; Patterns = @('\.lvlibp', 'copy_step_module', 'cloned, never loaded') }
-    @{ Name = 'diff plus audit_type_consistency'; Patterns = @('diff_sequence_files', 'audit_type_consistency') }
-    @{ Name = 'NI_Flow_* mandate'; Patterns = @('NI_Flow_\*', 'Goto') }
     @{ Name = 'Select/Case: one End per Case'; Patterns = @('NI_Flow_Select', 'own\s+`NI_Flow_End`') }
     @{ Name = 'SequenceCall as default step type'; Patterns = @('default to\s+`SequenceCall`') }
     @{ Name = 'headless limitations'; Patterns = @('Headless limitations', 'Paused', 'step_results') }
-    @{ Name = 'builder runs in the main thread'; Patterns = @('teststand-sequence-builder', 'AskUserQuestion', 'main thread') }
     @{ Name = 'doc generator asks the language first'; Patterns = @('teststand-doc-generator', 'ask the document language first') }
     @{ Name = 'presentation generator asks the language first'; Patterns = @('teststand-presentation-generator', 'ask the presentation language first') }
 )
+$NeverDoRules = @($RuleTable | Where-Object { $_.ContainsKey('NeverDoOrder') } | Sort-Object { $_.NeverDoOrder })
+$ReferenceFiles = @('rebuild.md', 'sequence-design.md', 'agents.md', 'headless-and-tools.md', 'tool-contracts.md')
+$SkillFileNames = @('SKILL.md') + @($ReferenceFiles | ForEach-Object { "references\$_" })
 
-# The first section of SKILL.md: exactly these four, in this order.
-$NeverDoRules = @(
-    @{ Name = 'builder in the main thread'; Patterns = @('teststand-sequence-builder', 'main thread', 'subagent') }
-    @{ Name = 'NI_Flow_* instead of Goto/Label'; Patterns = @('NI_Flow_\*', 'Goto', 'Label') }
-    @{ Name = '.lvlibp clone, never load'; Patterns = @('\.lvlibp', 'clone', 'in-process') }
-    @{ Name = 'diff plus audit_type_consistency'; Patterns = @('diff_sequence_files', 'audit_type_consistency') }
-)
-$ExpectedReferenceFiles = @('rebuild.md', 'sequence-design.md', 'agents.md', 'headless-and-tools.md')
-
-# --- Group B data: developer-only deny-list (AC-16) ---
+# --- Group B: developer-only deny-list (AC-16) ---
 $DenyList = @(
     @{ Name = 'date'; Pattern = '\b20\d\d-\d\d-\d\d\b'; CaseSensitive = $true }
     @{ Name = 'test id'; Pattern = '\bT\d{2}\b'; CaseSensitive = $true }
@@ -60,9 +57,12 @@ $DenyList = @(
     @{ Name = 'dynamic'; Pattern = 'dynamic'; CaseSensitive = $false }
     @{ Name = 'taskkill'; Pattern = 'taskkill'; CaseSensitive = $false }
     @{ Name = 'dotnet build'; Pattern = 'dotnet build'; CaseSensitive = $false }
+    @{ Name = 'CLAUDE.md'; Pattern = 'CLAUDE\.md'; CaseSensitive = $false }
+    @{ Name = 'build/'; Pattern = '\bbuild/'; CaseSensitive = $false }
+    @{ Name = 'src/'; Pattern = '\bsrc/'; CaseSensitive = $false }
 )
 
-# --- Group C data: the CLAUDE.md headings that moved into the skill (exact heading text) ---
+# --- Group C: the CLAUDE.md headings that moved into the skill (exact heading text) ---
 $MovedHeadings = @(
     'Rebuilding a .seq 1:1 <EM> `export_sequence_file` + `import_sequence_file` FIRST'
     'The on-disk FORMAT is reproduced too <EM> and the diff is blind to it (2026-07-31)'
@@ -91,6 +91,8 @@ $MovedHeadings = @(
     'Sequence Analyzer is ASYNC-capable (cold `.lvlibp` timeout fix; 2026-07-09)'
     'Post-build validation (reference audit)'
     'TestStand ENVIRONMENTS (`.tsenv`) <EM> chosen once per PROCESS (2026-08-14, issue #35)'
+    'Enumeration data types (create/modify/delete)'
+    'Authoring-complete step editing (1:1 file rebuilds; `T31`/`T32`)'
 ) | ForEach-Object { $_.Replace('<EM>', $EmDash) }
 
 # The .tsenv section is split: its user half moved, its developer half stays in CLAUDE.md.
@@ -102,12 +104,38 @@ $TsenvUserHalfMarkers = @(
 $TsenvDeveloperHeadingPrefix = '## TestStand ENVIRONMENTS'
 $TsenvDeveloperMarker = 'SetEnvironmentPath'
 
+# CLAUDE.md wraps its skill imports in these markers so a packaging step can swap the block.
+$ImportsBeginMarker = '<!-- skill-imports:begin -->'
+$ImportsEndMarker = '<!-- skill-imports:end -->'
+
 # Markdown outside these roots (relative, forward slashes) is searched for moved headings.
 $UniquenessExcludedRoots = @('plugin/skills/', 'docs/specs/', 'plans/')
 $WalkExcludedDirs = @('.git', 'bin', 'obj', 'node_modules', 'worktrees')
 
+# --- Named patterns and limits ---
+$FenceLinePattern = '^\s*```'
+$HeadingLinePattern = '^#{1,6}\s+(.*?)\s*$'
+$SectionHeadingPattern = '^##\s'
+$ListItemPattern = '^[-*]\s+(.*)$'
+$ContinuationPattern = '^\s+\S'
+$ImportLinePattern = '^@(\S+)\s*$'
+$FrontmatterNamePattern = '(?m)^name:\s*teststand-rules\s*$'
+$FrontmatterDescriptionPattern = '(?m)^description:\s*\S'
+$MaxDetailLines = 8
+
+if ($DefinitionsOnly) { return }
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 2.0
+
+if (-not $SkillRoot) { $SkillRoot = Join-Path $RepoRoot 'plugin\skills\teststand-rules' }
+$ClaudeMdPath = Join-Path $RepoRoot 'CLAUDE.md'
+$StrictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+$FrontmatterPattern = '^' + [regex]::Escape($Bom) + '?---\r?\n(.*?)\r?\n---\r?\n'
+
 # ----------------------------------------------------------------------------
 $script:Failures = 0
+$script:TextCache = @{}
 
 function Write-Result {
     param([string]$Name, [bool]$Ok, [string[]]$Detail = @())
@@ -116,18 +144,32 @@ function Write-Result {
     } else {
         $script:Failures++
         Write-Host "FAIL  $Name"
-        foreach ($line in $Detail) { Write-Host "      $line" }
+        foreach ($line in ($Detail | Select-Object -First $MaxDetailLines)) { Write-Host "      $line" }
     }
 }
 
-function Read-Text {
+# Each file is decoded once; a leading BOM is dropped so heading and import patterns anchor at column 0.
+function Get-FileText {
     param([string]$Path)
-    return $StrictUtf8.GetString([IO.File]::ReadAllBytes($Path))
+    if (-not $script:TextCache.ContainsKey($Path)) {
+        $text = $StrictUtf8.GetString([IO.File]::ReadAllBytes($Path))
+        # Ordinal on purpose: a culture-sensitive StartsWith treats U+FEFF as ignorable and is true for every string.
+        if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+        $script:TextCache[$Path] = $text
+    }
+    return $script:TextCache[$Path]
 }
 
-function Split-Lines {
+# The lines of a text outside code fences, with their 1-based line numbers.
+function Get-ProseLine {
     param([string]$Text)
-    return , ($Text -split "\r?\n")
+    $lines = $Text -split "\r?\n"
+    $inFence = $false
+    for ($n = 0; $n -lt $lines.Count; $n++) {
+        if ($lines[$n] -match $FenceLinePattern) { $inFence = -not $inFence; continue }
+        if ($inFence) { continue }
+        [pscustomobject]@{ Number = $n + 1; Text = $lines[$n] }
+    }
 }
 
 function Test-AllPatterns {
@@ -138,11 +180,6 @@ function Test-AllPatterns {
     return $true
 }
 
-function Get-SkillMarkdown {
-    if (-not (Test-Path -LiteralPath $SkillRoot -PathType Container)) { return @() }
-    return @(Get-ChildItem -LiteralPath $SkillRoot -Recurse -File -Filter '*.md' | Sort-Object FullName)
-}
-
 function Get-RelativePath {
     param([string]$Root, [string]$Path)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
@@ -150,69 +187,96 @@ function Get-RelativePath {
     return $full.Substring($rootFull.Length).Replace('\', '/')
 }
 
-function Get-HeadingText {
-    param([string]$Line)
-    $match = [regex]::Match($Line, '^#{1,6}\s+(.*?)\s*$')
-    if ($match.Success) { return $match.Groups[1].Value }
-    return $null
+# git's tracked paths (raw, NUL separated); $null when git is missing, fails or the repository is unreadable.
+function Get-GitTrackedPath {
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = 'git'
+    $info.Arguments = '-c core.quotePath=off -C "' + $RepoRoot + '" ls-files -z'
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    try { $process = [System.Diagnostics.Process]::Start($info) } catch { return $null }
+    $errors = $process.StandardError.ReadToEndAsync()
+    $output = $process.StandardOutput.ReadToEnd()
+    $process.WaitForExit()
+    [void]$errors.Result
+    if ($process.ExitCode -ne 0) { return $null }
+    return , @($output -split "`0" | Where-Object { $_ })   # the comma keeps a one-element list an array
 }
 
-# The markdown files of the repository: tracked ones when it is a git checkout, else a directory walk.
-function Get-RepositoryMarkdown {
-    $paths = @()
-    $git = Get-Command git -ErrorAction SilentlyContinue
-    if ((Test-Path -LiteralPath (Join-Path $RepoRoot '.git')) -and $git) {
-        $listed = & git -C $RepoRoot ls-files -- '*.md'
-        if ($LASTEXITCODE -eq 0 -and $listed) { $paths = @($listed | ForEach-Object { $_.Replace('\', '/') }) }
-    } else {
-        $pending = New-Object System.Collections.Generic.Stack[string]
-        $pending.Push((Resolve-Path -LiteralPath $RepoRoot).ProviderPath)
-        while ($pending.Count -gt 0) {
-            $dir = $pending.Pop()
-            foreach ($child in Get-ChildItem -LiteralPath $dir -Force) {
-                if ($child.PSIsContainer) {
-                    if ($WalkExcludedDirs -notcontains $child.Name) { $pending.Push($child.FullName) }
-                } elseif ($child.Extension -eq '.md') {
-                    $paths += (Get-RelativePath $RepoRoot $child.FullName)
-                }
+function Get-MarkdownByWalk {
+    $found = @()
+    $pending = New-Object System.Collections.Generic.Stack[string]
+    $pending.Push((Resolve-Path -LiteralPath $RepoRoot).ProviderPath)
+    while ($pending.Count -gt 0) {
+        $dir = $pending.Pop()
+        foreach ($child in Get-ChildItem -LiteralPath $dir -Force) {
+            if ($child.PSIsContainer) {
+                if ($WalkExcludedDirs -notcontains $child.Name) { $pending.Push($child.FullName) }
+            } elseif ($child.Extension -ieq '.md') {
+                $found += (Get-RelativePath $RepoRoot $child.FullName)
             }
         }
     }
+    return $found
+}
+
+# The markdown files of the repository: git-tracked ones when it is a git checkout (with a warning and a
+# directory walk when git cannot answer), else a directory walk. CLAUDE.md is always included.
+function Get-RepositoryMarkdownPath {
+    $paths = $null
+    if (Test-Path -LiteralPath (Join-Path $RepoRoot '.git')) {
+        $tracked = Get-GitTrackedPath
+        if ($null -eq $tracked -or $tracked.Count -eq 0) {
+            Write-Host 'WARN  git ls-files failed or listed nothing; scanning the directory tree instead'
+        } else {
+            $paths = @($tracked | Where-Object { $_ -match '\.md$' } | ForEach-Object { $_.Replace('\', '/') })
+        }
+    }
+    if ($null -eq $paths) { $paths = Get-MarkdownByWalk }
+    if (-not ($paths | Where-Object { $_ -ieq 'CLAUDE.md' })) { $paths = @($paths) + 'CLAUDE.md' }
     return $paths
 }
 
 # ============================================================================
 #  Group A - required rules
 # ============================================================================
-$skillFiles = Get-SkillMarkdown
-$skillText = ($skillFiles | ForEach-Object { Read-Text $_.FullName }) -join "`n"
+$skillFiles = @()
+if (Test-Path -LiteralPath $SkillRoot -PathType Container) {
+    $skillFiles = @(Get-ChildItem -LiteralPath $SkillRoot -Recurse -File -Filter '*.md' | Sort-Object FullName)
+}
 
-Write-Result 'skill: SKILL.md and the four reference files exist' (
-    (Test-Path -LiteralPath (Join-Path $SkillRoot 'SKILL.md')) -and
-    -not ($ExpectedReferenceFiles | Where-Object { -not (Test-Path -LiteralPath (Join-Path $SkillRoot "references\$_")) })
-) @("expected SKILL.md and references\{$($ExpectedReferenceFiles -join ',')} under $SkillRoot")
+$missingFiles = @($SkillFileNames | Where-Object { -not (Test-Path -LiteralPath (Join-Path $SkillRoot $_)) })
+Write-Result "skill: SKILL.md and the $($ReferenceFiles.Count) reference files exist" ($missingFiles.Count -eq 0) @($missingFiles | ForEach-Object { "missing: $_" })
 
-foreach ($rule in $RequiredRules) {
-    $ok = Test-AllPatterns $skillText $rule.Patterns
-    Write-Result "required rule present: $($rule.Name)" $ok @("no skill file contains all of: $($rule.Patterns -join ' | ')")
+$referenceTexts = @()
+foreach ($name in $ReferenceFiles) {
+    $path = Join-Path $SkillRoot "references\$name"
+    if (Test-Path -LiteralPath $path -PathType Leaf) { $referenceTexts += (Get-FileText $path) }
+}
+foreach ($rule in $RuleTable) {
+    $hit = $false
+    foreach ($text in $referenceTexts) { if (Test-AllPatterns $text $rule.Patterns) { $hit = $true; break } }
+    Write-Result "required rule present: $($rule.Name)" $hit @("no references/*.md file contains all of: $($rule.Patterns -join ' | ')")
 }
 
 $skillMdPath = Join-Path $SkillRoot 'SKILL.md'
 if (Test-Path -LiteralPath $skillMdPath) {
-    $skillMd = Read-Text $skillMdPath
-    $skillLines = Split-Lines $skillMd
+    $skillMd = Get-FileText $skillMdPath
+    $skillLines = @($skillMd -split "\r?\n")
 
-    $bomPattern = '(?:' + [regex]::Escape([string][char]0xFEFF) + ')?'
-    $frontmatter = [regex]::Match($skillMd, '^' + $bomPattern + '---\r?\n(.*?)\r?\n---\r?\n', 'Singleline')
+    $frontmatter = [regex]::Match($skillMd, $FrontmatterPattern, 'Singleline')
     $frontOk = $frontmatter.Success -and
-        ($frontmatter.Groups[1].Value -match '(?m)^name:\s*teststand-rules\s*$') -and
-        ($frontmatter.Groups[1].Value -match '(?m)^description:\s*\S')
+        ($frontmatter.Groups[1].Value -match $FrontmatterNamePattern) -and
+        ($frontmatter.Groups[1].Value -match $FrontmatterDescriptionPattern)
     Write-Result 'SKILL.md: frontmatter has name teststand-rules and a description' $frontOk @('expected a leading --- block with "name: teststand-rules" and a non-empty "description:"')
 
-    # The first section: from the first "## " heading to the next one.
+    # The first section: from the first "## " heading to the next one. Wrapped list items are folded.
     $sectionStart = -1; $sectionEnd = $skillLines.Count
     for ($i = 0; $i -lt $skillLines.Count; $i++) {
-        if ($skillLines[$i] -match '^##\s') {
+        if ($skillLines[$i] -match $SectionHeadingPattern) {
             if ($sectionStart -lt 0) { $sectionStart = $i } else { $sectionEnd = $i; break }
         }
     }
@@ -220,17 +284,17 @@ if (Test-Path -LiteralPath $skillMdPath) {
     if ($sectionStart -ge 0) {
         $current = $null
         for ($i = $sectionStart + 1; $i -lt $sectionEnd; $i++) {
-            if ($skillLines[$i] -match '^[-*]\s+(.*)$') {
+            if ($skillLines[$i] -match $ListItemPattern) {
                 if ($null -ne $current) { $items += $current }
                 $current = $Matches[1]
-            } elseif ($null -ne $current -and $skillLines[$i] -match '^\s+\S') {
+            } elseif ($null -ne $current -and $skillLines[$i] -match $ContinuationPattern) {
                 $current += ' ' + $skillLines[$i].Trim()
             }
         }
         if ($null -ne $current) { $items += $current }
     }
     $neverDoOk = ($sectionStart -ge 0) -and ($items.Count -eq $NeverDoRules.Count)
-    $neverDoDetail = @("first section of SKILL.md must list exactly $($NeverDoRules.Count) rules, found $($items.Count)")
+    $neverDoDetail = @("the first section of SKILL.md must list exactly $($NeverDoRules.Count) rules, found $($items.Count)")
     if ($neverDoOk) {
         for ($r = 0; $r -lt $NeverDoRules.Count; $r++) {
             if (-not (Test-AllPatterns $items[$r] $NeverDoRules[$r].Patterns)) {
@@ -240,10 +304,10 @@ if (Test-Path -LiteralPath $skillMdPath) {
             }
         }
     }
-    Write-Result 'SKILL.md: the first section holds exactly the four never-do rules' $neverDoOk $neverDoDetail
+    Write-Result "SKILL.md: the first section holds exactly the $($NeverDoRules.Count) never-do rules" $neverDoOk $neverDoDetail
 
-    $missingPointers = @($ExpectedReferenceFiles | Where-Object { $skillMd -notmatch [regex]::Escape("references/$_") })
-    Write-Result 'SKILL.md: points to every reference file' ($missingPointers.Count -eq 0) @("no pointer to: $($missingPointers -join ', ')")
+    $missingPointers = @($ReferenceFiles | Where-Object { $skillMd -notmatch [regex]::Escape("references/$_") })
+    Write-Result 'SKILL.md: points to every reference file' ($missingPointers.Count -eq 0) @($missingPointers | ForEach-Object { "no pointer to: references/$_" })
 }
 
 # ============================================================================
@@ -253,69 +317,73 @@ foreach ($entry in $DenyList) {
     $options = if ($entry.CaseSensitive) { 'None' } else { 'IgnoreCase' }
     $hits = @()
     foreach ($file in $skillFiles) {
-        $lines = Split-Lines (Read-Text $file.FullName)
+        $lines = @((Get-FileText $file.FullName) -split "\r?\n")
         for ($n = 0; $n -lt $lines.Count; $n++) {
             if ([regex]::IsMatch($lines[$n], $entry.Pattern, $options)) {
                 $hits += "$(Get-RelativePath $SkillRoot $file.FullName):$($n + 1): $($lines[$n].Trim())"
             }
         }
     }
-    Write-Result "deny-list: no '$($entry.Name)' ($($entry.Pattern)) in the skill files" ($hits.Count -eq 0) @($hits | Select-Object -First 5)
+    Write-Result "deny-list: no '$($entry.Name)' ($($entry.Pattern)) in the skill files" ($hits.Count -eq 0) $hits
 }
 
 # ============================================================================
-#  Group C - uniqueness
+#  Group C - no moved heading remains
 # ============================================================================
-$claudeMdExists = Test-Path -LiteralPath $ClaudeMdPath
-$claudeLines = @()
-if ($claudeMdExists) { $claudeLines = Split-Lines (Read-Text $ClaudeMdPath) }
+$claudeMdExists = Test-Path -LiteralPath $ClaudeMdPath -PathType Leaf
+$claudeProse = @()
+$claudeText = ''
+if ($claudeMdExists) {
+    $claudeText = Get-FileText $ClaudeMdPath
+    $claudeProse = @(Get-ProseLine $claudeText)
+}
 
 $leftovers = @()
-foreach ($relative in (Get-RepositoryMarkdown)) {
+foreach ($relative in (Get-RepositoryMarkdownPath)) {
     $excluded = $false
     foreach ($root in $UniquenessExcludedRoots) { if ($relative.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { $excluded = $true } }
     if ($excluded) { continue }
     $full = Join-Path $RepoRoot $relative
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
-    $lines = Split-Lines (Read-Text $full)
-    $inFence = $false
-    for ($n = 0; $n -lt $lines.Count; $n++) {
-        if ($lines[$n] -match '^\s*```') { $inFence = -not $inFence; continue }
-        if ($inFence) { continue }
-        $heading = Get-HeadingText $lines[$n]
-        if ($null -ne $heading -and ($MovedHeadings -ccontains $heading)) {
-            $leftovers += "${relative}:$($n + 1): moved heading still present: $heading"
+    foreach ($line in (Get-ProseLine (Get-FileText $full))) {
+        $heading = [regex]::Match($line.Text, $HeadingLinePattern)
+        if ($heading.Success -and ($MovedHeadings -ccontains $heading.Groups[1].Value)) {
+            $leftovers += "${relative}:$($line.Number): moved heading still present: $($heading.Groups[1].Value)"
         }
     }
 }
-Write-Result 'uniqueness: no moved heading remains in CLAUDE.md or other tracked markdown' ($leftovers.Count -eq 0) @($leftovers | Select-Object -First 8)
+Write-Result 'uniqueness: no moved heading remains in CLAUDE.md or other tracked markdown' ($leftovers.Count -eq 0) $leftovers
 
-$claudeText = $claudeLines -join "`n"
 $userHalfLeft = @($TsenvUserHalfMarkers | Where-Object { $claudeText.Contains($_) })
 Write-Result 'uniqueness: CLAUDE.md keeps no user half of the .tsenv section' ($userHalfLeft.Count -eq 0) @($userHalfLeft | ForEach-Object { "still in CLAUDE.md: $_" })
 
-$devHeading = @($claudeLines | Where-Object { $_.StartsWith($TsenvDeveloperHeadingPrefix) })
-$devOk = $claudeMdExists -and ($devHeading.Count -eq 1) -and $claudeText.Contains($TsenvDeveloperMarker)
-Write-Result 'uniqueness: CLAUDE.md keeps the developer half of the .tsenv section' $devOk @("expected one '$TsenvDeveloperHeadingPrefix...' heading and the text '$TsenvDeveloperMarker' in CLAUDE.md")
+$developerHeadings = @($claudeProse | Where-Object { $_.Text.StartsWith($TsenvDeveloperHeadingPrefix) })
+$developerHalfPresent = $claudeMdExists -and ($developerHeadings.Count -eq 1) -and $claudeText.Contains($TsenvDeveloperMarker)
+Write-Result 'uniqueness: CLAUDE.md keeps the developer half of the .tsenv section' $developerHalfPresent @("expected exactly one '$TsenvDeveloperHeadingPrefix...' heading (found $($developerHeadings.Count)) and the text '$TsenvDeveloperMarker' in CLAUDE.md")
 
 # ============================================================================
 #  Group D - imports
 # ============================================================================
+$beginLines = @($claudeProse | Where-Object { $_.Text.Trim() -eq $ImportsBeginMarker })
+$endLines = @($claudeProse | Where-Object { $_.Text.Trim() -eq $ImportsEndMarker })
+$markersOk = ($beginLines.Count -eq 1) -and ($endLines.Count -eq 1) -and ($beginLines[0].Number -lt $endLines[0].Number)
+Write-Result 'imports: CLAUDE.md has one begin and one end marker around the skill imports' $markersOk @("expected exactly one '$ImportsBeginMarker' before exactly one '$ImportsEndMarker' (found $($beginLines.Count) and $($endLines.Count))")
+
 $dangling = @()
 $imported = @()
-$inFence = $false
-for ($n = 0; $n -lt $claudeLines.Count; $n++) {
-    $line = $claudeLines[$n]
-    if ($line -match '^\s*```') { $inFence = -not $inFence; continue }
-    if ($inFence) { continue }
-    if ($line -match '^@(\S+)\s*$') {
-        $importPath = $Matches[1]
-        $resolved = [IO.Path]::GetFullPath((Join-Path $RepoRoot $importPath))
-        $imported += $resolved
-        if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) { $dangling += "CLAUDE.md:$($n + 1): import @$importPath does not exist" }
+$outsideMarkers = @()
+foreach ($line in $claudeProse) {
+    $import = [regex]::Match($line.Text, $ImportLinePattern)
+    if (-not $import.Success) { continue }
+    $resolved = [IO.Path]::GetFullPath((Join-Path $RepoRoot $import.Groups[1].Value))
+    $imported += $resolved
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) { $dangling += "CLAUDE.md:$($line.Number): import @$($import.Groups[1].Value) does not exist" }
+    if ($markersOk -and ($line.Number -lt $beginLines[0].Number -or $line.Number -gt $endLines[0].Number)) {
+        $outsideMarkers += "CLAUDE.md:$($line.Number): import @$($import.Groups[1].Value) is outside the markers"
     }
 }
 Write-Result 'imports: every @path import in CLAUDE.md resolves' ($dangling.Count -eq 0) $dangling
+Write-Result 'imports: every import sits between the markers' ($outsideMarkers.Count -eq 0) $outsideMarkers
 
 $notImported = @()
 foreach ($file in $skillFiles) {

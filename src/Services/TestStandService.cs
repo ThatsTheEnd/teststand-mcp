@@ -186,10 +186,11 @@ public interface ITestStandService : IDisposable
     Task DeleteStepPropertyAsync(string filePath, string sequenceName, string stepGroup,
         string stepName, string propertyPath, bool save = true);
 
-    /// <summary>Sets the raw PropFlags bitfield on a step property. By default this ORs the bits on
-    /// (SetFlags); with <paramref name="exact"/> the whole bitfield is ASSIGNED, which is the only way
-    /// to turn a bit OFF (e.g. clearing a 0x4 PassByReference a prototype load left behind). Returns
-    /// the read-back flags.</summary>
+    /// <summary>Sets the raw PropFlags bitfield on a step property. A plain <c>SetFlags</c> REPLACES
+    /// the bitfield (measured: 0x4 then 0x80 reads back 0x80 plus the engine's own 0x400000 bit, 0x4 is
+    /// gone), so bits can be turned off with it. <paramref name="exact"/> routes through
+    /// <c>SetExactFlags</c>, which verifies the read-back and falls back to the instance-override flags;
+    /// the observable result was identical in the same measurement. Returns the read-back flags.</summary>
     Task<StepPropertyValue> SetStepPropertyFlagsAsync(string filePath, string sequenceName,
         string stepGroup, string stepName, string propertyPath, int flags, bool save = true,
         bool exact = false);
@@ -248,7 +249,7 @@ public interface ITestStandService : IDisposable
     /// switch (scalar / container / reference / named_type / enum / array_elements).
     /// <paramref name="representation"/>/<paramref name="numberFormat"/> set a NUMBER node's width
     /// (float64/int64/uint64) and display format; <paramref name="clearFlags"/> makes the
-    /// <paramref name="flags"/> write EXACT (also turning bits off) instead of OR-only.</summary>
+    /// <paramref name="flags"/> write go through the verified exact path (<c>SetExactFlags</c>).</summary>
     Task<PropertyNodeInfo> SetPropertyNodeAsync(string filePath, string scope,
         string? sequenceName, string lookupString, string valueType, string? typeName,
         string? value, int? ordinal, int? numElements, int? flags,
@@ -2968,10 +2969,10 @@ public sealed class TestStandService : ITestStandService
                     SetLeafValue(parent, leaf, vtl, value, ordinal, typeName, sf, filePath);
             }
 
-            // Apply PropFlags LAST. SetFlags has OR semantics (it turns bits ON and can never turn
-            // one off), so an exact-flags write — needed when the original has 0x0 where the engine's
-            // own LoadPrototype left 0x4 (PassByReference) behind — goes through the property's Flags
-            // *setter* instead, which assigns the whole bitfield.
+            // Apply PropFlags LAST. SetFlags REPLACES the bitfield (measured); the engine keeps its own
+            // 0x400000 bit either way. An exact-flags write — needed when the original has 0x0 where the
+            // engine's own LoadPrototype left 0x4 (PassByReference) behind — goes through SetExactFlags,
+            // which verifies the read-back and falls back to the instance-override flags.
             if (flags.HasValue)
             {
                 if (clearFlags) SetExactFlags(parent, leaf, flags.Value);
@@ -3017,9 +3018,9 @@ public sealed class TestStandService : ITestStandService
 
     /// <summary>
     /// Assigns a property's PropFlags bitfield EXACTLY, i.e. also turning bits OFF. Needed because
-    /// <c>SetFlags</c> could only ever add bits in practice, so a rebuild could not reproduce an
-    /// original that has 0x0 where the engine's own LoadPrototype left 0x4 (PassByReference) behind
-    /// on a caller's argument. Strategy: SetFlags → verify; if bits survive, drive the INSTANCE
+    /// <c>SetFlags</c> replaces the bitfield, but a type's own flag layer can keep bits alive, so a
+    /// rebuild could fail to reproduce an original that has 0x0 where the engine's own LoadPrototype
+    /// left 0x4 (PassByReference) behind on a caller's argument. Strategy: SetFlags → verify; if bits survive, drive the INSTANCE
     /// OVERRIDE flags (the per-instance layer on top of the type's flags) → verify again. Returns the
     /// flags actually in effect so callers can report a residual honestly.
     /// </summary>
@@ -4729,8 +4730,8 @@ public sealed class TestStandService : ITestStandService
             dynamic step = (NiStep)(object)ResolveStepInGroup(seq, ParseStepGroup(stepGroup), stepName);
             NiPropertyObject stepPo = ((NiStep)(object)step).AsPropertyObject();
 
-            // SetFlags only ever adds bits; 'exact' assigns the whole bitfield so a bit can be turned
-            // OFF (see SetExactFlags) — the case a rebuild needs when the original has 0x0 where a
+            // A plain SetFlags already REPLACES the bitfield (measured); 'exact' adds the verified
+            // path (see SetExactFlags) — the case a rebuild needs when the original has 0x0 where a
             // prototype load left 0x4 (PassByReference) on a caller's argument.
             if (exact) SetExactFlags(stepPo, propertyPath, flags);
             else       stepPo.SetFlags(propertyPath, 0, flags);

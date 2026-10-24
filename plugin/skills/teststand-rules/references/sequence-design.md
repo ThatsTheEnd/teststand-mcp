@@ -32,15 +32,15 @@ Goto   only for a pattern that cannot be expressed with NI_Flow_* (for example a
 Label  only as the target of such a Goto
 ```
 
-`NI_Flow_Break` and `NI_Flow_Continue` must sit physically inside a loop block, or `validate_sequence_plan` raises `E_JUMP_OUTSIDE_LOOP`.
+`NI_Flow_Break` and `NI_Flow_Continue` must sit physically inside a loop block, or `validate_sequence_plan` rejects the plan (error codes: [headless-and-tools.md](headless-and-tools.md#validation-before-and-after-building)).
 
 ## Default step type when unclear
 
 When it is not clear which step type a step should be, default to `SequenceCall`, not `Statement`.
 
-- It applies to every action or placeholder step whose type no other rule decides (not a flow step, not a wait, not a check).
-- The `SequenceCall` may stay unresolved (no target) while the target subsequence is not known; the user links it later.
-- The deterministic rules still win first: `NI_Flow_*` for branching and loops, `NI_Wait` for waits and delays, a result-template step such as `PassFailTest` for checks. `SequenceCall` is only the fallback for the otherwise ambiguous plain action.
+- It applies to every action or placeholder step whose type no other rule decides (not a flow step, not a wait, not a test step).
+- The step may stay an unlinked SequenceCall placeholder (no target) while the target subsequence is not known; the user links it later. A `Statement` placeholder is never the intended result.
+- The deterministic rules still win first: `NI_Flow_*` for branching and loops, `NI_Wait` for waits and delays, a test step such as `PassFailTest` for checks. `SequenceCall` is only the fallback for the otherwise ambiguous plain action.
 
 ## Structure of an If/Else block
 
@@ -73,12 +73,12 @@ Each `NI_Flow_Case` opens its OWN block and needs its OWN `NI_Flow_End`. This is
 [7] End_Select      NI_Flow_End      closes Select
 ```
 
-`validate_sequence_plan` enforces this: a Case whose parent block is not the Select (because the previous Case was not closed) raises `E_CASE_WITHOUT_SELECT`, and any unclosed Case or Select raises `E_UNCLOSED_BLOCK`.
+`validate_sequence_plan` enforces this: a Case whose parent block is not the Select (because the previous Case was not closed) is rejected, and so is any unclosed Case or Select.
 
 ## Step types (`get_step_types` lists what is installed)
 
 - Flow control: `NI_Flow_If`, `NI_Flow_ElseIf`, `NI_Flow_Else`, `NI_Flow_End`, `NI_Flow_While`, `NI_Flow_DoWhile`, `NI_Flow_For`, `NI_Flow_ForEach`, `NI_Flow_SweepLoop`, `NI_Flow_StreamLoop`, `NI_Flow_Select`, `NI_Flow_Case`, `NI_Flow_Break`, `NI_Flow_Continue`
-- Tests: `NumericLimitTest`, `StringValueTest`, `PassFailTest`, `NI_MultipleNumericLimitTest`
+- Test steps: `NumericLimitTest`, `StringValueTest`, `PassFailTest`, `NI_MultipleNumericLimitTest`
 - Actions: `Statement`, `Action`, `MessagePopup`, `CallExecutable`, `SequenceCall`
 - Legacy, avoid: `Goto`, `Label`
 
@@ -87,4 +87,4 @@ Each `NI_Flow_Case` opens its OWN block and needs its OWN `NI_Flow_End`. This is
 The mandate above is about structure; this is about filling a step in.
 
 - Fully covered by tools: `If`/`ElseIf`/`Else`/`End`; `While`/`DoWhile` (the condition goes to `ConditionExpr`); `For` (`configure_for_loop`, or the bulk fields `init_expr`, `expression`, `increment_expr`); `ForEach` (`configure_foreach_loop`, or the bulk fields `array_expr`, `element_expr`); `Select`/`Case` (including the bulk field `is_default`); `Break`/`Continue` (the validator enforces the loop context).
-- `NI_Flow_SweepLoop` and `NI_Flow_StreamLoop` have NO configure tool. A Sweep keeps its sweep table in `Parameters[]` (`NI_SweepParameter`) plus Input and Output containers; a Stream keeps its data source plus `IterationExpr`. Reach them with `set_step_property`, or author them in the editor. Inserting one is fine; do not assume a `configure_*` call can fill it in.
+- `NI_Flow_SweepLoop` and `NI_Flow_StreamLoop` have NO configure tool. A Sweep keeps its own `Parameters[]` list (`NI_SweepParameter` entries, not the sequence's Parameters) plus Input and Output containers; a Stream keeps its data source plus `IterationExpr`. Reach them with `set_step_property`, or author them in the editor. Inserting one is fine; do not assume a `configure_*` call can fill it in.

@@ -266,9 +266,9 @@ bin/README.md, bin/CLAUDE.md
 - **AC-16 Rules skill.** The `teststand-rules` skill holds the user-facing rules. `SKILL.md`
   contains only the frontmatter, a never-do section (main thread for the builder, `NI_Flow_*`
   mandate, `.lvlibp` clone-not-load, diff plus `audit_type_consistency`) and one pointer per
-  `references/*.md` file. The rules below are covered across `SKILL.md` and the reference files
-  together. Each must appear at least once in `plugin/skills/teststand-rules/`, not necessarily in
-  `SKILL.md`:
+  `references/*.md` file (rebuild, sequence design, agents, headless and tools, tool contracts).
+  Each rule below must appear at least once in a `references/*.md` file; `SKILL.md` repeats only
+  the never-do four:
   - export/import first;
   - `.lvlibp` clone-not-load;
   - verification with diff plus `audit_type_consistency`;
@@ -286,7 +286,8 @@ bin/README.md, bin/CLAUDE.md
   - dates matching `\b20\d\d-\d\d-\d\d\b`;
   - test IDs matching `\bT\d{2}\b`;
   - the strings `memory`, `[[`, `.Demo_jcm`, `this file`, `Marshal`, `dynamic`, `taskkill` and
-    `dotnet build`.
+    `dotnet build`, and, as developer-only pointers, `CLAUDE.md`, `build/` and `src/`
+    (all matched case-insensitively).
   `CLAUDE.md` imports the skill files, so each user-facing rule has exactly one copy in the
   repository.
 - **AC-17 Environment configuration survives updates.** The README documents the plugin route for a
