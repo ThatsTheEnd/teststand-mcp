@@ -1,0 +1,11 @@
+{
+  "run_id": "1234567890",
+  "date": "2026-08-20",
+  "assets": {
+    "teststand-mcp.zip": 3,
+    "teststand-mcp.sha256": 2,
+    "teststand-mcp.manifest.sha256": 1,
+    "teststand-mcp-v1.9.0.zip": 1
+  },
+  "draft": true
+}
