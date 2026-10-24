@@ -4,16 +4,33 @@
 #  these helpers never print a diagnostic, the callers swallow every failure.
 # ============================================================================
 
+$script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$script:DayInSeconds = 24 * 60 * 60
 $script:MaxHookInputChars = 1048576   # hook stdin is untrusted: never buffer more than 1 MB
+$script:StdinChunkChars = 4096
+$script:AbsoluteLocalPathPattern = '\A[A-Za-z]:[\\/]'   # a drive path; a UNC path, \\?\ or a relative path never matches
 
-# The text on stdin as UTF-8, or $null when it is longer than the cap (treated as no input).
+# Runs the hook body and ends the process with exit code 0 whatever happens inside: a hook must
+# never block the session or print a stack trace.
+function Invoke-SilentHook {
+    param([Parameter(Mandatory)][scriptblock]$Body)
+    try { & $Body } catch { }
+    exit 0
+}
+
+# The text on stdin as UTF-8, read in chunks until end of input; $null when it is longer than the
+# cap (treated as no input). Claude Code closes stdin after writing the input; if it ever did not,
+# the hook timeout in hooks.json bounds the wait.
 function Read-HookStdin {
-    $reader = New-Object System.IO.StreamReader([Console]::OpenStandardInput(), (New-Object System.Text.UTF8Encoding($false)))
+    $reader = New-Object System.IO.StreamReader([Console]::OpenStandardInput(), $script:Utf8NoBom)
     try {
-        $buffer = New-Object char[] ($script:MaxHookInputChars + 1)
-        $count = $reader.ReadBlock($buffer, 0, $buffer.Length)
-        if ($count -gt $script:MaxHookInputChars) { return $null }
-        return (New-Object System.Text.StringBuilder).Append($buffer, 0, $count).ToString()
+        $builder = New-Object System.Text.StringBuilder
+        $chunk = New-Object char[] $script:StdinChunkChars
+        while (($count = $reader.Read($chunk, 0, $chunk.Length)) -gt 0) {
+            [void]$builder.Append($chunk, 0, $count)
+            if ($builder.Length -gt $script:MaxHookInputChars) { return $null }
+        }
+        return $builder.ToString()
     } finally {
         $reader.Dispose()
     }
@@ -32,8 +49,17 @@ function Write-HookOutput {
     [Console]::Out.Write((ConvertTo-AsciiJson $Object) + "`n")
 }
 
+# A property of a parsed JSON object, or $null (a missing property throws under strict mode).
+function Get-HookProperty {
+    param($Object, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Object) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
 # ----------------------------------------------------------------------------
-#  Environment, clock and state (the throttle / notify caches)
+#  Environment, clock and time windows
 # ----------------------------------------------------------------------------
 $script:StateDirOverrideVariable = 'TESTSTAND_MCP_STATE_DIR'      # tests and unusual stations
 $script:PluginDataVariable = 'CLAUDE_PLUGIN_DATA'                 # survives plugin updates
@@ -65,11 +91,37 @@ function Get-HookNow {
     return [DateTimeOffset]::UtcNow
 }
 
-# Where the caches live: TESTSTAND_MCP_STATE_DIR, else CLAUDE_PLUGIN_DATA, else
-# %LOCALAPPDATA%\teststand-mcp; $null when none of them is set.
+function ConvertTo-EpochOrZero {
+    param($Value)
+    $parsed = 0L
+    if ([long]::TryParse([string]$Value, [ref]$parsed)) { return $parsed }
+    return 0L
+}
+
+# True when the instant is less than the window in the past. An instant in the future (the clock
+# moved back) is not fresh, so a wrong clock can never silence a hook for longer than the window.
+function Test-IsFresh {
+    param([long]$Epoch, [long]$NowEpoch, [long]$WindowSeconds)
+    $ageSeconds = $NowEpoch - $Epoch
+    return ($ageSeconds -ge 0 -and $ageSeconds -lt $WindowSeconds)
+}
+
+function Test-IsAbsoluteLocalPath {
+    param($Path)
+    return (($Path -is [string]) -and $Path -match $script:AbsoluteLocalPathPattern)
+}
+
+# ----------------------------------------------------------------------------
+#  State (the throttle / notify caches)
+# ----------------------------------------------------------------------------
+$script:StateReplaceAttempts = 3
+$script:StateReplaceRetryMilliseconds = 50
+
+# Where the caches live: TESTSTAND_MCP_STATE_DIR (an absolute local path only), else
+# CLAUDE_PLUGIN_DATA, else %LOCALAPPDATA%\teststand-mcp; $null when none of them is usable.
 function Get-HookStateDir {
     $override = Get-HookEnvironmentText $script:StateDirOverrideVariable
-    if ($null -ne $override) { return $override }
+    if ($null -ne $override -and (Test-IsAbsoluteLocalPath $override)) { return $override }
     $pluginData = Get-HookEnvironmentText $script:PluginDataVariable
     if ($null -ne $pluginData) { return $pluginData }
     $localAppData = Get-HookEnvironmentText 'LOCALAPPDATA'
@@ -77,16 +129,8 @@ function Get-HookStateDir {
     return $null
 }
 
-# A property of a parsed JSON object, or $null (a missing property throws under strict mode).
-function Get-HookProperty {
-    param($Object, [Parameter(Mandatory)][string]$Name)
-    if ($null -eq $Object) { return $null }
-    $property = $Object.PSObject.Properties[$Name]
-    if ($null -eq $property) { return $null }
-    return $property.Value
-}
-
-# The state file as an object; $null when it is missing, unreadable or not JSON.
+# The state file as an object; $null when it is missing, unreadable or not JSON. Opened with
+# FileShare.ReadWrite and Delete so a concurrent atomic replace by another session never fails the read.
 function Read-HookState {
     param([Parameter(Mandatory)][string]$Name)
     try {
@@ -94,9 +138,32 @@ function Read-HookState {
         if ($null -eq $dir) { return $null }
         $path = Join-Path $dir $Name
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
-        return ([IO.File]::ReadAllText($path, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json)
+        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $stream = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        try {
+            $text = (New-Object IO.StreamReader($stream, $script:Utf8NoBom)).ReadToEnd()
+        } finally {
+            $stream.Dispose()
+        }
+        return ($text | ConvertFrom-Json)
     } catch {
         return $null
+    }
+}
+
+# Moves the finished temp file over the target, retrying a few times: another session may hold the
+# target open for an instant.
+function Move-HookStateIntoPlace {
+    param([string]$Temp, [string]$Target)
+    for ($attempt = 1; $attempt -le $script:StateReplaceAttempts; $attempt++) {
+        try {
+            # A plain $null would reach .NET as an empty string, which Replace rejects as an illegal path.
+            if (Test-Path -LiteralPath $Target) { [IO.File]::Replace($Temp, $Target, [NullString]::Value) } else { [IO.File]::Move($Temp, $Target) }
+            return
+        } catch {
+            if ($attempt -eq $script:StateReplaceAttempts) { throw }
+            Start-Sleep -Milliseconds $script:StateReplaceRetryMilliseconds
+        }
     }
 }
 
@@ -111,9 +178,8 @@ function Write-HookState {
         [void][IO.Directory]::CreateDirectory($dir)
         $target = Join-Path $dir $Name
         $temp = Join-Path $dir ($Name + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
-        [IO.File]::WriteAllText($temp, ($State | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
-        # A plain $null would reach .NET as an empty string, which Replace rejects as an illegal path.
-        if (Test-Path -LiteralPath $target) { [IO.File]::Replace($temp, $target, [NullString]::Value) } else { [IO.File]::Move($temp, $target) }
+        [IO.File]::WriteAllText($temp, ($State | ConvertTo-Json -Compress), $script:Utf8NoBom)
+        Move-HookStateIntoPlace $temp $target
         $temp = $null
         return $true
     } catch {

@@ -1,5 +1,5 @@
 {
-  "description": "TestStand MCP hooks: read-only TestStand tools run without a permission prompt, a startup check warns about a missing TestStand or doc-agent dependency, and a startup notice names a newer release. The hooks print nothing and never block when something fails.",
+  "description": "TestStand MCP hooks: read-only TestStand tools on .seq files inside the project run without a permission prompt, a startup check warns about a missing TestStand or doc-agent dependency, and a startup notice names a newer release. The hooks print nothing and never block when something fails.",
   "hooks": {
     "PreToolUse": [
       {
@@ -7,8 +7,16 @@
         "hooks": [
           {
             "type": "command",
-            "shell": "powershell",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/hooks/allow-readonly.ps1\""
+            "command": "powershell.exe",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-ExecutionPolicy",
+              "Bypass",
+              "-File",
+              "${CLAUDE_PLUGIN_ROOT}/hooks/allow-readonly.ps1"
+            ],
+            "timeout": 10
           }
         ]
       }
@@ -19,15 +27,29 @@
         "hooks": [
           {
             "type": "command",
-            "shell": "powershell",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/hooks/platform-guard.ps1\"",
-            "timeout": 5
+            "command": "powershell.exe",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-ExecutionPolicy",
+              "Bypass",
+              "-File",
+              "${CLAUDE_PLUGIN_ROOT}/hooks/platform-guard.ps1"
+            ],
+            "timeout": 10
           },
           {
             "type": "command",
-            "shell": "powershell",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/hooks/update-notify.ps1\"",
-            "timeout": 5
+            "command": "powershell.exe",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-ExecutionPolicy",
+              "Bypass",
+              "-File",
+              "${CLAUDE_PLUGIN_ROOT}/hooks/update-notify.ps1"
+            ],
+            "timeout": 10
           }
         ]
       }

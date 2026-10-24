@@ -1,5 +1,5 @@
 {
-  "description": "Classification of every MCP tool the server registers: allow = runs without a permission prompt (modifies no TestStand file, engine, station or execution state, starts no child process, reads no file the caller names beyond a sequence file); prompt = keeps the permission prompt. Literal names only. build/tests/PluginHooks.Tests.ps1 fails when a registered tool is in neither list, in both, or when an allow entry is unregistered or a wildcard.",
+  "description": "Classification of every MCP tool the server registers: allow = runs without a permission prompt (modifies no TestStand file, engine, station or execution state, starts no child process, reads no file the caller names beyond a sequence file); prompt = keeps the permission prompt. Literal names only. A tool that takes a file path loads the file and runs its SequenceFileLoad callback, so the hook allows it only when every path argument listed in pathArguments is a .seq file inside the session's project folder; notFileArguments lists the path-like parameters that open no file, with the reason. build/tests/ToolClassification.Tests.ps1 fails when a registered tool is in neither list, in both, when an allow entry is unregistered or a wildcard, or when a path-like parameter of an allow-listed tool is undeclared.",
   "allow": [
     "audit_sequence_references",
     "audit_type_consistency",
@@ -282,5 +282,44 @@
       "verdict": "prompt",
       "reason": "Opens the CSV input record stream on ANY path the caller names and returns its lines, so it is an arbitrary file read and not a read of a TestStand file."
     }
+  },
+  "pathArguments": {
+    "audit_sequence_references": ["file_path"],
+    "audit_type_consistency": ["file_path", "reference_file_path"],
+    "check_expression": ["sequence_file_path"],
+    "find_in_file": ["file_path"],
+    "get_array_variable": ["file_path"],
+    "get_breakpoints": ["file_path"],
+    "get_callbacks": ["file_path"],
+    "get_data_type_fields": ["file_path"],
+    "get_data_types": ["sequence_file_path"],
+    "get_enum_values": ["file_path"],
+    "get_file_globals": ["sequence_file_path"],
+    "get_file_properties": ["file_path"],
+    "get_local_variables": ["file_path"],
+    "get_module_parameters": ["file_path"],
+    "get_numeric_limits": ["file_path"],
+    "get_property_object": ["file_path"],
+    "get_property_tree": ["file_path"],
+    "get_sequence": ["file_path"],
+    "get_sequence_parameters": ["file_path"],
+    "get_sequence_properties": ["file_path"],
+    "get_step": ["sequence_file_path"],
+    "get_step_module_info": ["file_path"],
+    "get_step_properties": ["sequence_file_path"],
+    "get_step_templates": ["file_path"],
+    "get_step_unique_id": ["file_path"],
+    "get_steps": ["sequence_file_path"],
+    "get_undo_stack": ["file_path"],
+    "list_file_typedefs": ["file_path"],
+    "search_steps": ["file_path"],
+    "sequence_name_exists": ["file_path"],
+    "step_name_exists": ["file_path"]
+  },
+  "notFileArguments": {
+    "expand_path_macros": { "path": "a path macro string such as <TestStand> that is expanded in memory; no file is opened" },
+    "get_runtime_variable": { "property_path": "a property path inside a live execution, not a file" },
+    "get_step_types": { "palette_file": "only its file name is compared as a text filter over the loaded types; the file is never opened" },
+    "validate_sequence_plan": { "target_sequence_file": "a property of the plan items; the validator needs no engine and opens no file" }
   }
 }

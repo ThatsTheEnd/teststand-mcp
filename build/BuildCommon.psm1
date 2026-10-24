@@ -4,7 +4,7 @@
 #      (What / Why / Fix) every build/*.ps1 reports;
 #    - Resolve-BuildPath: user-supplied paths resolved against the PowerShell
 #      location (NOT the process directory), before any Test-Path or .NET I/O;
-#    - Read-Utf8Text, Get-Utf8NoBomEncoding, Get-JsonProperty;
+#    - Read-Utf8Text, Read-JsonFile, Get-Utf8NoBomEncoding, Get-JsonProperty, Get-PropertyNames;
 #    - Add-GitHubOutput: a step output for later workflow steps;
 #    - Remove-BuildTempTree: temp cleanup that retries and warns.
 #  Compatible with Windows PowerShell 5.1 and PowerShell 7.
@@ -109,6 +109,27 @@ function Get-JsonProperty {
     return $property.Value
 }
 
+# A JSON file as an object. An invalid file fails (What / Why / Fix) naming the file; $Why says what
+# the caller cannot do without it.
+function Read-JsonFile {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Why)
+    $text = Read-Utf8Text $Path
+    try {
+        return ($text | ConvertFrom-Json)
+    } catch {
+        Write-BuildFailure -What "Invalid JSON in ${Path}: $($_.Exception.Message)" -Why $Why -Fix 'Fix the JSON syntax of the file.'
+    }
+}
+
+# The property names of a JSON object (empty for a missing or non-object value).
+function Get-PropertyNames {
+    [CmdletBinding()]
+    param($Object)
+    if ($null -eq $Object) { return @() }
+    return @($Object.PSObject.Properties | ForEach-Object { $_.Name })
+}
+
 # ----------------------------------------------------------------------------
 #  GitHub Actions
 # ----------------------------------------------------------------------------
@@ -150,4 +171,4 @@ function Remove-BuildTempTree {
 }
 
 Export-ModuleMember -Function Get-Utf8NoBomEncoding, Resolve-BuildPath, Write-BuildFailure, Get-ScriptFailureText,
-    Read-Utf8Text, Get-JsonProperty, Add-GitHubOutput, Remove-BuildTempTree
+    Read-Utf8Text, Read-JsonFile, Get-JsonProperty, Get-PropertyNames, Add-GitHubOutput, Remove-BuildTempTree

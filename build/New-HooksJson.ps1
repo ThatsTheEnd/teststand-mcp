@@ -5,11 +5,15 @@
 #  from build/PluginIdentity.psm1 (a matcher of letters, digits, _ - and | is a list
 #  of EXACT strings, never a regular expression), so a tool that prompts starts no
 #  process. The classification is checked against the tools the server registers
-#  first; an invalid one writes nothing and exits 1.
+#  first; an invalid or empty one writes nothing and exits 1.
+#  Every hook is in exec form: "command": "powershell.exe" with an "args" list, so no shell
+#  (and no Git Bash) is involved and a plugin path with a space or a non-ASCII letter needs
+#  no quoting.
 #  Run:  powershell.exe -NoProfile -ExecutionPolicy Bypass -File build\New-HooksJson.ps1
 #  -OutputPath / -ClassesPath / -RegistryPath let the tests point it at fixtures.
-#  The JSON is written by hand (LF, UTF-8 without BOM, final newline) so the bytes are the same
-#  on Windows PowerShell 5.1 and PowerShell 7: ConvertTo-Json indents differently in the two.
+#  The JSON is written by ConvertTo-StableJson (LF, UTF-8 without BOM, final newline) so the
+#  bytes are the same on Windows PowerShell 5.1 and PowerShell 7: ConvertTo-Json indents
+#  differently in the two.
 #  Windows PowerShell 5.1 and PowerShell 7 compatible.
 # ============================================================================
 param(
@@ -20,15 +24,16 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-Import-Module (Join-Path $PSScriptRoot 'BuildCommon.psm1') -Force
-
-$Description = 'TestStand MCP hooks: read-only TestStand tools run without a permission prompt, a startup check warns about a missing TestStand or doc-agent dependency, and a startup notice names a newer release. The hooks print nothing and never block when something fails.'
-$HookShell = 'powershell'
-$CommandFormat = 'powershell -NoProfile -ExecutionPolicy Bypass -File "${{CLAUDE_PLUGIN_ROOT}}/hooks/{0}"'
+$Description = 'TestStand MCP hooks: read-only TestStand tools on .seq files inside the project run without a permission prompt, a startup check warns about a missing TestStand or doc-agent dependency, and a startup notice names a newer release. The hooks print nothing and never block when something fails.'
+$PreToolUseEvent = 'PreToolUse'
+$SessionStartEvent = 'SessionStart'
+$HookExecutable = 'powershell.exe'
+$HookArgumentsBeforeScript = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File')
+$ScriptPathFormat = '${{CLAUDE_PLUGIN_ROOT}}/hooks/{0}'
 $PreToolUseScript = 'allow-readonly.ps1'
 $SessionStartScripts = @('platform-guard.ps1', 'update-notify.ps1')
 $SessionStartMatcher = 'startup'          # not resume, clear or compact
-$SessionStartTimeoutSeconds = 5           # hook timeouts are in seconds (slice 0, fact 5)
+$HookTimeoutSeconds = 10                  # hook timeouts are in seconds (slice 0, fact 5)
 $ToolNameSeparator = '|'
 $IndentUnit = '  '
 
@@ -51,78 +56,79 @@ function ConvertTo-JsonStringLiteral {
     return $builder.ToString()
 }
 
-function Format-HookEntry {
-    param([Parameter(Mandatory)][string]$ScriptName, [int]$TimeoutSeconds = 0, [Parameter(Mandatory)][string]$Indent)
-    $command = $CommandFormat -f $ScriptName
-    $fields = @(
-        '"type": "command"',
-        ('"shell": ' + (ConvertTo-JsonStringLiteral $HookShell)),
-        ('"command": ' + (ConvertTo-JsonStringLiteral $command))
-    )
-    if ($TimeoutSeconds -gt 0) { $fields += ('"timeout": ' + $TimeoutSeconds) }
-    $inner = $Indent + $IndentUnit
-    $lines = @($Indent + '{')
-    for ($index = 0; $index -lt $fields.Count; $index++) {
-        $comma = if ($index -lt $fields.Count - 1) { ',' } else { '' }
-        $lines += ($inner + $fields[$index] + $comma)
+# One stable layout for a tree of ordered dictionaries, arrays, strings, integers and booleans: two-space
+# indent, one member or element per line, keys in the given order.
+function ConvertTo-StableJson {
+    param($Value, [int]$Depth = 0)
+    $outer = $IndentUnit * $Depth
+    $inner = $IndentUnit * ($Depth + 1)
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [bool]) { return $(if ($Value) { 'true' } else { 'false' }) }
+    if ($Value -is [string]) { return (ConvertTo-JsonStringLiteral $Value) }
+    if ($Value -is [int] -or $Value -is [long]) { return $Value.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
+    if ($Value -is [System.Collections.IDictionary]) {
+        if ($Value.Count -eq 0) { return '{}' }
+        $members = @($Value.Keys | ForEach-Object { $inner + (ConvertTo-JsonStringLiteral $_) + ': ' + (ConvertTo-StableJson $Value[$_] ($Depth + 1)) })
+        return "{`n" + ($members -join ",`n") + "`n$outer}"
     }
-    $lines += ($Indent + '}')
-    return $lines
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $items = @($Value | ForEach-Object { $inner + (ConvertTo-StableJson $_ ($Depth + 1)) })
+        if ($items.Count -eq 0) { return '[]' }
+        return "[`n" + ($items -join ",`n") + "`n$outer]"
+    }
+    throw "ConvertTo-StableJson cannot write a value of type $($Value.GetType().FullName)"
 }
 
-# A matcher group: { "matcher": ..., "hooks": [ entries... ] }, entries given as arrays of lines.
-function Format-MatcherGroup {
-    param([Parameter(Mandatory)][string]$Matcher, [Parameter(Mandatory)]$EntryLines, [Parameter(Mandatory)][string]$Indent)
-    $inner = $Indent + $IndentUnit
-    $lines = @(($Indent + '{'), ($inner + '"matcher": ' + (ConvertTo-JsonStringLiteral $Matcher) + ','), ($inner + '"hooks": ['))
-    for ($index = 0; $index -lt $EntryLines.Count; $index++) {
-        $entry = @($EntryLines[$index])
-        if ($index -lt $EntryLines.Count - 1) { $entry[$entry.Count - 1] += ',' }
-        $lines += $entry
+function New-HookEntry {
+    param([Parameter(Mandatory)][string]$ScriptName)
+    $arguments = @($HookArgumentsBeforeScript) + ($ScriptPathFormat -f $ScriptName)
+    return [ordered]@{
+        type    = 'command'
+        command = $HookExecutable
+        args    = [object[]]$arguments
+        timeout = $HookTimeoutSeconds
     }
-    $lines += ($inner + ']')
-    $lines += ($Indent + '}')
-    return $lines
 }
 
-function New-HooksJsonText {
+function New-HooksTree {
     param([Parameter(Mandatory)][string[]]$ToolNames, [Parameter(Mandatory)][string]$ToolPrefix)
     $matcher = ($ToolNames | ForEach-Object { $ToolPrefix + $_ }) -join $ToolNameSeparator
-
-    $preEntry = Format-HookEntry -ScriptName $PreToolUseScript -Indent ($IndentUnit * 5)
-    $preGroup = Format-MatcherGroup -Matcher $matcher -EntryLines @(, $preEntry) -Indent ($IndentUnit * 3)
-
-    $startEntries = @($SessionStartScripts | ForEach-Object {
-        , (Format-HookEntry -ScriptName $_ -TimeoutSeconds $SessionStartTimeoutSeconds -Indent ($IndentUnit * 5))
-    })
-    $startGroup = Format-MatcherGroup -Matcher $SessionStartMatcher -EntryLines $startEntries -Indent ($IndentUnit * 3)
-
-    $lines = @('{', ($IndentUnit + '"description": ' + (ConvertTo-JsonStringLiteral $Description) + ','), ($IndentUnit + '"hooks": {'))
-    $lines += ($IndentUnit * 2) + '"PreToolUse": ['
-    $lines += $preGroup
-    $lines += ($IndentUnit * 2) + '],'
-    $lines += ($IndentUnit * 2) + '"SessionStart": ['
-    $lines += $startGroup
-    $lines += ($IndentUnit * 2) + ']'
-    $lines += ($IndentUnit + '}')
-    $lines += '}'
-    return (($lines -join "`n") + "`n")
+    $sessionStartEntries = [object[]]@($SessionStartScripts | ForEach-Object { New-HookEntry $_ })
+    return [ordered]@{
+        description = $Description
+        hooks       = [ordered]@{
+            $PreToolUseEvent   = [object[]]@([ordered]@{ matcher = $matcher; hooks = [object[]]@(New-HookEntry $PreToolUseScript) })
+            $SessionStartEvent = [object[]]@([ordered]@{ matcher = $SessionStartMatcher; hooks = $sessionStartEntries })
+        }
+    }
 }
 
-try {
-    Import-Module (Join-Path $PSScriptRoot 'PluginIdentity.psm1') -Force
-    Import-Module (Join-Path $PSScriptRoot 'ToolClassification.psm1') -Force
+# Dot-sourcing (the tests) loads the functions only.
+if ($MyInvocation.InvocationName -ne '.') {
+    try {
+        Import-Module (Join-Path $PSScriptRoot 'BuildCommon.psm1') -Force
+        Import-Module (Join-Path $PSScriptRoot 'PluginIdentity.psm1') -Force
+        Import-Module (Join-Path $PSScriptRoot 'ToolClassification.psm1') -Force
 
-    $classes = Read-ToolClasses -Path $ClassesPath
-    Assert-ToolClassification -Classes $classes -RegisteredTools (Get-RegisteredToolNames -RegistryPath $RegistryPath) -ClassesPath $ClassesPath
+        $classes = Read-ToolClasses -Path $ClassesPath
+        $allow = @(Get-ClassList $classes 'allow')
+        if ($allow.Count -eq 0) {
+            Write-BuildFailure -What "The allow list in $ClassesPath is empty." `
+                -Why 'A PreToolUse entry with an empty matcher would start the hook for EVERY tool of every server, so no hooks.json is written.' `
+                -Fix 'List the read-only tools under "allow", or do not generate the hooks.'
+        }
+        Assert-ToolClassification -Classes $classes -RegisteredTools (Get-RegisteredToolNames -RegistryPath $RegistryPath) `
+            -ClassesPath $ClassesPath -ToolParameters (Get-RegisteredToolParameters -RegistryPath $RegistryPath)
 
-    $text = New-HooksJsonText -ToolNames @($classes.allow) -ToolPrefix (Get-PluginIdentity).pluginToolPrefix
-    $target = Resolve-BuildPath $OutputPath
-    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $target))
-    [IO.File]::WriteAllText($target, $text, (Get-Utf8NoBomEncoding))
-    Write-Host "Wrote $OutputPath ($(@($classes.allow).Count) allow-listed tools)"
-    exit 0
-} catch {
-    Write-Host (Get-ScriptFailureText -ErrorRecord $_)
-    exit 1
+        $text = (ConvertTo-StableJson (New-HooksTree -ToolNames $allow -ToolPrefix (Get-PluginIdentity).pluginToolPrefix)) + "`n"
+        $target = Resolve-BuildPath $OutputPath
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $target))
+        [IO.File]::WriteAllText($target, $text, (Get-Utf8NoBomEncoding))
+        Write-Host "Wrote $OutputPath ($($allow.Count) allow-listed tools)"
+        exit 0
+    } catch {
+        if (Get-Command Get-ScriptFailureText -ErrorAction SilentlyContinue) { Write-Host (Get-ScriptFailureText -ErrorRecord $_) }
+        else { Write-Host "What: $($_.Exception.Message)" }
+        exit 1
+    }
 }

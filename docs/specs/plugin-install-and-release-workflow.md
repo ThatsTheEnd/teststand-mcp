@@ -221,16 +221,20 @@ bin/README.md, bin/CLAUDE.md
     `2. claude plugin update teststand-mcp`. It says to restart Claude Code afterwards, and that the
     message can be ignored when marketplace auto-update is on;
   - the same new version is announced at most once per 24 h;
-  - when the versions are equal, when the installed version is the `0.0.0` development placeholder,
-    or when the check fails for any reason (offline, proxy, TLS, timeout, parse error), it prints
-    nothing and exits 0;
+  - when the versions are equal, when the installed version is the `0.0.0` development placeholder
+    or is not a plain `X.Y.Z`, or when the check fails for any reason (offline, proxy, TLS, timeout,
+    parse error), it prints nothing and exits 0. A pre-release tag (for example `v2.0.0-rc1`) is
+    never announced: only plain `X.Y.Z` tags count;
   - a failed lookup is cached too, so an offline station pays the timeout at most once per 24 h;
   - the latest version comes from the redirect target of
     `https://github.com/Zuehlke/teststand-mcp/releases/latest`, which has no API rate limit. A
     leading `v` or `V` is stripped. Versions compare numerically (`1.10.0` > `1.9.0`);
-  - the HTTP lookup has a 3 s timeout, and each SessionStart entry in `hooks.json` has a timeout of
-    5 (seconds), if slice 0 confirmed the field exists. The under-5 s wall-clock total is checked
-    locally on a Windows station and is not a CI assertion;
+  - the HTTP lookup has a 3 s timeout, and each hook entry in `hooks.json` (both SessionStart entries
+    and the PreToolUse entry) has a timeout of 10 (seconds, slice 0 fact 5). The wall-clock total of a
+    hanging lookup (the 3 s timeout plus the shell start, under 5 s) is checked locally on a Windows
+    station (`TESTSTAND_MCP_TIMING_CHECK=1`) and is not a CI assertion;
+  - the plugin name and the repository come from the installed `plugin.json`; a test-only override of
+    the repository URL is honoured only for `https://github.com/` and loopback `http://` URLs;
   - setting `TESTSTAND_MCP_NO_UPDATE_CHECK=1` disables it;
   - it never blocks the session.
 - **AC-14 Read-only auto-allow hook.** Tools on an explicit allow-list of **literal names** (no
@@ -243,22 +247,39 @@ bin/README.md, bin/CLAUDE.md
   - It excludes the analyzer, `diff_sequence_files` and `compare_sequence_files`, because they spawn
     processes and write temp files.
   - It excludes `find_file`, because the engine can raise a modal prompt.
+  - A tool that takes a file path also loads the file, and loading runs the file's `SequenceFileLoad`
+    callback (measured, slice 0 facts, fact 18). So such a call is auto-allowed only when EVERY path
+    argument the tool declares (`pathArguments` in `tool-classes.json`, derived from the tool schemas)
+    is a `.seq` file (case-insensitive) on a local drive that lies inside the hook input's `cwd`, the
+    session's project folder. A path must be a non-empty absolute `X:\...` path: no UNC, `\\?\`,
+    `\\.\`, relative or drive-relative path, no wildcard, and no `..` that escapes the folder after
+    `[IO.Path]::GetFullPath`. Both sides are normalised (full path, trailing separator, case-insensitive
+    prefix on a segment boundary). Anything else, including a missing `cwd`, prints nothing, so the user
+    gets the normal prompt. An absent argument does not block; a present non-string value prompts.
+    Tools without a path argument are not affected. The one residual risk, stated in the README: a
+    `.seq` inside the project still runs its `SequenceFileLoad` callback, so open only files you trust.
   - A test fails when a registered tool is in neither the allow-list nor an explicit prompt-list, so
-    every new tool is classified on purpose.
+    every new tool is classified on purpose, and when an allow-listed tool has a path-like parameter
+    (a name containing `path` or `file`) that is declared neither as a path argument nor as "not a file".
   - Malformed hook input yields no decision, never an error.
 - **AC-15 Platform guard.** At session **startup** only:
-  - on a non-Windows host, the hook prints one message explaining that the server needs Windows
-    with TestStand;
+  - ~~on a non-Windows host, the hook prints one message explaining that the server needs Windows
+    with TestStand~~ (struck: the server executable cannot start off Windows, and the README states
+    that the plugin is Windows-only; a POSIX hook entry could also show a hook-error notice to a
+    Windows user without Git Bash, slice 0 fact 10);
   - on Windows it prints one combined, plain-ASCII warning, and never blocks, when TestStand is not
     detected, or when Python (found through `py -3` first, then `python`), `python-docx`, Pillow or
     Edge/Chrome are missing. "TestStand detected" means the `TestStand` environment variable is set,
     or a `National Instruments\TestStand*` folder exists under `%ProgramFiles%` or
     `%ProgramFiles(x86)%`. The warning states that the doc and presentation agents are optional and
-    gives the install command `py -m pip install python-docx pillow`;
+    gives the install command of the found interpreter (`py -m pip install python-docx pillow`, or
+    `python -m ...` when only `python` was found);
   - a healthy station sees no warning;
-  - the optional-dependency part appears at most once per 24 h for the same missing set, and
-    `TESTSTAND_MCP_NO_PLATFORM_WARNING=1` switches it off. A missing TestStand is reported every
-    time;
+  - the optional dependencies are probed at most once per 24 h and the outcome is cached with its
+    time, so inside that window nothing is probed and the optional warning is not repeated; a
+    changed missing set is noticed when the window ends. `TESTSTAND_MCP_NO_PLATFORM_WARNING=1`
+    switches the optional part off. A missing TestStand is reported every time, and so is the
+    rules pointer, even when an optional probe fails;
   - it also emits a one-line `additionalContext` that tells the model to load the `teststand-rules`
     skill before TestStand work, so the rules do not depend on the skill description being matched.
     This item applies only if the AC-2 spike confirms SessionStart supports `additionalContext`.
@@ -377,8 +398,8 @@ bin/README.md, bin/CLAUDE.md
 | CI test gate | `inferable` | inference | Integration tests need a licensed TestStand engine, which runners lack. CI gates on build, packaging and smoke tests. The pre-push hook stays the test gate. |
 | Read-only allow-list membership | `inferable` | inference | The server declares no `readOnlyHint`, so the list is explicit and curated. Rule: no file, engine, station or execution mutation. `evaluate_*` and the analyzer are excluded. The list is reviewed in `/plan`. |
 | Single source for user rules | `inferable` | inference | A copied skill would drift from `CLAUDE.md`. `CLAUDE.md` supports `@path` imports, so the skill is canonical and `CLAUDE.md` imports it. |
-| Notify-hook throttling and failure mode | `inferable` | inference | The unauthenticated GitHub API allows 60 requests/h, and a SessionStart hook must never block. So: 24 h cache, 5 s cap, and silence on any failure. |
-| Notify-hook shell | `inferable` | inference | Windows-only payoff, so PowerShell. The platform guard stays POSIX `sh` because it must run on the non-Windows hosts it warns. |
+| Notify-hook throttling and failure mode | `inferable` | inference | The unauthenticated GitHub API allows 60 requests/h, and a SessionStart hook must never block. So: 24 h cache, a 3 s HTTP cap inside a 10 s hook timeout, and silence on any failure. |
+| Notify-hook shell | `inferable` | inference | Windows-only payoff, so PowerShell, started in exec form (`powershell.exe` with an `args` list: no shell, no Git Bash, no quoting). The platform guard is PowerShell too; the non-Windows message was dropped (AC-15), because the server cannot start off Windows. |
 | `.tsenv` configuration on a plugin install | `inferable` | inference | The plugin cache is replaced on update, so `bin/appsettings.json` edits are lost. The existing `TESTSTAND_MCP_` environment variable route survives (AC-17). |
 | Direct-registration agents in the zip | `inferable` | inference | The Claude Desktop/manual route still exists and needs the `mcp__teststand__` flavour plus `link-agents.bat`. labview-mcp ships both flavours for the same reason. |
 | Hand-cut releases in existing history | `inferable` | inference | Not touched. `/releases/latest` resolves to the first workflow-built release once it is published. |

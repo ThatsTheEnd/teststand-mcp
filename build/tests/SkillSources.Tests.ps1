@@ -40,32 +40,8 @@ $DenySamples = @{
 # A lower-case form of a case-sensitive entry that must NOT match.
 $CaseNegatives = @{ 'test id' = 'Pinned by t35.' }
 
-$script:Failures = 0
-$script:TempDirs = @()
-
-function Invoke-Case {
-    param([string]$Name, [scriptblock]$Body)
-    try {
-        & $Body
-        Write-Host "PASS  $Name"
-    } catch {
-        $script:Failures++
-        Write-Host "FAIL  $Name"
-        Write-Host "      $($_.Exception.Message)"
-    }
-}
-
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
-}
-
-function New-TempDir {
-    $dir = Join-Path ([IO.Path]::GetTempPath()) ('SkillSourcesTests_' + [Guid]::NewGuid().ToString('N'))
-    [void](New-Item -ItemType Directory -Path $dir)
-    $script:TempDirs += $dir
-    return $dir
-}
+. (Join-Path $PSScriptRoot 'TestHarness.ps1')
+$script:TempDirPrefix = 'SkillSourcesTests_'
 
 function Write-FixtureText {
     param([string]$Path, [string]$Text)
@@ -421,16 +397,7 @@ try {
     }
 }
 finally {
-    foreach ($dir in $script:TempDirs) {
-        if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
-    }
+    Remove-TestTempDirs
 }
 
-if ($script:Failures -gt 0) {
-    Write-Host ''
-    Write-Host "$script:Failures case(s) FAILED"
-    exit 1
-}
-Write-Host ''
-Write-Host 'All cases passed'
-exit 0
+Complete-TestRun

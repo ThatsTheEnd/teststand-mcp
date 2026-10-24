@@ -389,9 +389,9 @@ Feature: Plugin users get the TestStand usage rules
 ### Slice 4: Plugin hooks
 
 **Depends-on:** 0, 2
-**Files:** `plugin/hooks/hooks.json`, `plugin/hooks/allow-readonly.ps1`, `plugin/hooks/tool-classes.json`, `plugin/hooks/platform-guard.ps1`, `plugin/hooks/platform-guard.sh`, `plugin/hooks/hook-common.ps1`, `plugin/hooks/update-notify.ps1`, `build/New-HooksJson.ps1`, `build/ToolClassification.psm1`, `build/tests/PluginHooks.Tests.ps1`
+**Files:** `plugin/hooks/hooks.json`, `plugin/hooks/allow-readonly.ps1`, `plugin/hooks/tool-classes.json`, `plugin/hooks/platform-guard.ps1`, `plugin/hooks/hook-common.ps1`, `plugin/hooks/update-notify.ps1`, `build/New-HooksJson.ps1`, `build/ToolClassification.psm1`, `build/tests/TestHarness.ps1`, `build/tests/HookTestSupport.ps1`, `build/tests/ToolClassification.Tests.ps1`, `build/tests/AllowHook.Tests.ps1`, `build/tests/PlatformGuard.Tests.ps1`, `build/tests/UpdateNotify.Tests.ps1`, `build/tests/HooksJson.Tests.ps1`
 
-**Shell decision (slice 0 fact 10):** on Windows a hook command runs in Git Bash when present, else PowerShell, and Git Bash must not be required. All Windows hook logic is therefore a Windows PowerShell 5.1 script pinned to `"shell": "powershell"`. `platform-guard.sh` (POSIX `sh`) only carries the non-Windows message and is **not wired into `hooks.json`**: the official hooks documentation says that "without Git Bash, a shell-form hook with no `shell` set runs in PowerShell, where it can fail", and that "a hook that can't start is a non-blocking error", which shows a `<hook name> hook error` notice, so a Windows station without Git Bash would see an error from a `sh` entry. The file and its tests stay, ready for a host where a POSIX entry can be wired safely. The consequence is that AC-15's non-Windows message is not delivered at run time. The quotes are recorded in `docs/validation/claude-code-plugin-facts.md` (facts 10 and 15).
+**Hook command decision (slice 0 facts 10, 15, 17):** on Windows a shell-form hook command runs in Git Bash when present, else PowerShell, and Git Bash must not be required. Every hook is therefore a Windows PowerShell 5.1 script started in **exec form**: `"command": "powershell.exe"` with an `"args"` list (`-NoProfile`, `-NonInteractive`, `-ExecutionPolicy`, `Bypass`, `-File`, `${CLAUDE_PLUGIN_ROOT}/hooks/<script>.ps1`) and no `shell` field. No shell is involved, so Git Bash is irrelevant, and the plugin path is one argv element that needs no quoting. All three entries carry `"timeout": 10` (seconds). `onFailure` is not set (it needs Claude Code 2.1.295 and the minimum client is 2.1.224); the exec form means a failing hook lets the call go ahead according to the docs. The non-Windows guard (`platform-guard.sh`) was **dropped**: the server executable cannot start off Windows, the README states Windows-only, and a POSIX entry could show a hook-error notice to a Windows user without Git Bash (fact 10).
 
 **Behavior:**
 
@@ -399,8 +399,36 @@ Feature: Plugin users get the TestStand usage rules
 Feature: Plugin hooks help without getting in the way
 
   Scenario: A read-only tool runs without a prompt
-    When the allow hook receives "mcp__plugin_teststand-mcp_teststand__get_steps"
+    When the allow hook receives "mcp__plugin_teststand-mcp_teststand__get_station_info"
     Then it returns an allow decision with the reason "no TestStand file is modified"
+
+  Scenario: A path-taking read tool on a .seq inside the project
+    Given the hook input names the project folder C:\Work\Proj as its cwd
+    When the allow hook receives get_steps with sequence_file_path "C:\Work\Proj\tests\a.seq"
+    Then it returns an allow decision
+
+  Scenario Outline: A path that is not a .seq inside the project keeps the prompt
+    Given the hook input names the project folder C:\Work\Proj as its cwd
+    When the allow hook receives get_steps with sequence_file_path <path>
+    Then it prints nothing and exits 0
+
+    Examples:
+      | path                                     | reason                          |
+      | \\server\share\Work\Proj\a.seq        | UNC                             |
+      | \\?\C:\Work\Proj\a.seq                | \\?\ prefix                    |
+      | C:\Elsewhere\a.seq                      | outside the project             |
+      | C:\Work\Proj\..\Other\a.seq            | .. escapes the project          |
+      | C:\Work\Proj\a.txt                     | not a .seq                      |
+      | a.seq                                    | relative                        |
+
+  Scenario: Every path argument must pass
+    When the allow hook receives audit_type_consistency with file_path inside the project
+      and reference_file_path outside it
+    Then it prints nothing and exits 0
+
+  Scenario: No project folder
+    When the allow hook receives a path-taking tool and the hook input has no cwd
+    Then it prints nothing and exits 0
 
   Scenario Outline: Tools that still prompt
     When the allow hook receives "mcp__plugin_teststand-mcp_teststand__<tool>"
@@ -448,11 +476,6 @@ Feature: Plugin hooks help without getting in the way
     When hooks.json is read
     Then the PreToolUse matcher lists exactly the allow-listed names
 
-  Scenario: Non-Windows host
-    Given the session starts on Linux
-    When the platform guard runs
-    Then it prints one systemMessage saying the server needs Windows with TestStand, and exits 0
-
   Scenario: Healthy Windows station
     Given TestStand, Python with python-docx and Pillow, and Edge are present
     When the platform guard runs at startup
@@ -464,6 +487,7 @@ Feature: Plugin hooks help without getting in the way
     When the platform guard runs at startup
     Then it prints exactly one ASCII warning naming <named> and its fix, and exits 0
     And for optional items it states that the doc and presentation agents are optional
+    And the install command is the found interpreter's (py, or python when py is absent)
 
     Examples:
       | missing                                     | named                                          |
@@ -480,10 +504,15 @@ Feature: Plugin hooks help without getting in the way
     Then it prints no warning
 
   Scenario: The optional warning does not nag
-    Given the same optional dependencies were reported missing 3 hours ago
+    Given the optional dependencies were probed and reported missing 3 hours ago
     When the platform guard runs at startup
-    Then it prints no optional-dependency warning
+    Then it starts no interpreter and prints no optional-dependency warning
     And a missing TestStand is still reported every time
+
+  Scenario: A failing probe costs nothing
+    Given TestStand is not detected and an optional probe throws
+    When the platform guard runs at startup
+    Then the TestStand warning and the rules pointer are still printed
 
   Scenario: Optional warnings switched off
     Given TESTSTAND_MCP_NO_PLATFORM_WARNING is 1
@@ -541,13 +570,13 @@ Feature: Plugin hooks help without getting in the way
 
   Scenario: Hook commands survive awkward paths
     Given the plugin root contains a space and a non-ASCII character
-    When each hook command from hooks.json is run
+    When each hook entry from hooks.json is spawned with its args as single arguments
     Then each one starts and behaves as above
 
   Scenario: SessionStart hooks run at startup only, within a timeout
     When hooks.json is read
-    Then both SessionStart entries match "startup" and not "resume" or "clear"
-    And each carries a timeout no larger than 5 seconds, unless slice 0 recorded that hooks take no timeout
+    Then the SessionStart group matches "startup" and not "resume" or "clear"
+    And all three hook entries are exec-form powershell.exe commands with a timeout of 10 seconds
 ```
 
 **Steps:**
@@ -579,24 +608,25 @@ user_name_exists validate_sequence_plan
 
 All other registered tools go to `prompt`, including `diff_sequence_files`, `compare_sequence_files` and `find_file`, which look read-only by name.
 
+**Path rule (review decision, fact 18):** a path-taking read tool loads the file and runs its `SequenceFileLoad` callback, so the 75-tool list is kept but a call is auto-allowed only when EVERY path argument the tool declares meets all of: a non-empty absolute local drive path (`X:\...`: no UNC, `\\?\`, `\\.\`, relative path, wildcard or `..` that escapes after `GetFullPath`); extension `.seq`, case-insensitive; inside the hook input's `cwd` after normalising both sides (full path, trailing separator, case-insensitive prefix on a segment boundary; a drive root is no project folder). Anything else, including a missing `cwd`, prints nothing. The argument names are declared in `tool-classes.json` (`pathArguments`: 31 tools; `notFileArguments`: the four path-like parameters that open no file, with the reason), derived from the C# tool schemas, and the classification check fails when an allow-listed tool has a path-like parameter (name contains `path` or `file`) that is declared in neither, or declares a name the tool does not have. An absent argument does not block; a present non-string value prompts. The tool prefix in the hook is the full `mcp__plugin_teststand-mcp_teststand__` (a constant, drift-tested against `PluginIdentity`).
+
 **Audit result (built):** the committed allow-list has **75** tools and `prompt` has 177 (252 registered). `get_step_unique_id` (reads `Step.UniqueStepId`, no setter, no save), `find_in_file` (engine search over one loaded sequence file, no replacement, no save) and `get_report_text` (reads `Execution.ReportText` of an in-memory execution, takes no path) are **kept**. `read_csv_lines` **moved to `prompt`**: it opens the CSV input record stream on any path the caller names and returns its lines, an arbitrary file read. The verdicts and reasons are recorded under `audit` in `tool-classes.json` and checked against the lists; the permanent exclusions sit under `neverAllow`. The classification check is `build/ToolClassification.psm1`, shared by the test and `New-HooksJson.ps1`.
-**TEST**: `PluginHooks.Tests.ps1` runs the allowed case, both Outlines, the malformed input, and the named-exclusion invariant. The classification check runs against `Register("…")` in `src/Tools/TestStandToolRegistry.cs`, plus fixture classifications for each fault row. It runs under both `powershell.exe` and `pwsh`.
+**TEST**: `ToolClassification.Tests.ps1` runs the classification check against `Register("...")` in `src/Tools/TestStandToolRegistry.cs`, plus fixture classifications for each fault row and the named-exclusion invariant. `AllowHook.Tests.ps1` runs the allowed case, both Outlines, the malformed input and the path matrix below. Both run under `powershell.exe` (a `pwsh` run was not possible on the build station).
 **REFACTOR**: Sort both arrays, one name per line.
-**Files**: `plugin/hooks/allow-readonly.ps1`, `plugin/hooks/hook-common.ps1`, `plugin/hooks/tool-classes.json`, `build/ToolClassification.psm1`, `build/tests/PluginHooks.Tests.ps1`
+**Files**: `plugin/hooks/allow-readonly.ps1`, `plugin/hooks/hook-common.ps1`, `plugin/hooks/tool-classes.json`, `build/ToolClassification.psm1`, `build/tests/ToolClassification.Tests.ps1`, `build/tests/AllowHook.Tests.ps1`
 **Commit**: `feat: auto-allow read-only TestStand tools, classify every tool`
 
 #### Step 4.2: Platform guard
 
 **Complexity**: standard
-**IMPLEMENT**: Run on `startup` only. The Windows part is `plugin/hooks/platform-guard.ps1` (Windows PowerShell 5.1, pinned to `"shell": "powershell"`). `plugin/hooks/platform-guard.sh` (POSIX `sh`) carries only the non-Windows message, and exits 0 silently when `uname` reports MINGW, MSYS, CYGWIN or Windows, so a Windows station with Git Bash never gets a double message. The `.sh` entry is not wired (see the Shell decision above).
-- Non-Windows (`.sh`): one systemMessage saying the server needs Windows with NI TestStand.
-- Windows (`.ps1`): one combined ASCII warning. TestStand is detected by the `TestStand` env var, then the `…\National Instruments\TestStand*` folders under the Program Files roots (`ProgramW6432`, `ProgramFiles`, `ProgramFiles(x86)`). Python is found through `py -3` first, then `python`; one probe per interpreter, cut off after 1.5 s, answers whether `python-docx` and Pillow import. Edge/Chrome is looked up the way `scripts/generate_teststand_doc.py` does.
-- Always: the `additionalContext` rules pointer (slice 0 fact 6 confirmed the field).
-- The optional-dependency part is throttled to once per 24 h per missing set (a stored time of exactly 24 h or more, or in the future, is expired), using the same cache location as the notify hook: `TESTSTAND_MCP_STATE_DIR`, else `${CLAUDE_PLUGIN_DATA}`, else `%LOCALAPPDATA%\teststand-mcp\`. A different missing set warns again at once. The fix shown for a missing TestStand is "install NI TestStand 2019 or later, or start Claude Code where TestStand is installed". `TESTSTAND_MCP_NO_PLATFORM_WARNING=1` switches the optional part off (and does not consume the throttle). A missing TestStand is never throttled.
-- Git Bash is **not** required: nothing here runs in Git Bash, so no README prerequisite is needed.
-**TEST**: Injected `PATH` (stub `py` / `python` launchers), Program Files roots, env and clock (`TESTSTAND_MCP_NOW`) for every Outline row, the launcher fallback, a hanging interpreter, the throttle (23 h 59 m 59 s against exactly 24 h), a changed set, a clock that moved back, a corrupt or unwritable state, the state-directory precedence and the opt-out. For the `.sh`, a stubbed `uname` for Linux, Darwin and every Windows value, a failing `uname` and a hostile value. Check that the output is ASCII and that each case prints exactly one message.
-**REFACTOR**: One `emit` helper for JSON escaping (`emit_system_message` in the `.sh`, `Write-HookOutput` in `hook-common.ps1`).
-**Files**: `plugin/hooks/platform-guard.ps1`, `plugin/hooks/platform-guard.sh`, `plugin/hooks/hook-common.ps1`, `build/tests/PluginHooks.Tests.ps1`
+**IMPLEMENT**: `plugin/hooks/platform-guard.ps1` (Windows PowerShell 5.1, exec form), `startup` only. There is no non-Windows variant: the server cannot start off Windows.
+- One combined ASCII warning. TestStand is detected by the `TestStand` env var, then the `...\National Instruments\TestStand*` folders under the Program Files roots (`ProgramW6432`, `ProgramFiles`, `ProgramFiles(x86)`). Python is found through `py -3` first, then `python`; one probe per interpreter (`-E`, run in the hooks folder, cut off after 3 s, its process tree killed on a timeout) answers whether `python-docx` and Pillow import. The worst case is 0.6 s + 2 x (3 s + 1 s) = 8.6 s, inside the 10 s hook timeout. Edge/Chrome is looked up the way `scripts/generate_teststand_doc.py` does.
+- Always: the `additionalContext` rules pointer (slice 0 fact 6). A missing-TestStand warning and the pointer never depend on an optional probe: a probe that fails is "not probed".
+- The optional dependencies are probed at most once per 24 h: the outcome (the missing set, possibly empty) is cached with its time in `platform-guard.json`, in the same location as the notify hook (`TESTSTAND_MCP_STATE_DIR` if absolute, else `${CLAUDE_PLUGIN_DATA}`, else `%LOCALAPPDATA%\teststand-mcp\`). Inside the window nothing is probed and the optional warning is not repeated (a stored time of exactly 24 h or more, or in the future, is expired); a changed missing set is noticed when the window ends. The fix shown for a missing TestStand is "install NI TestStand 2019 or later, or start Claude Code where TestStand is installed". `TESTSTAND_MCP_NO_PLATFORM_WARNING=1` switches the optional part off (nothing is probed, the window is not consumed). A missing TestStand is never throttled. The output is written before the state.
+- The pip command shown is the found interpreter's: `py -m pip install python-docx pillow`, or `python -m ...` when only `python` was found.
+**TEST**: Injected `PATH` (stub `py` / `python` launchers that log their arguments and working directory), Program Files roots, env and clock (`TESTSTAND_MCP_NOW`) for every Outline row, the launcher fallback and which interpreter wins, a hanging interpreter, the window (23 h 59 m 59 s against exactly 24 h, with the probe log showing that no interpreter starts inside it), a changed set, a clock that moved back, a corrupt or unwritable state, the state-directory precedence, the opt-out and a probe that throws. Check that the output is ASCII, that the raw output holds exactly one `systemMessage`, and that each case prints exactly one message.
+**REFACTOR**: One `Write-HookOutput` helper for JSON escaping; the pure decisions (`Select-DueFindings`, `Test-OptionalProbeDue`, `Get-MissingSetKey`) are separate from the probes and the state write.
+**Files**: `plugin/hooks/platform-guard.ps1`, `plugin/hooks/hook-common.ps1`, `build/tests/PlatformGuard.Tests.ps1`
 **Commit**: `feat: warn on unsupported hosts and missing doc-agent dependencies`
 
 #### Step 4.3: Update-notify hook
@@ -607,22 +637,22 @@ All other registered tools go to `prompt`, including `diff_sequence_files`, `com
 - Find the latest version from the `Location` header of a no-redirect `HEAD` to `…/releases/latest`.
 - Cache success *and* failure for 24 h, plus the last announced version, in `${CLAUDE_PLUGIN_DATA}` when slice 0 confirms it exists, else `%LOCALAPPDATA%\teststand-mcp\`.
 - Compare with `[version]` after stripping `v`/`V`.
-- Skip `0.0.0` and the opt-out variable.
-- Allow a 3 s HTTP budget so the total, including the shell start, stays under 5 s.
+- Skip `0.0.0`, an installed version that is not a plain `X.Y.Z`, and the opt-out variable. The plugin name and the repository come from the installed `plugin.json`.
+- Allow a 3 s HTTP budget inside the 10 s hook timeout; the shell start plus the budget stays under 5 s.
 - The base URL (`TESTSTAND_MCP_RELEASES_BASE_URL`), the clock (`TESTSTAND_MCP_NOW`), the cache directory (`TESTSTAND_MCP_STATE_DIR`, else `${CLAUDE_PLUGIN_DATA}`, else `%LOCALAPPDATA%\teststand-mcp\`) and the plugin root (`CLAUDE_PLUGIN_ROOT`, else the folder above the script) are injectable through env vars. Tests never touch the real `%LOCALAPPDATA%`.
 - The lookup is bounded as a whole (connect included): an async `HEAD` abandoned after 3 s, so a blackholed connection cannot outlast it. The state file is `update-notify.json`; the hook shares `hook-common.ps1` with the other two PowerShell hooks.
-**TEST**: A local `HttpListener` on an ephemeral port serves a newer redirect, an equal one, a lower one, a 500, a hang, garbage and `V`/malformed tags. Also run the cache-boundary Outline, opt-out and `0.0.0`. Assert the configured HTTP timeout, and that the hang case returns after one timeout. The wall-time bound under 5 s is a local check only, not a CI assertion.
+**TEST**: A local `HttpListener` on an ephemeral port serves a newer redirect, an equal one, a lower one, a 500, a hang, garbage and `V`/malformed tags. Also run the cache-boundary Outline (including a fresh successful lookup that announces without a request, and a timed-out lookup that stays cached), opt-out, `0.0.0` and a non-`X.Y.Z` installed version, and the repository allow-list (`https://github.com/` or loopback only). Assert the 3000 ms constant, and that the hang case returns after at least one timeout. The wall-time upper bound is opt-in (`TESTSTAND_MCP_TIMING_CHECK=1`), not a CI assertion; the stub does not simulate a blackholed connect.
 **REFACTOR**: A pure `Get-UpdateMessage` decides; the I/O wraps it.
-**Files**: `plugin/hooks/update-notify.ps1`, `build/tests/PluginHooks.Tests.ps1`
+**Files**: `plugin/hooks/update-notify.ps1`, `plugin/hooks/hook-common.ps1`, `build/tests/UpdateNotify.Tests.ps1`
 **Commit**: `feat: tell plugin users once a day when a newer release exists`
 
 #### Step 4.4: hooks.json wiring
 
 **Complexity**: standard
-**IMPLEMENT**: `build/New-HooksJson.ps1` generates the PreToolUse matcher from `PluginIdentity` plus `tool-classes.json`'s allow-list, and the result is committed. The matcher is the `|`-joined list of the full tool names: a matcher of only letters, digits, `_`, `-` and `|` is a list of exact strings, not a regular expression (slice 0 fact 16). A prompting tool therefore starts no process. The generator first runs the classification check (`build/ToolClassification.psm1`) against the registered tools, and writes nothing for an invalid classification. The JSON is written by hand (LF, no BOM, final newline), so the bytes are identical on Windows PowerShell 5.1 and PowerShell 7. Every entry is `"type": "command"`, `"shell": "powershell"`, with the command `powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}/hooks/<script>.ps1"`: `allow-readonly.ps1` for PreToolUse; `platform-guard.ps1` and `update-notify.ps1` for the one SessionStart group, matcher `startup`, each with `"timeout": 5` (seconds, fact 5). `platform-guard.sh` is not wired (Shell decision above). The top-level `description` is filled in (`hooks/hooks.json` accepts it).
-**TEST**: Re-running `New-HooksJson.ps1` reproduces the committed `hooks.json` byte for byte (line endings aside, because `core.autocrlf` may check the file out with CRLF), so the matcher equals the allow-list. Every command path is quoted and exists. The SessionStart matcher is `startup` and the timeout is checked. Faulty classifications are refused with the offending entry named and no file written. The awkward-path scenario runs each command from a staging copy under a generated `%TEMP%\<guid> T<e-acute>st\plugin root` folder, as PowerShell text with the placeholder substituted (what `"shell": "powershell"` does). The test file stays ASCII (the letter is built from its code point), which 5.1 reads correctly without a BOM.
+**IMPLEMENT**: `build/New-HooksJson.ps1` generates the PreToolUse matcher from `PluginIdentity` plus `tool-classes.json`'s allow-list, and the result is committed. The matcher is the `|`-joined list of the full tool names: a matcher of only letters, digits, `_`, `-` and `|` is a list of exact strings, not a regular expression (slice 0 fact 16). A prompting tool therefore starts no process. The generator first runs the classification check (`build/ToolClassification.psm1`) against the registered tools and their parameters, and writes nothing for an invalid or empty classification. One recursive `ConvertTo-StableJson` writes the tree (LF, no BOM, final newline), so the bytes are identical on Windows PowerShell 5.1 and PowerShell 7. Every entry is `"type": "command"`, `"command": "powershell.exe"`, `"args": ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PLUGIN_ROOT}/hooks/<script>.ps1"]` and `"timeout": 10` (seconds, fact 5), with no `shell`: `allow-readonly.ps1` for PreToolUse; `platform-guard.ps1` and `update-notify.ps1` for the one SessionStart group, matcher `startup`. The top-level `description` is filled in (`hooks/hooks.json` accepts it).
+**TEST**: Re-running `New-HooksJson.ps1` reproduces the committed `hooks.json` byte for byte (line endings aside, because `core.autocrlf` may check the file out with CRLF), so the matcher equals the allow-list. Every `args` entry is one unquoted element and the script it names exists. The SessionStart matcher is `startup` and the timeouts are checked. Faulty and empty classifications are refused with the offending entry named and no file written. The awkward-path scenario spawns each entry (`command` plus each `args` element as one argument) from a staging copy under a generated `%TEMP%\<guid> T<e-acute>st\plugin root` folder. The test files stay ASCII (the letter is built from its code point), which 5.1 reads correctly without a BOM.
 **REFACTOR**: Fill in the top-level `description`.
-**Files**: `plugin/hooks/hooks.json`, `build/New-HooksJson.ps1`, `build/ToolClassification.psm1`, `build/tests/PluginHooks.Tests.ps1`
+**Files**: `plugin/hooks/hooks.json`, `build/New-HooksJson.ps1`, `build/ToolClassification.psm1`, `build/tests/HooksJson.Tests.ps1`
 **Commit**: `feat: wire the plugin hooks`
 
 ### Slice 5: Packaging script
@@ -1218,7 +1248,7 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
 
 - Scope is large: 20 ACs and 12 slices. The minimum viable subset, if time runs short, is slices 0, 1, 2, 5, 6, 7, then the release and slice 11.
 - The allow-list is a human judgement. The literal list in step 4.1 is the one to approve, and each entry is audited before commit.
-- Several design details depend on slice 0 facts: hook timeout, `additionalContext`, `CLAUDE_PLUGIN_DATA`, `userConfig`, the shell for `sh` hooks, and the MCP start timeout. Each dependent step names its fallback.
+- Several design details depend on slice 0 facts: hook timeout, `additionalContext`, `CLAUDE_PLUGIN_DATA`, `userConfig`, the command form of a hook on Windows, and the MCP start timeout. Each dependent step names its fallback.
 
 ## Build Progress
 
@@ -1276,3 +1306,4 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
 - Slice 7: publish by the verifier's `release_id` output, and pass the verified archive digest to the final `-Latest` check. Without it, `-Latest` passes while `releases/latest` still points at the previous release (both old files agree).
 - Slice 7: a rehearsal tag (`v<X.Y.Z>-rehearsal`) gives the gate's plain `version` output, so its versioned archive is named `teststand-mcp-vX.Y.Z.zip`.
 - Verifier wording: the Fix line says "delete the draft first" even when the release is already published (seen on the live `v1.8.6` check). Word it by `release.draft` when slice 7 touches the verifier.
+- Slice 11 README: auto-allowed reads of a .seq inside the project still run its SequenceFileLoad callback; open only files you trust

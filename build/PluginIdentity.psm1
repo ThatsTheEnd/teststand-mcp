@@ -4,7 +4,9 @@
 #       plugin/.claude-plugin/plugin.json and plugin/.mcp.json;
 #    2. agent flavour conversion: source agents (direct tool prefix, CLAUDE.md)
 #       <-> plugin agents (plugin tool prefix, rules skill), driven by that identity.
-#  Nothing else in the repository retypes the tool prefix.
+#  Nothing else in the repository retypes the tool prefix, with ONE shipped-code exception:
+#  plugin/hooks/allow-readonly.ps1 carries the full prefix as a constant, because the hook has no
+#  build step to derive it. build/tests/AllowHook.Tests.ps1 pins that constant to this module.
 #  Compatible with Windows PowerShell 5.1 and PowerShell 7.
 #  Files are read with explicit .NET UTF-8 (no BOM added or dropped) APIs: never
 #  use Get-Content / Set-Content -Encoding UTF8 here (5.1 writes a BOM).
@@ -20,22 +22,11 @@ $script:DefaultMcpJsonPath = Join-Path $script:RepoRoot 'plugin\.mcp.json'
 # Claude Code's naming rules for MCP tools (docs/validation/claude-code-plugin-facts.md, row 12).
 $script:PluginToolPrefixFormat = 'mcp__plugin_{0}_{1}__'
 $script:DirectToolPrefixFormat = 'mcp__{0}__'
+$script:IdentityJsonWhy = 'The plugin identity (name, server key, tool prefix) is read from this file, so nothing can be built without it.'
 
 # ----------------------------------------------------------------------------
-#  File and JSON reading (Read-Utf8Text and Get-JsonProperty come from BuildCommon.psm1)
+#  File and JSON reading (Read-Utf8Text, Read-JsonFile and Get-JsonProperty come from BuildCommon.psm1)
 # ----------------------------------------------------------------------------
-function Read-JsonFile {
-    param([Parameter(Mandatory)][string]$Path)
-    $text = Read-Utf8Text $Path
-    try {
-        return ($text | ConvertFrom-Json)
-    } catch {
-        Write-BuildFailure -What "Invalid JSON in ${Path}: $($_.Exception.Message)" `
-            -Why 'The plugin identity (name, server key, tool prefix) is read from this file, so nothing can be built without it.' `
-            -Fix 'Fix the JSON syntax of the file.'
-    }
-}
-
 # ----------------------------------------------------------------------------
 #  Plugin identity
 # ----------------------------------------------------------------------------
@@ -46,14 +37,14 @@ function Get-PluginIdentity {
         [string]$McpJsonPath = $script:DefaultMcpJsonPath
     )
 
-    $pluginName = Get-JsonProperty (Read-JsonFile $PluginJsonPath) 'name'
+    $pluginName = Get-JsonProperty (Read-JsonFile $PluginJsonPath $script:IdentityJsonWhy) 'name'
     if ([string]::IsNullOrWhiteSpace($pluginName)) {
         Write-BuildFailure -What "No plugin name ('name') in $PluginJsonPath" `
             -Why 'The plugin name is part of every tool prefix the agents use (mcp__plugin_<name>_<server>__).' `
             -Fix "Add a non-empty 'name' to the plugin manifest."
     }
 
-    $servers = Get-JsonProperty (Read-JsonFile $McpJsonPath) 'mcpServers'
+    $servers = Get-JsonProperty (Read-JsonFile $McpJsonPath $script:IdentityJsonWhy) 'mcpServers'
     if ($null -eq $servers) {
         Write-BuildFailure -What "No 'mcpServers' object in $McpJsonPath" `
             -Why 'The server key is part of every tool prefix the agents use, and it is read from this object.' `

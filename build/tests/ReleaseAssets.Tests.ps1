@@ -57,42 +57,10 @@ $TagTable = @(
     @{ Tag = '';           Verdict = 'rejected: empty' }
 )
 
-$script:Failures = 0
-$script:TempDirs = @()
-
-function Invoke-Case {
-    param([string]$Name, [scriptblock]$Body)
-    try {
-        & $Body
-        Write-Host "PASS  $Name"
-    } catch {
-        $script:Failures++
-        Write-Host "FAIL  $Name"
-        Write-Host "      $($_.Exception.Message)"
-    }
-}
+. (Join-Path $PSScriptRoot 'TestHarness.ps1')
+$script:TempDirPrefix = 'ReleaseAssetsTests_'
 
 # --- Asserts ---------------------------------------------------------------------------------------
-function Assert-Equal {
-    param($Expected, $Actual, [string]$What = 'value')
-    if ($Expected -cne $Actual) { throw "$What : expected [$Expected] but got [$Actual]" }
-}
-
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
-}
-
-function Assert-Contains {
-    param([string]$Text, [string]$Needle, [string]$What = 'text')
-    if ($Text.IndexOf($Needle, [StringComparison]::Ordinal) -lt 0) { throw "$What does not contain [$Needle]. Text was:`n$Text" }
-}
-
-function Assert-NotContains {
-    param([string]$Text, [string]$Needle, [string]$What = 'text')
-    if ($Text.IndexOf($Needle, [StringComparison]::Ordinal) -ge 0) { throw "$What unexpectedly contains [$Needle]. Text was:`n$Text" }
-}
-
 # The three parts of every build failure: labelled What / Why / Fix lines, each with content.
 function Assert-ThreePartFailure {
     param([string]$Text)
@@ -128,13 +96,6 @@ function Assert-RecordMatchesFixture {
 }
 
 # --- Files and processes ----------------------------------------------------------------------------
-function New-TempDir {
-    $dir = Join-Path ([IO.Path]::GetTempPath()) ('ReleaseAssetsTests_' + [Guid]::NewGuid().ToString('N'))
-    [void](New-Item -ItemType Directory -Path $dir)
-    $script:TempDirs += $dir
-    return $dir
-}
-
 function Write-TextFile {
     param([string]$Path, [string]$Text)
     $parent = Split-Path -Parent $Path
@@ -1497,16 +1458,7 @@ try {
 }
 finally {
     foreach ($name in $savedEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name]) }
-    foreach ($dir in $script:TempDirs) {
-        if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
-    }
+    Remove-TestTempDirs
 }
 
-if ($script:Failures -gt 0) {
-    Write-Host ''
-    Write-Host "$script:Failures case(s) FAILED"
-    exit 1
-}
-Write-Host ''
-Write-Host 'All cases passed'
-exit 0
+Complete-TestRun

@@ -6,13 +6,15 @@
 #  The latest version is the tag in the Location header of a no-redirect HEAD request
 #  to <repo>/releases/latest (no API rate limit). The lookup, successful or failed, is
 #  cached for 24 hours, and a version is announced at most once per 24 hours.
-#  Silent when: the installed version is the 0.0.0 placeholder or unreadable, it is
+#  Silent when: the installed version is the 0.0.0 placeholder or not a plain X.Y.Z, it is
 #  equal or higher than the latest, TESTSTAND_MCP_NO_UPDATE_CHECK=1, or anything fails.
+#  A pre-release tag (v2.0.0-rc1) is never announced: only X.Y.Z tags count.
 #
-#  Injectable through environment variables, so the tests never touch the network or
-#  the real profile: TESTSTAND_MCP_RELEASES_BASE_URL (the repository URL),
-#  TESTSTAND_MCP_NOW (the clock), TESTSTAND_MCP_STATE_DIR (the cache directory) and
-#  CLAUDE_PLUGIN_ROOT (the plugin root that holds .claude-plugin/plugin.json).
+#  The plugin name and the repository come from the installed plugin.json. Injectable through
+#  environment variables, so the tests never touch the network or the real profile:
+#  TESTSTAND_MCP_RELEASES_BASE_URL (honoured only for https://github.com/ and a loopback
+#  http URL), TESTSTAND_MCP_NOW (the clock), TESTSTAND_MCP_STATE_DIR (the cache directory)
+#  and CLAUDE_PLUGIN_ROOT (the plugin root that holds .claude-plugin/plugin.json).
 # ============================================================================
 Set-StrictMode -Version 2.0
 
@@ -21,28 +23,27 @@ try { . (Join-Path $PSScriptRoot 'hook-common.ps1') } catch { exit 0 }
 $script:OptOutVariable = 'TESTSTAND_MCP_NO_UPDATE_CHECK'
 $script:BaseUrlVariable = 'TESTSTAND_MCP_RELEASES_BASE_URL'
 $script:PluginRootVariable = 'CLAUDE_PLUGIN_ROOT'
-$script:DefaultBaseUrl = 'https://github.com/Zuehlke/teststand-mcp'
+$script:AllowedBaseUrlPrefixes = @('https://github.com/', 'http://127.0.0.1:', 'http://localhost:')
 $script:LatestReleasePath = '/releases/latest'
-$script:HttpTimeoutMilliseconds = 3000   # the hook timeout is 5 s: shell start plus this stays inside it
+$script:HttpTimeoutMilliseconds = 3000   # the hook timeout is 10 s: shell start plus this stays well inside it
 $script:UserAgent = 'teststand-mcp-update-notify'
 $script:RedirectStatusCodes = @(301, 302, 303, 307, 308)
 $script:StateFile = 'update-notify.json'
-$script:CacheSeconds = 24 * 60 * 60
 $script:PlaceholderVersion = [version]'0.0.0'
 $script:PluginJsonRelativePath = '.claude-plugin\plugin.json'
-$script:TagPattern = '\A[vV]?(\d+\.\d+\.\d+)\z'
+$script:VersionPattern = '\A[vV]?(\d+\.\d+\.\d+)\z'
 $script:TagInLocationPattern = '/tag/([^/?#]+)(?:[?#].*)?\z'
 $script:MarketplaceName = 'zuehlke-teststand'
-$script:PluginName = 'teststand-mcp'
 
 # ----------------------------------------------------------------------------
 #  Pure decisions
 # ----------------------------------------------------------------------------
 # "v1.10.0", "V1.8.6" or "1.2.3" as a [version]; $null for anything else (v1.x, 1.2, 1.2.3-rc1, overflow).
-function Convert-TagToVersion {
-    param([AllowNull()][string]$Tag)
-    if ([string]::IsNullOrEmpty($Tag)) { return $null }
-    $match = [regex]::Match($Tag, $script:TagPattern)
+# Used for the release tag AND for the installed version, so both follow the same strict rule.
+function Convert-VersionText {
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $null }
+    $match = [regex]::Match($Text, $script:VersionPattern)
     if (-not $match.Success) { return $null }
     $parsed = $null
     if ([version]::TryParse($match.Groups[1].Value, [ref]$parsed)) { return $parsed }
@@ -58,26 +59,28 @@ function Get-TagFromLocation {
     return $match.Groups[1].Value
 }
 
-# True when the instant is less than 24 hours in the past. An instant in the future (the clock moved
-# back) is not fresh, so a wrong clock can never silence the hook for longer than a day.
-function Test-IsFresh {
-    param([long]$Epoch, [long]$NowEpoch)
-    $ageSeconds = $NowEpoch - $Epoch
-    return ($ageSeconds -ge 0 -and $ageSeconds -lt $script:CacheSeconds)
+function Test-AllowedBaseUrl {
+    param($Url)
+    if ($Url -isnot [string]) { return $false }
+    foreach ($prefix in $script:AllowedBaseUrlPrefixes) {
+        if ($Url.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
 }
 
 # The message to show, or $null: only a latest version above the installed one that was not announced
 # within the last 24 hours.
 function Get-UpdateMessage {
-    param([version]$Installed, [AllowNull()][version]$Latest, [string]$AnnouncedVersion, [long]$AnnouncedEpoch, [long]$NowEpoch)
+    param([version]$Installed, [AllowNull()][version]$Latest, [string]$AnnouncedVersion, [long]$AnnouncedEpoch, [long]$NowEpoch,
+          [Parameter(Mandatory)][string]$PluginName)
     if ($null -eq $Latest -or $Latest -le $Installed) { return $null }
-    $wasAnnouncedRecently = ($AnnouncedVersion -ceq [string]$Latest) -and (Test-IsFresh $AnnouncedEpoch $NowEpoch)
+    $wasAnnouncedRecently = ($AnnouncedVersion -ceq [string]$Latest) -and (Test-IsFresh $AnnouncedEpoch $NowEpoch $script:DayInSeconds)
     if ($wasAnnouncedRecently) { return $null }
     $lines = @(
         "TestStand MCP update available: you have $Installed, the latest release is $Latest.",
         'To update, run these two commands in order:',
         "  1. claude plugin marketplace update $($script:MarketplaceName)",
-        "  2. claude plugin update $($script:PluginName)",
+        "  2. claude plugin update $PluginName",
         'Then restart Claude Code. You can ignore this message when marketplace auto-update is on: it updates the plugin by itself.',
         "To stop these checks, set $($script:OptOutVariable)=1."
     )
@@ -87,7 +90,7 @@ function Get-UpdateMessage {
 # ----------------------------------------------------------------------------
 #  I/O
 # ----------------------------------------------------------------------------
-function Set-HookTls12 {
+function Enable-HookTls12 {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 }
 
@@ -97,16 +100,29 @@ function Get-PluginRoot {
     return (Split-Path -Parent $PSScriptRoot)
 }
 
-# The version in plugin.json; $null when it is missing, unreadable or not a version.
-function Get-InstalledVersion {
+# @{ Name; Version; RepositoryUrl } from plugin.json; $null when the file is missing or unreadable, or the
+# version is not a plain X.Y.Z or the name is empty. RepositoryUrl may be $null.
+function Get-InstalledPlugin {
     param([string]$PluginRoot)
     try {
         $path = Join-Path $PluginRoot $script:PluginJsonRelativePath
-        $text = [IO.File]::ReadAllText($path, (New-Object System.Text.UTF8Encoding($false)))
-        $versionText = [string](Get-HookProperty ($text | ConvertFrom-Json) 'version')
-        $parsed = $null
-        if ([version]::TryParse($versionText, [ref]$parsed)) { return $parsed }
-    } catch { }
+        $json = [IO.File]::ReadAllText($path, $script:Utf8NoBom) | ConvertFrom-Json
+        $version = Convert-VersionText ([string](Get-HookProperty $json 'version'))
+        $name = [string](Get-HookProperty $json 'name')
+        if ($null -eq $version -or [string]::IsNullOrWhiteSpace($name)) { return $null }
+        return @{ Name = $name; Version = $version; RepositoryUrl = (Get-HookProperty $json 'repository') }
+    } catch {
+        return $null
+    }
+}
+
+# The repository URL to look the release up at: the test override when it is an allowed URL, else
+# the repository of plugin.json when that is an allowed URL, else $null.
+function Get-ReleaseBaseUrl {
+    param($Plugin)
+    $override = Get-HookEnvironmentText $script:BaseUrlVariable
+    if (Test-AllowedBaseUrl $override) { return $override }
+    if (Test-AllowedBaseUrl $Plugin.RepositoryUrl) { return $Plugin.RepositoryUrl }
     return $null
 }
 
@@ -141,44 +157,32 @@ function Invoke-HeadRequest {
 # The latest released version, or $null when the lookup fails or the redirect is not a clean X.Y.Z tag.
 function Get-LatestVersion {
     param([Parameter(Mandatory)][string]$BaseUrl)
-    Set-HookTls12
+    Enable-HookTls12
     $answer = Invoke-HeadRequest ($BaseUrl.TrimEnd('/') + $script:LatestReleasePath)
     if ($null -eq $answer -or $script:RedirectStatusCodes -notcontains $answer.StatusCode) { return $null }
-    return (Convert-TagToVersion (Get-TagFromLocation $answer.Location))
+    return (Convert-VersionText (Get-TagFromLocation $answer.Location))
 }
 
-function ConvertTo-EpochOrZero {
-    param($Value)
-    $parsed = 0L
-    if ([long]::TryParse([string]$Value, [ref]$parsed)) { return $parsed }
-    return 0L
-}
-
-# The latest version from the cache when the last lookup is under 24 hours old (a failed lookup is
-# cached as "no version"), else from the network. Returns @{ Latest; State } with the state to keep.
-function Get-LatestVersionCached {
-    param($State, [long]$NowEpoch)
-    $kept = @{
-        announcedVersion = [string](Get-HookProperty $State 'announcedVersion')
-        announcedEpoch   = (ConvertTo-EpochOrZero (Get-HookProperty $State 'announcedEpoch'))
-    }
+# The latest version from the cache when the last lookup is under 24 hours old (a failed lookup is cached
+# as "no version"), else from the network. Returns @{ Latest; StateToWrite }: StateToWrite is the whole new
+# state after a network lookup (the announcement is carried over), and $null when the cache answered.
+function Resolve-LatestVersion {
+    param($State, [long]$NowEpoch, [Parameter(Mandatory)][string]$BaseUrl)
     $lookupEpoch = ConvertTo-EpochOrZero (Get-HookProperty $State 'lookupEpoch')
-    if (Test-IsFresh $lookupEpoch $NowEpoch) {
+    if (Test-IsFresh $lookupEpoch $NowEpoch $script:DayInSeconds) {
         $cached = $null
         if (Get-HookProperty $State 'lookupOk') { [void][version]::TryParse([string](Get-HookProperty $State 'latestVersion'), [ref]$cached) }
-        return @{ Latest = $cached; State = $null }
+        return @{ Latest = $cached; StateToWrite = $null }
     }
-    $latest = Get-LatestVersion (Get-BaseUrl)
-    $kept['lookupEpoch'] = $NowEpoch
-    $kept['lookupOk'] = ($null -ne $latest)
-    $kept['latestVersion'] = if ($null -ne $latest) { [string]$latest } else { '' }
-    return @{ Latest = $latest; State = $kept }
-}
-
-function Get-BaseUrl {
-    $fromEnvironment = Get-HookEnvironmentText $script:BaseUrlVariable
-    if ($null -ne $fromEnvironment) { return $fromEnvironment }
-    return $script:DefaultBaseUrl
+    $latest = Get-LatestVersion $BaseUrl
+    $carriedState = @{
+        announcedVersion = [string](Get-HookProperty $State 'announcedVersion')
+        announcedEpoch   = (ConvertTo-EpochOrZero (Get-HookProperty $State 'announcedEpoch'))
+        lookupEpoch      = $NowEpoch
+        lookupOk         = ($null -ne $latest)
+        latestVersion    = $(if ($null -ne $latest) { [string]$latest } else { '' })
+    }
+    return @{ Latest = $latest; StateToWrite = $carriedState }
 }
 
 # The state after an announcement: the lookup that produced the version, plus what was announced when.
@@ -195,28 +199,28 @@ function New-AnnouncedState {
 
 function Invoke-UpdateNotify {
     if (Test-HookFlag $script:OptOutVariable) { return }
-    $installed = Get-InstalledVersion (Get-PluginRoot)
-    if ($null -eq $installed -or $installed -le $script:PlaceholderVersion) { return }
+    $plugin = Get-InstalledPlugin (Get-PluginRoot)
+    if ($null -eq $plugin -or $plugin.Version -le $script:PlaceholderVersion) { return }
+    $baseUrl = Get-ReleaseBaseUrl $plugin
+    if ($null -eq $baseUrl) { return }
 
     $nowEpoch = (Get-HookNow).ToUnixTimeSeconds()
     $state = Read-HookState $script:StateFile
-    $lookup = Get-LatestVersionCached $state $nowEpoch
-    if ($null -ne $lookup.State) {
-        [void](Write-HookState $script:StateFile $lookup.State)
-        $state = [pscustomobject]$lookup.State
+    $lookup = Resolve-LatestVersion $state $nowEpoch $baseUrl
+    if ($null -ne $lookup.StateToWrite) {
+        [void](Write-HookState $script:StateFile $lookup.StateToWrite)
+        $state = [pscustomobject]$lookup.StateToWrite
     }
 
-    $message = Get-UpdateMessage -Installed $installed -Latest $lookup.Latest `
+    $message = Get-UpdateMessage -Installed $plugin.Version -Latest $lookup.Latest -PluginName $plugin.Name `
         -AnnouncedVersion ([string](Get-HookProperty $state 'announcedVersion')) `
         -AnnouncedEpoch (ConvertTo-EpochOrZero (Get-HookProperty $state 'announcedEpoch')) -NowEpoch $nowEpoch
     if ($null -eq $message) { return }
 
-    [void](Write-HookState $script:StateFile (New-AnnouncedState $state $lookup.Latest $nowEpoch))
     Write-HookOutput @{ systemMessage = $message }
+    # Recorded after the output is written, so a failing write can never cost the message.
+    [void](Write-HookState $script:StateFile (New-AnnouncedState $state $lookup.Latest $nowEpoch))
 }
 
 # Dot-sourcing (the tests) loads the functions only.
-if ($MyInvocation.InvocationName -ne '.') {
-    try { Invoke-UpdateNotify } catch { }
-    exit 0
-}
+if ($MyInvocation.InvocationName -ne '.') { Invoke-SilentHook { Invoke-UpdateNotify } }

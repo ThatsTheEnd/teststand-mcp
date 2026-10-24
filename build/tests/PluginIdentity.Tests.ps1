@@ -28,30 +28,8 @@ $BomChar = [string][char]0xFEFF
 $UmlautU = [string][char]0x00FC   # the u-umlaut of the company name
 $CompanyName = 'Z' + $UmlautU + 'hlke Engineering AG'
 
-$script:Failures = 0
-$script:TempDirs = @()
-
-function Invoke-Case {
-    param([string]$Name, [scriptblock]$Body)
-    try {
-        & $Body
-        Write-Host "PASS  $Name"
-    } catch {
-        $script:Failures++
-        Write-Host "FAIL  $Name"
-        Write-Host "      $($_.Exception.Message)"
-    }
-}
-
-function Assert-Equal {
-    param($Expected, $Actual, [string]$What = 'value')
-    if ($Expected -cne $Actual) { throw "$What : expected [$Expected] but got [$Actual]" }
-}
-
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
-}
+. (Join-Path $PSScriptRoot 'TestHarness.ps1')
+$script:TempDirPrefix = 'PluginIdentityTests_'
 
 # Passes only when the exception names the file AND states the reason.
 function Assert-Throws {
@@ -79,13 +57,6 @@ function Get-Utf8Bytes {
 function Test-StartsWithBom {
     param([byte[]]$Bytes)
     return ($Bytes.Length -ge 3) -and ($Bytes[0] -eq $Utf8Bom[0]) -and ($Bytes[1] -eq $Utf8Bom[1]) -and ($Bytes[2] -eq $Utf8Bom[2])
-}
-
-function New-TempDir {
-    $dir = Join-Path ([IO.Path]::GetTempPath()) ('PluginIdentityTests_' + [Guid]::NewGuid().ToString('N'))
-    [void](New-Item -ItemType Directory -Path $dir)
-    $script:TempDirs += $dir
-    return $dir
 }
 
 function Read-JsonFile {
@@ -378,16 +349,7 @@ try {
 }
 finally {
     Remove-Module PluginIdentity -ErrorAction SilentlyContinue
-    foreach ($dir in $script:TempDirs) {
-        if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
-    }
+    Remove-TestTempDirs
 }
 
-if ($script:Failures -gt 0) {
-    Write-Host ''
-    Write-Host "$script:Failures case(s) FAILED"
-    exit 1
-}
-Write-Host ''
-Write-Host 'All cases passed'
-exit 0
+Complete-TestRun
