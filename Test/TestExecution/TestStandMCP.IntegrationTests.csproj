@@ -6,9 +6,6 @@
     <PlatformTarget>x86</PlatformTarget>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
-    <!-- Deliberately distinctive: VersionInfo.Current reads THIS assembly's version here, and the
-         default 1.0.0 would let a leftover hard-coded "1.0.0" in the server pass a version test. -->
-    <Version>0.0.0-test</Version>
     <RootNamespace>TestStandMCP.IntegrationTests</RootNamespace>
     <AssemblyName>TestStandMCP.IntegrationTests</AssemblyName>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>

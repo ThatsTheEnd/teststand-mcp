@@ -37,6 +37,8 @@ internal class Program
     private const int  STD_ERROR_HANDLE = -12;
     private const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
 
+    private const string LoadPrototypeWorkerFlag = "--load-prototype-worker";
+    private const string SetupAgentsFlag         = "--setup-agents";
     private const string VersionFlag   = "--version";
     private const string ListToolsFlag = "--list-tools";
     private const string JsonFlag      = "--json";
@@ -48,7 +50,7 @@ internal class Program
         // result line, and never allocates a console window. It owns its own short-lived engine,
         // performs the (possibly process-fatal) native LabVIEW Load Prototype, and hard-exits. See
         // LoadPrototypeWorker for the rationale (isolating the 0xC06D007E .lvlibp delay-load crash).
-        if (args.Length > 0 && args[0] == "--load-prototype-worker")
+        if (args.Length > 0 && args[0] == LoadPrototypeWorkerFlag)
             return await LoadPrototypeWorker.RunAsync(args);
 
         // Informational flags are answered HERE — before AllocConsole, the banner, configuration and
@@ -63,7 +65,7 @@ internal class Program
         if (Console.IsInputRedirected)
         {
             AllocConsole();
-            SetConsoleTitle("TestStand MCP Server");
+            SetConsoleTitle(VersionInfo.ProductName);
             SetConsoleOutputCP(65001); // UTF-8
 
             // Re-point Console.Error at the new console window (CONOUT$)
@@ -104,7 +106,7 @@ internal class Program
         // the .claude\agents folder shipped next to this exe, so Claude Code sees the deployed
         // agents user-wide. Meaningless under non-Claude hosts (Copilot etc.) that don't read
         // ~/.claude/agents — which is exactly why it stays a deliberate manual step.
-        if (args.Contains("--setup-agents"))
+        if (args.Contains(SetupAgentsFlag))
             return SetupAgents();
 
         // ── Configuration ─────────────────────────────────────────────────────
@@ -127,9 +129,7 @@ internal class Program
         });
 
         services.AddSingleton<IConfiguration>(config);
-        services.AddSingleton<ITestStandService, TestStandService>();
-        services.AddSingleton<ISequenceEditorService, SequenceEditorService>();
-        services.AddSingleton<TestStandToolRegistry>();
+        AddToolCatalog(services);
         services.AddSingleton<TestStandResourceProvider>();
         services.AddSingleton<TestStandPromptProvider>();
         services.AddSingleton<McpServer>();
@@ -152,7 +152,7 @@ internal class Program
 
         // ── Run ───────────────────────────────────────────────────────────────
         var logger = sp.GetRequiredService<ILogger<Program>>();
-        logger.LogInformation("TestStand MCP Server v{Version} starting...", VersionInfo.Current.Version);
+        logger.LogInformation("{Product} v{Version} starting...", VersionInfo.ProductName, VersionInfo.Current.Version);
         logger.LogInformation("Platform: {OS}", Environment.OSVersion);
         logger.LogInformation("Runtime: {Runtime}", RuntimeInformation.FrameworkDescription);
 
@@ -207,48 +207,54 @@ internal class Program
     /// </summary>
     private static int? TryRunInformationalCommand(string[] args)
     {
-        if (args.Contains(VersionFlag))
-        {
-            Console.Out.Write(VersionInfo.Current.FormatForCli());
-            return 0;
-        }
+        var isVersion   = args.Contains(VersionFlag);
+        var isListTools = args.Contains(ListToolsFlag);
+        if (!isVersion && !isListTools)
+            return null;
 
-        if (args.Contains(ListToolsFlag))
-        {
-            WriteToolList(CreateToolRegistryWithoutEngine(), asJson: args.Contains(JsonFlag));
-            return 0;
-        }
+        // Its own UTF-8 (no BOM) writer instead of Console.Out: the console's code page (e.g. 850)
+        // would garble the non-ASCII tool descriptions for the caller that captures stdout, and
+        // changing Console.OutputEncoding changes the code page of a real console as a side effect.
+        using var stdout = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
 
-        return null;
+        if (isVersion)
+            stdout.Write(VersionInfo.Current.FormatForCli());
+        else
+            WriteToolList(stdout, asJson: args.Contains(JsonFlag));
+        return 0;
     }
 
     /// <summary>
-    /// A registry built from the bare minimum: logging plus the two services whose constructors only
-    /// store a logger. No configuration, no engine connection, no COM — so listing the tools needs no
-    /// TestStand installation.
+    /// The tool registry and the two services it needs, whose constructors only store a logger — no
+    /// engine connection and no COM until a tool is called. Shared by the MCP serve path and
+    /// <c>--list-tools</c>, so what is listed is exactly what is served.
     /// </summary>
-    private static TestStandToolRegistry CreateToolRegistryWithoutEngine()
+    private static void AddToolCatalog(IServiceCollection services)
     {
-        var services = new ServiceCollection();
-        services.AddLogging();
         services.AddSingleton<ITestStandService, TestStandService>();
         services.AddSingleton<ISequenceEditorService, SequenceEditorService>();
         services.AddSingleton<TestStandToolRegistry>();
-        return services.BuildServiceProvider().GetRequiredService<TestStandToolRegistry>();
     }
 
-    private static void WriteToolList(TestStandToolRegistry registry, bool asJson)
+    private static void WriteToolList(TextWriter output, bool asJson)
     {
+        // Minimal container: logging (no providers, so nothing reaches stdout) plus the catalog.
+        var services = new ServiceCollection();
+        services.AddLogging();
+        AddToolCatalog(services);
+        using var provider = services.BuildServiceProvider();
+        var tools = provider.GetRequiredService<TestStandToolRegistry>().GetTools();
+
         if (asJson)
         {
-            Console.Out.WriteLine(JsonSerializer.Serialize(registry.GetTools().Select(tool => tool.Name)));
+            output.WriteLine(JsonSerializer.Serialize(tools.Select(tool => tool.Name)));
             return;
         }
 
-        Console.Out.WriteLine("Available Tools:");
-        foreach (var tool in registry.GetTools())
-            Console.Out.WriteLine($"  {tool.Name,-35} {tool.Description}");
-        Console.Out.WriteLine();
+        output.WriteLine("Available Tools:");
+        foreach (var tool in tools)
+            output.WriteLine($"  {tool.Name,-35} {tool.Description}");
+        output.WriteLine();
     }
 
     /// <summary>
