@@ -1299,9 +1299,9 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
   - [x] Step 5.3: Smoke tests, zip, digests, local verify
 
 #### Wave 4
-- [ ] Slice 7: GitHub Actions — PR check and release
-  - [ ] Step 7.1: Script-test runner and ci.yml
-  - [ ] Step 7.2: release.yml
+- [x] Slice 7: GitHub Actions — PR check and release
+  - [x] Step 7.1: Script-test runner and ci.yml
+  - [x] Step 7.2: release.yml
 
 #### Wave 5
 - [ ] Slice 10: CONTRIBUTING (PR A)
