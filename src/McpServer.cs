@@ -199,7 +199,7 @@ public class McpServer
             ServerInfo      = new McpServerInfo
             {
                 Name    = "TestStand MCP Server",
-                Version = "1.0.0"
+                Version = VersionInfo.Current.Version
             },
             Capabilities = new McpCapabilities
             {

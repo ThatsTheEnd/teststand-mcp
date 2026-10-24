@@ -152,7 +152,7 @@ internal class Program
 
         // ── Run ───────────────────────────────────────────────────────────────
         var logger = sp.GetRequiredService<ILogger<Program>>();
-        logger.LogInformation("TestStand MCP Server v1.0.0 starting...");
+        logger.LogInformation("TestStand MCP Server v{Version} starting...", VersionInfo.Current.Version);
         logger.LogInformation("Platform: {OS}", Environment.OSVersion);
         logger.LogInformation("Runtime: {Runtime}", RuntimeInformation.FrameworkDescription);
 

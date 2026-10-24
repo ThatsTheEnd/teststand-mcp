@@ -51,7 +51,7 @@ public class McpServerInfo
     /// <summary>Display name of the server.</summary>
     [JsonPropertyName("name")]    public string Name { get; set; } = "TestStand MCP Server";
     /// <summary>Server version string.</summary>
-    [JsonPropertyName("version")] public string Version { get; set; } = "1.0.0";
+    [JsonPropertyName("version")] public string Version { get; set; } = VersionInfo.Current.Version;
 }
 
 /// <summary>The capabilities the server advertises to the client.</summary>
