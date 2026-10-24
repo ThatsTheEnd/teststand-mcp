@@ -112,7 +112,8 @@ function Write-HookState {
         $target = Join-Path $dir $Name
         $temp = Join-Path $dir ($Name + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
         [IO.File]::WriteAllText($temp, ($State | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
-        if (Test-Path -LiteralPath $target) { [IO.File]::Replace($temp, $target, $null) } else { [IO.File]::Move($temp, $target) }
+        # A plain $null would reach .NET as an empty string, which Replace rejects as an illegal path.
+        if (Test-Path -LiteralPath $target) { [IO.File]::Replace($temp, $target, [NullString]::Value) } else { [IO.File]::Move($temp, $target) }
         $temp = $null
         return $true
     } catch {

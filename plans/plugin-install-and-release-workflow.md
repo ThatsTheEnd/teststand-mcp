@@ -609,7 +609,8 @@ All other registered tools go to `prompt`, including `diff_sequence_files`, `com
 - Compare with `[version]` after stripping `v`/`V`.
 - Skip `0.0.0` and the opt-out variable.
 - Allow a 3 s HTTP budget so the total, including the shell start, stays under 5 s.
-- The base URL, the clock, the cache directory (`TESTSTAND_MCP_STATE_DIR`) and the plugin root are injectable through env vars. Tests never touch the real `%LOCALAPPDATA%`.
+- The base URL (`TESTSTAND_MCP_RELEASES_BASE_URL`), the clock (`TESTSTAND_MCP_NOW`), the cache directory (`TESTSTAND_MCP_STATE_DIR`, else `${CLAUDE_PLUGIN_DATA}`, else `%LOCALAPPDATA%\teststand-mcp\`) and the plugin root (`CLAUDE_PLUGIN_ROOT`, else the folder above the script) are injectable through env vars. Tests never touch the real `%LOCALAPPDATA%`.
+- The lookup is bounded as a whole (connect included): an async `HEAD` abandoned after 3 s, so a blackholed connection cannot outlast it. The state file is `update-notify.json`; the hook shares `hook-common.ps1` with the other two PowerShell hooks.
 **TEST**: A local `HttpListener` on an ephemeral port serves a newer redirect, an equal one, a lower one, a 500, a hang, garbage and `V`/malformed tags. Also run the cache-boundary Outline, opt-out and `0.0.0`. Assert the configured HTTP timeout, and that the hang case returns after one timeout. The wall-time bound under 5 s is a local check only, not a CI assertion.
 **REFACTOR**: A pure `Get-UpdateMessage` decides; the I/O wraps it.
 **Files**: `plugin/hooks/update-notify.ps1`, `build/tests/PluginHooks.Tests.ps1`
