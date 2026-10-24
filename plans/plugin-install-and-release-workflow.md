@@ -744,13 +744,13 @@ Feature: One script produces the plugin archive
 
 **Complexity**: standard
 **IMPLEMENT**:
-- Smoke-test the staged exe: `--version`, `--list-tools --json` against `tool-classes.json`, and a stdio `initialize` round trip.
-- Zip with `ZipFile.CreateFromDirectory` (pwsh, forward-slash entries).
-- Write the version-named copy, the digest and the manifest through `ReleaseAssets.psm1`.
+- Smoke-test the staged exe (`build/PluginSmoke.psm1`, each process started with a timeout and stopped by its own process id): `--version` (version on its first line, tag and commit), `--list-tools --json` against `tool-classes.json` and the registry, and a stdio `initialize` round trip (`serverInfo.version`). `initialize` does not connect the engine (`HandleInitialize` only negotiates, logs and answers).
+- Zip entry by entry with `ZipArchive.CreateEntry` and explicit forward-slash names (not `ZipFile.CreateFromDirectory`, which writes backslashes on Windows PowerShell 5.1), then guard the finished archive: no entry name contains `\`, and the entries are exactly the staged files.
+- Write the version-named copy, the digest and the manifest through `ReleaseAssets.psm1`. A pre-release build (`0.0.0-ci`) names its versioned copy after its numeric core (`teststand-mcp-v0.0.0.zip`): the verifier and the tag format know only `X.Y.Z`.
 - Finish with `Assert-PublishedRelease.ps1 -LocalDir`.
-**TEST**: `sha256sum -c` passes, the local verify passes, and no zip entry contains `\`. The unclassified-tool and backslash faults fail. The smoke run captures the startup log (stderr) of the `initialize` round trip and asserts the version in it.
+**TEST**: `sha256sum -c` passes, the local verify passes, and no zip entry contains `\`. The unclassified-tool and backslash faults fail. The startup log cannot be read from a redirected stderr (with stdin redirected `Program.cs` allocates its own console window and logs there), so the smoke run asserts the version in the log when stderr carries it and otherwise checks that the startup log line prints `VersionInfo.Current.Version`, the same value `serverInfo` reports.
 **REFACTOR**: Asset names come only from `ReleaseAssets.psm1`.
-**Files**: `build/Build-PluginArchive.ps1`
+**Files**: `build/Build-PluginArchive.ps1`, `build/PluginArchive.psm1`, `build/PluginSmoke.psm1`, `build/tests/BuildPluginArchive.Tests.ps1`
 **Commit**: `feat: smoke-test, zip and self-verify the plugin archive`
 
 ### Slice 6: Release assets, tag gate and release verifier

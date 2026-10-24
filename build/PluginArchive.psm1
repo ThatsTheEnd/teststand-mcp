@@ -4,7 +4,9 @@
 #    1. the inputs (version, tag, commit, layout) and the source checks that need no build;
 #    2. dotnet publish in the chosen exe layout, and the proof that the exe carries the version;
 #    3. staging: the archive's directory tree, the converted agents, the stamped plugin.json,
-#       bin/CLAUDE.md with the skill inlined and VERSION.txt, and every assertion on that tree.
+#       bin/CLAUDE.md with the skill inlined and VERSION.txt, and every assertion on that tree;
+#    4. the zip, its entry-name guard, the release assets and the local run of the release verifier.
+#  (The smoke tests of the staged exe are in PluginSmoke.psm1.)
 #  The ONE layout table holds everything that differs per exe layout; the ONE staging table drives
 #  both what is staged and what is asserted.
 #  Every failure goes through Write-BuildFailure (What / Why / Fix).
@@ -12,6 +14,9 @@
 #  maintainer's station, so nothing here may need it).
 # ============================================================================
 Set-StrictMode -Version 2.0
+
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 Import-Module (Join-Path $PSScriptRoot 'BuildCommon.psm1')
 Import-Module (Join-Path $PSScriptRoot 'ToolClassification.psm1')
@@ -621,9 +626,86 @@ function Assert-StagedPlugin {
     Assert-ClaudeMdResolved -Path (Join-Path $StageDir 'bin\CLAUDE.md') -SkillMdPath (Join-Path $RepoRoot 'plugin\skills\teststand-rules\SKILL.md')
 }
 
+# ----------------------------------------------------------------------------
+#  Zip, release assets, local verification
+# ----------------------------------------------------------------------------
+$script:VerifierScript = Join-Path $PSScriptRoot 'Assert-PublishedRelease.ps1'
+$script:VerifierTimeoutSeconds = 600
+
+# The archive, written entry by entry with explicit forward-slash names. ZipFile.CreateFromDirectory
+# is not used: it writes backslash names on Windows PowerShell 5.1 (.NET Framework), which the zip
+# specification does not allow and which extract into the wrong folders elsewhere.
+function New-PluginZip {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$StageDir, [Parameter(Mandatory)][string]$ZipPath)
+    $zipFullPath = Resolve-BuildPath $ZipPath
+    if (Test-Path -LiteralPath $zipFullPath) { Remove-Item -LiteralPath $zipFullPath -Force }
+    $stream = [IO.File]::Open($zipFullPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite)
+    try {
+        $zip = New-Object System.IO.Compression.ZipArchive($stream, [IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            foreach ($name in (Get-FileSet $StageDir)) {
+                $entry = $zip.CreateEntry($name, [IO.Compression.CompressionLevel]::Optimal)
+                $entryStream = $entry.Open()
+                try {
+                    $source = [IO.File]::OpenRead((Join-Path (Resolve-BuildPath $StageDir) $name))
+                    try { $source.CopyTo($entryStream) } finally { $source.Dispose() }
+                } finally { $entryStream.Dispose() }
+            }
+        } finally { $zip.Dispose() }
+    } finally { $stream.Dispose() }
+}
+
+# The finished archive: no entry name with a backslash, and exactly the files of the staged tree.
+function Assert-PluginZip {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ZipPath, [Parameter(Mandatory)][string]$StageDir)
+    $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-BuildPath $ZipPath))
+    try { $names = [string[]]@($zip.Entries | ForEach-Object { $_.FullName }) } finally { $zip.Dispose() }
+    $backslashed = @($names | Where-Object { $_.Contains('\') })
+    if ($backslashed.Count -gt 0) {
+        Write-BuildFailure -What "The archive holds $($backslashed.Count) entry name(s) with a backslash, for example '$($backslashed[0])'." `
+            -Why 'Zip entry names must use "/". A backslash name extracts as one oddly named file on other platforms and breaks the manifest check, so the release verifier would reject the archive.' `
+            -Fix 'Write the zip with New-PluginZip (explicit forward-slash entry names), never with ZipFile.CreateFromDirectory on Windows PowerShell 5.1.'
+    }
+    $staged = Get-FileSet $StageDir
+    $unexpected = @($names | Where-Object { $staged -cnotcontains $_ })
+    $missing = @($staged | Where-Object { $names -cnotcontains $_ })
+    if ($unexpected.Count -gt 0 -or $missing.Count -gt 0) {
+        Write-BuildFailure -What "The archive holds $($names.Count) entries but the staged tree has $($staged.Count) files (unexpected: $(($unexpected | Select-Object -First 3) -join ', '); missing: $(($missing | Select-Object -First 3) -join ', '))." `
+            -Why 'The archive must be exactly the staged, asserted tree; anything else was never checked.' `
+            -Fix 'Run the packaging again.'
+    }
+}
+
+# The version-named copy, the digest and the per-file manifest next to the archive. Every name
+# comes from ReleaseAssets.psm1. Returns the asset directory.
+function Write-ReleaseAssets {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$StageDir, [Parameter(Mandatory)][string]$OutDir, [Parameter(Mandatory)][string]$Version)
+    $zipPath = Join-Path $OutDir $ReleaseArchiveName
+    Copy-Item -LiteralPath $zipPath -Destination (Join-Path $OutDir (Get-VersionedArchiveName -Version (Get-VersionCore $Version))) -Force
+    [IO.File]::WriteAllText((Join-Path $OutDir $ReleaseDigestName), (New-ArchiveDigest -ArchivePath $zipPath), (Get-Utf8NoBomEncoding))
+    [IO.File]::WriteAllText((Join-Path $OutDir $ReleaseManifestName), (New-ArchiveManifest -StagedDir $StageDir), (Get-Utf8NoBomEncoding))
+}
+
+# The release verifier (spec AC-8) in local mode on the asset directory: it must accept the output.
+function Assert-LocalRelease {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$OutDir, [Parameter(Mandatory)][string]$Version)
+    $result = Invoke-ChildProcess -FilePath $script:HostPath -TimeoutSeconds $script:VerifierTimeoutSeconds `
+        -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $script:VerifierScript, '-LocalDir', $OutDir, '-Version', (Get-VersionCore $Version))
+    if ($result.ExitCode -eq 0 -and -not $result.TimedOut) { return }
+    $report = if ($result.TimedOut) { "it did not finish within $script:VerifierTimeoutSeconds s and was stopped" } else { $result.Stdout.Trim() }
+    Write-BuildFailure -What "The release verifier (build\Assert-PublishedRelease.ps1, local mode) rejected the output in ${OutDir}:`n$report" `
+        -Why 'The same verifier gates the real release; an archive it rejects here would be rejected there, after the tag is pushed.' `
+        -Fix 'Fix what the verifier reports, then run the packaging again.'
+}
+
 Export-ModuleMember -Function Get-ArchiveLayoutName, Get-DefaultArchiveLayout, Get-ArchiveLayout,
     Assert-BuildVersion, Get-VersionCore, Assert-BuildCommit, Assert-BuildTag,
     Assert-SkillSources, Assert-AllToolsClassified, Find-VersionPlaceholder, Assert-ManifestPlaceholder, Invoke-SourceChecks,
     Publish-PluginExe, Assert-PublishedVersion,
     Get-RunUrl, New-ReleaseRecord, Get-FileSet, Get-StagingTable, New-StagedPlugin, Write-StampedManifest, Assert-StagedPlugin, Assert-StampedManifest, Assert-VersionTxt, Assert-AgentFlavours,
-    ConvertTo-ResolvedClaudeMd, Assert-ClaudeMdResolved
+    ConvertTo-ResolvedClaudeMd, Assert-ClaudeMdResolved,
+    New-PluginZip, Assert-PluginZip, Write-ReleaseAssets, Assert-LocalRelease

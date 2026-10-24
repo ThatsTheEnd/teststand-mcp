@@ -5,7 +5,13 @@
 #       plugin.json version placeholder);
 #    3. dotnet publish in the chosen exe layout, and proves the exe carries the version;
 #    4. stages the archive tree (converted agents, stamped plugin.json, bin/CLAUDE.md with the skill
-#       inlined, VERSION.txt) and asserts the layout, the agent flavours and the version stamp.
+#       inlined, VERSION.txt) and asserts the layout, the agent flavours and the version stamp;
+#    5. smoke-tests the STAGED exe: --version, --list-tools --json, a stdio initialize round trip;
+#    6. zips the tree (forward-slash entry names, written entry by entry) and checks the entry names;
+#    7. writes the versioned copy, the digest and the per-file manifest (names from ReleaseAssets.psm1);
+#    8. runs build\Assert-PublishedRelease.ps1 in local mode on the result.
+#  The assets (teststand-mcp.zip, teststand-mcp-v<X.Y.Z>.zip, .sha256, .manifest.sha256) end up in
+#  -OutDir next to the stage\ tree they were built from.
 #  Every failure is three parts - what is wrong, why it matters, the command that fixes it -
 #  printed to the host, with exit code 1.
 #
@@ -28,13 +34,15 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'BuildCommon.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'ReleaseAssets.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'PluginArchive.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'PluginSmoke.psm1') -Force
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $PublishDirName = 'publish'
 $StageDirName = 'stage'
 $StepClock = [Diagnostics.Stopwatch]::StartNew()
-$StepCount = 4
+$StepCount = 8
 
 function Write-Step {
     param([int]$Number, [string]$Text)
@@ -85,6 +93,25 @@ try {
     } finally {
         Remove-BuildTempTree -Path $publishDir
     }
+
+    Write-Step 5 'Smoke-testing the staged exe'
+    Invoke-SmokeTests -StageDir $stageDir -Release $release `
+        -ClassesPath (Join-Path $RepoRoot 'plugin\hooks\tool-classes.json') `
+        -RegistryPath (Join-Path $RepoRoot 'src\Tools\TestStandToolRegistry.cs') `
+        -ProgramSourcePath (Join-Path $RepoRoot 'Program.cs')
+
+    Write-Step 6 "Zipping $ReleaseArchiveName"
+    $zipPath = Join-Path $OutDir $ReleaseArchiveName
+    New-PluginZip -StageDir $stageDir -ZipPath $zipPath
+    Assert-PluginZip -ZipPath $zipPath -StageDir $stageDir
+
+    Write-Step 7 'Writing the versioned copy, the digest and the manifest'
+    Write-ReleaseAssets -StageDir $stageDir -OutDir $OutDir -Version $Version
+
+    Write-Step 8 'Verifying the output the way the release is verified'
+    Assert-LocalRelease -OutDir $OutDir -Version $Version
+
+    Write-Host ("Done in {0:N1}s: {1} ({2:N1} MB) and its digest and manifest are in {3}" -f $StepClock.Elapsed.TotalSeconds, $ReleaseArchiveName, ((Get-Item -LiteralPath $zipPath).Length / 1MB), $OutDir)
     exit 0
 } catch {
     Write-Host (Get-ScriptFailureText -ErrorRecord $_)

@@ -439,6 +439,217 @@ try {
     }
 
     # ======================================================================
+    #  Smoke tests of the staged exe (PluginSmoke): fake exes are .cmd files
+    # ======================================================================
+    Import-Module (Join-Path $BuildDir 'PluginSmoke.psm1') -Force
+
+    # A .cmd standing in for the exe; $Lines are its batch lines.
+    function New-FakeExe {
+        param([string[]]$Lines)
+        $path = Join-Path (New-TempDir) 'TestStandMCP.cmd'
+        [IO.File]::WriteAllText($path, ((@('@echo off') + $Lines) -join "`r`n") + "`r`n", $Utf8NoBom)
+        return $path
+    }
+
+    $VersionLines = @('echo TestStand MCP Server 1.9.0', 'echo   tag:     v1.9.0', "echo   commit:  $SampleCommit", 'echo   built:   2026-10-24T12:00:00Z', 'echo   run:     local')
+
+    Invoke-Case 'smoke --version: the version, the tag and the commit on stdout with exit 0 pass' {
+        Assert-VersionOutput -ExePath (New-FakeExe $VersionLines) -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit
+    }
+
+    Invoke-Case 'fault: --version names another version' {
+        $exe = New-FakeExe (@('echo TestStand MCP Server 1.8.0') + $VersionLines[1..4])
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @("its first line ends with '1.8.0', not '1.9.0'", '--version output is wrong', 'VERSION.txt')
+    }
+
+    Invoke-Case 'fault: --version lacks the tag (an untagged or unreadable VERSION.txt)' {
+        $exe = New-FakeExe @('echo TestStand MCP Server 1.9.0', "echo   commit:  $SampleCommit", 'echo   note:    release metadata incomplete: no tag')
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @("does not name 'v1.9.0'", 'release-metadata note')
+    }
+
+    Invoke-Case 'fault: --version reports an untagged -dev build' {
+        $exe = New-FakeExe @('echo TestStand MCP Server 1.9.0-dev', 'echo   tag:     v1.9.0', "echo   commit:  $SampleCommit")
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @("untagged build ('-dev')")
+    }
+
+    Invoke-Case 'fault: --version exits non-zero' {
+        $exe = New-FakeExe @('echo broken', 'exit /b 3')
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @('exited with code 3', 'broken', 'Run it by hand')
+    }
+
+    # tool list: a classification of get_a, get_b (allow) and set_c (prompt) over a three-tool registry
+    function New-ToolListFixture {
+        $dir = New-TempDir
+        Write-TextFile (Join-Path $dir 'Registry.cs') "Register(`"get_a`", `"a`")`nRegister(`"get_b`", `"b`")`nRegister(`"set_c`", `"c`")`n"
+        Write-TextFile (Join-Path $dir 'tool-classes.json') '{ "allow": ["get_a", "get_b"], "prompt": ["set_c"] }'
+        return @{ Classes = (Join-Path $dir 'tool-classes.json'); Registry = (Join-Path $dir 'Registry.cs') }
+    }
+
+    Invoke-Case 'smoke --list-tools: exactly the classified tools, in any order, pass' {
+        $fixture = New-ToolListFixture
+        $exe = New-FakeExe @('echo ["set_c","get_a","get_b"]')
+        Assert-ToolList -ExePath $exe -ClassesPath $fixture.Classes -RegistryPath $fixture.Registry
+    }
+
+    Invoke-Case 'fault: the exe lists a tool that is not classified, and a classified one is missing' {
+        $fixture = New-ToolListFixture
+        $exe = New-FakeExe @('echo ["get_a","get_b","rogue_tool"]')
+        Assert-FailsWith { Assert-ToolList -ExePath $exe -ClassesPath $fixture.Classes -RegistryPath $fixture.Registry } `
+            @('listed by the exe but not classified: rogue_tool', 'classified but not listed by the exe: set_c', 'tool-classes.json')
+    }
+
+    Invoke-Case 'fault: --list-tools --json prints text that is not JSON' {
+        $fixture = New-ToolListFixture
+        $exe = New-FakeExe @('echo Available Tools:')
+        Assert-FailsWith { Assert-ToolList -ExePath $exe -ClassesPath $fixture.Classes -RegistryPath $fixture.Registry } @('did not print a JSON array', 'Available Tools:')
+    }
+
+    # initialize: the fake reads one line from stdin, then answers like the server would
+    function New-InitializeFake {
+        param([string]$Version)
+        return New-FakeExe @('set /p line=', "echo {`"jsonrpc`":`"2.0`",`"id`":1,`"result`":{`"serverInfo`":{`"name`":`"x`",`"version`":`"$Version`"}}}")
+    }
+    $RealProgramPath = Join-Path $RepoRoot 'Program.cs'
+
+    Invoke-Case 'smoke initialize: serverInfo.version is the version built' {
+        Assert-InitializeRoundTrip -ExePath (New-InitializeFake $SampleVersion) -Version $SampleVersion -ProgramSourcePath $RealProgramPath
+    }
+
+    Invoke-Case 'fault: initialize answers another version' {
+        Assert-FailsWith { Assert-InitializeRoundTrip -ExePath (New-InitializeFake '1.8.0') -Version $SampleVersion -ProgramSourcePath $RealProgramPath } `
+            @("serverInfo.version '1.8.0'", 'version 1.9.0 was built')
+    }
+
+    Invoke-Case 'fault: initialize is never answered, and the stuck process is stopped' {
+        $exe = New-FakeExe @('set /p line=', 'ping -n 15 127.0.0.1 >nul')
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        Assert-FailsWith { Assert-InitializeRoundTrip -ExePath $exe -Version $SampleVersion -ProgramSourcePath $RealProgramPath -TimeoutSeconds 2 } @('did not answer an MCP initialize request within 2 s')
+        Assert-True ($clock.Elapsed.TotalSeconds -lt 40) "the check took $($clock.Elapsed.TotalSeconds) s"
+    }
+
+    Invoke-Case 'startup log: a version on stderr passes; a stderr without it fails' {
+        Assert-StartupLogVersion -StderrText "info: TestStand MCP Server v1.9.0 starting..." -Version $SampleVersion -ProgramSourcePath $RealProgramPath
+        Assert-FailsWith { Assert-StartupLogVersion -StderrText 'info: TestStand MCP Server v1.8.0 starting...' -Version $SampleVersion -ProgramSourcePath $RealProgramPath } `
+            @('does not name version 1.9.0', 'v1.8.0')
+    }
+
+    Invoke-Case 'startup log: with nothing on stderr the source must log VersionInfo.Current.Version' {
+        Assert-StartupLogVersion -StderrText '' -Version $SampleVersion -ProgramSourcePath $RealProgramPath
+        $dir = New-TempDir
+        $program = Join-Path $dir 'Program.cs'
+        Write-TextFile $program 'logger.LogInformation("{Product} v{Version} starting...", VersionInfo.ProductName, "1.0.0");'
+        Assert-FailsWith { Assert-StartupLogVersion -StderrText '' -Version $SampleVersion -ProgramSourcePath $program } @('Nothing reached stderr', 'VersionInfo.Current.Version')
+    }
+
+    # ======================================================================
+    #  Zip, release assets, local verification
+    # ======================================================================
+    function New-SmallStage {
+        $dir = Join-Path (New-TempDir) 'stage'
+        Write-TextFile (Join-Path $dir 'VERSION.txt') 'tag: v1.9.0'
+        Write-TextFile (Join-Path $dir '.claude-plugin\plugin.json') '{}'
+        Write-TextFile (Join-Path $dir 'bin\scripts\a.py') 'print(1)'
+        return $dir
+    }
+
+    Invoke-Case 'zip: every file is an entry with forward slashes, hidden folders included, no directory entries' {
+        $stage = New-SmallStage
+        $zipPath = Join-Path (New-TempDir) 'a.zip'
+        New-PluginZip -StageDir $stage -ZipPath $zipPath
+        Assert-PluginZip -ZipPath $zipPath -StageDir $stage
+        $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
+        try { $names = @($zip.Entries | ForEach-Object { $_.FullName }) } finally { $zip.Dispose() }
+        Assert-Equal '.claude-plugin/plugin.json,VERSION.txt,bin/scripts/a.py' ($names -join ',') 'entry names'
+    }
+
+    Invoke-Case 'fault: a zip entry contains a backslash' {
+        $stage = New-SmallStage
+        $zipPath = Join-Path (New-TempDir) 'bad.zip'
+        $stream = [IO.File]::Open($zipPath, [IO.FileMode]::CreateNew)
+        $zip = New-Object System.IO.Compression.ZipArchive($stream, [IO.Compression.ZipArchiveMode]::Create)
+        foreach ($name in @('VERSION.txt', '.claude-plugin\plugin.json', 'bin/scripts/a.py')) { $zip.CreateEntry($name).Open().Dispose() }
+        $zip.Dispose(); $stream.Dispose()
+        Assert-FailsWith { Assert-PluginZip -ZipPath $zipPath -StageDir $stage } @("backslash, for example '.claude-plugin\plugin.json'", 'New-PluginZip', 'ZipFile.CreateFromDirectory')
+    }
+
+    Invoke-Case 'fault: the zip holds a file the staged tree does not, or lacks one it has' {
+        $stage = New-SmallStage
+        $zipPath = Join-Path (New-TempDir) 'a.zip'
+        New-PluginZip -StageDir $stage -ZipPath $zipPath
+        Write-TextFile (Join-Path $stage 'bin\scripts\late.py') 'x'
+        Assert-FailsWith { Assert-PluginZip -ZipPath $zipPath -StageDir $stage } @('3 entries but the staged tree has 4 files', 'missing: bin/scripts/late.py')
+    }
+
+    Invoke-Case 'assets: the versioned copy, digest and manifest are written under the ReleaseAssets names; sha256sum -c accepts them' {
+        $stage = New-SmallStage
+        $outDir = New-TempDir
+        New-PluginZip -StageDir $stage -ZipPath (Join-Path $outDir $ReleaseArchiveName)
+        Write-ReleaseAssets -StageDir $stage -OutDir $outDir -Version '0.0.0-ci'
+        foreach ($name in @($ReleaseArchiveName, $ReleaseDigestName, $ReleaseManifestName, (Get-VersionedArchiveName -Version '0.0.0'))) {
+            Assert-True (Test-Path -LiteralPath (Join-Path $outDir $name)) "$name was not written"
+        }
+        Assert-Equal (Get-FileSha256 (Join-Path $outDir $ReleaseArchiveName)) (Get-FileSha256 (Join-Path $outDir (Get-VersionedArchiveName -Version '0.0.0'))) 'versioned copy'
+        $manifest = [IO.File]::ReadAllText((Join-Path $outDir $ReleaseManifestName))
+        Assert-Equal 3 @($manifest.TrimEnd("`n") -split "`n").Count 'manifest lines'
+        Assert-Contains $manifest '  bin/scripts/a.py' 'manifest'
+        $sha256sum = Get-Command sha256sum -ErrorAction SilentlyContinue
+        if ($null -ne $sha256sum) {
+            $check = Invoke-ChildProcess -FilePath $sha256sum.Source -ArgumentList @('-c', $ReleaseDigestName) -WorkingDirectory $outDir -TimeoutSeconds 60
+            Assert-Equal 0 $check.ExitCode "sha256sum -c said: $($check.Stdout) $($check.Stderr)"
+            Assert-Contains $check.Stdout 'OK' 'sha256sum output'
+        }
+    }
+
+    Invoke-Case 'verify: the release verifier accepts the assets in local mode' {
+        $stage = New-SmallStage
+        $outDir = New-TempDir
+        New-PluginZip -StageDir $stage -ZipPath (Join-Path $outDir $ReleaseArchiveName)
+        Write-ReleaseAssets -StageDir $stage -OutDir $outDir -Version '1.9.0'
+        Assert-LocalRelease -OutDir $outDir -Version '1.9.0'
+    }
+
+    Invoke-Case 'fault: the verifier rejects a digest that does not match the archive' {
+        $stage = New-SmallStage
+        $outDir = New-TempDir
+        New-PluginZip -StageDir $stage -ZipPath (Join-Path $outDir $ReleaseArchiveName)
+        Write-ReleaseAssets -StageDir $stage -OutDir $outDir -Version '1.9.0'
+        Write-TextFile (Join-Path $outDir $ReleaseDigestName) (('0' * 64) + "  $ReleaseArchiveName`n")
+        Assert-FailsWith { Assert-LocalRelease -OutDir $outDir -Version '1.9.0' } @('release verifier', $ReleaseDigestName, 'Fix what the verifier reports')
+    }
+
+    # ======================================================================
+    #  The real end-to-end run, once per layout. Opt-in: it publishes the real exe.
+    # ======================================================================
+    foreach ($layoutName in (Get-ArchiveLayoutName)) {
+        if ($env:TESTSTAND_MCP_PACKAGE_E2E -ne '1') {
+            Write-Host "SKIP  e2e ($layoutName): set TESTSTAND_MCP_PACKAGE_E2E=1 to publish and package the real exe"
+            continue
+        }
+        Invoke-Case "e2e ($layoutName): the script packages the real exe and the verifier accepts the output" {
+            $outDir = Join-Path (New-TempDir) 'out'
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            $result = Invoke-ChildProcess -FilePath $HostPath -TimeoutSeconds 1200 `
+                -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath, '-Version', '0.0.0-ci', '-Layout', $layoutName, '-OutDir', $outDir)
+            Assert-Equal 0 $result.ExitCode "the script failed:`n$($result.Stdout)"
+            Assert-Contains $result.Stdout '[8/8]' 'the last step ran'
+            $zipPath = Join-Path $outDir $ReleaseArchiveName
+            $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
+            try { $names = @($zip.Entries | ForEach-Object { $_.FullName }) } finally { $zip.Dispose() }
+            Assert-Equal 0 @($names | Where-Object { $_.Contains('\') }).Count 'entry names with a backslash'
+            Assert-Equal (Get-FileSet (Join-Path $outDir 'stage')).Count $names.Count 'entries against staged files'
+            $version = Invoke-ChildProcess -FilePath (Join-Path $outDir 'stage\bin\TestStandMCP.exe') -ArgumentList @('--version') -TimeoutSeconds 60
+            Assert-Contains $version.Stdout '0.0.0-ci' 'staged --version'
+            $sha256sum = Get-Command sha256sum -ErrorAction SilentlyContinue
+            if ($null -ne $sha256sum) {
+                $check = Invoke-ChildProcess -FilePath $sha256sum.Source -ArgumentList @('-c', $ReleaseDigestName) -WorkingDirectory $outDir -TimeoutSeconds 120
+                Assert-Equal 0 $check.ExitCode "sha256sum -c said: $($check.Stdout) $($check.Stderr)"
+            }
+            Write-Host ("      e2e {0}: {1:N1} MB, {2} entries, {3:N1} s" -f $layoutName, ((Get-Item -LiteralPath $zipPath).Length / 1MB), $names.Count, $clock.Elapsed.TotalSeconds)
+            Write-Host ($result.Stdout -split "`n" | Where-Object { $_ -match '^\[\d/8\]' } | ForEach-Object { "      $_" }) -Separator "`n"
+        }
+    }
+
+    # ======================================================================
     #  The script itself
     # ======================================================================
     Invoke-Case 'script: a malformed version stops it with exit code 1 and the three parts, before anything is built' {
