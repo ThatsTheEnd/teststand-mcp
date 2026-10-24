@@ -162,7 +162,7 @@ def own_records_from_json(document: object) -> list[OwnRecord]:
         raise OwnRecordError("counts is not an object")
     records: list[OwnRecord] = []
     for day_text, assets in counts.items():
-        day = _parse_day(day_text, OwnRecordError)
+        day = parse_day(day_text, OwnRecordError)
         if not isinstance(assets, dict):
             raise OwnRecordError(f"counts for {day_text} is not an object")
         for asset, phases in assets.items():
@@ -187,11 +187,11 @@ def traffic_from_json(metric: str, document: object) -> list[TrafficDay]:
         count, uniques = entry.get("count"), entry.get("uniques")
         if not _is_count(count) or not _is_count(uniques):
             raise CollectError(f"a {metric} entry has no integer count and uniques")
-        rows.append(TrafficDay(_parse_day(timestamp[:10], CollectError), metric, count, uniques))
+        rows.append(TrafficDay(parse_day(timestamp[:10], CollectError), metric, count, uniques))
     return rows
 
 
-def _parse_day(text: object, error: type[Exception]) -> date:
+def parse_day(text: object, error: type[Exception]) -> date:
     try:
         if not isinstance(text, str) or len(text) != 10:
             raise ValueError(text)
@@ -208,19 +208,19 @@ def snapshots_from_rows(rows: Iterable[Mapping[str, str]]) -> dict[date, dict[tu
     """downloads.csv rows grouped as {date: {(tag, asset): cumulative count}}."""
     snapshots: dict[date, dict[tuple[str, str], int]] = {}
     for row in rows:
-        day = _parse_day(row["date"], CollectError)
-        snapshots.setdefault(day, {})[(row["tag"], row["asset"])] = _csv_int(row["download_count"])
+        day = parse_day(row["date"], CollectError)
+        snapshots.setdefault(day, {})[(row["tag"], row["asset"])] = csv_int(row["download_count"])
     return snapshots
 
 
 def own_records_from_rows(rows: Iterable[Mapping[str, str]]) -> list[OwnRecord]:
     return [
-        OwnRecord(row["run_id"], _parse_day(row["date"], CollectError), row["asset"], _csv_int(row["draft"]), _csv_int(row["published"]))
+        OwnRecord(row["run_id"], parse_day(row["date"], CollectError), row["asset"], csv_int(row["draft"]), csv_int(row["published"]))
         for row in rows
     ]
 
 
-def _csv_int(text: str) -> int:
+def csv_int(text: str) -> int:
     try:
         value = int(text)
     except ValueError:
@@ -545,7 +545,7 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None,
             raise CollectError("--repo or GITHUB_REPOSITORY must look like owner/name")
         if not token:
             raise CollectError("GITHUB_TOKEN is not set")
-        today = _parse_day(args.today, CollectError) if args.today else utc_date(clock())
+        today = parse_day(args.today, CollectError) if args.today else utc_date(clock())
         traffic_api = client_factory(traffic_token) if traffic_token else None
         result = collect(client_factory(token), traffic_api, args.repo, args.stats_dir, today)
     except CollectError as error:

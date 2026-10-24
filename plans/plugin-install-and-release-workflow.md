@@ -939,9 +939,16 @@ Feature: Install counts over time
 
   Scenario: Own downloads are subtracted by contract
     Given teststand-mcp.zip rose from 100 to 120 between the snapshots of day D-1 and day D
-    And two release runs whose own-downloads records carry date D and assets {"teststand-mcp.zip": 4}
+    And two release runs whose own-downloads records each carry, on date D,
+      {"teststand-mcp.zip": {"draft": 3, "published": 1}}
     When the site is built
     Then the installs plotted for teststand-mcp.zip on day D are 12
+
+  Scenario: The draft switch decides what is subtracted
+    Given the same snapshots and records
+    And the collector's switch is set to ignore draft downloads
+    When the site is built
+    Then only the published counts are subtracted and the installs plotted on day D are 18
 
   Scenario: Subtraction never goes negative
     Given own-download records larger than the raw delta (draft downloads may not be counted)

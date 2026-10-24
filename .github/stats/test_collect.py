@@ -7,12 +7,16 @@ From .github/stats:        python -m unittest
 from __future__ import annotations
 
 import http.server
+import importlib.util
 import io
 import json
+import re
+import sys
 import tempfile
 import threading
 import time
 import unittest
+from html.parser import HTMLParser
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from unittest import mock
 import zipfile
@@ -20,6 +24,12 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import collect
+
+SITE_BUILDER = Path(__file__).resolve().parents[1] / "site" / "build.py"
+_spec = importlib.util.spec_from_file_location("stats_site_build", SITE_BUILDER)
+site = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = site  # dataclasses resolves annotations through sys.modules
+_spec.loader.exec_module(site)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OWN_DOWNLOADS_FIXTURE = REPO_ROOT / "build" / "tests" / "fixtures" / "own-downloads.json"
@@ -484,6 +494,335 @@ class RealClient(unittest.TestCase):
             with self.assertRaises(collect.CollectError):
                 self.client.get_json("/slow")
         self.assertLess(time.monotonic() - started, 3)
+
+
+# --------------------------------------------------------------------------
+#  Step 9.2: the site builder
+# --------------------------------------------------------------------------
+
+DOWNLOADS_HEADER = ",".join(collect.DOWNLOADS_COLUMNS) + "\n"
+OWN_HEADER = ",".join(collect.OWN_DOWNLOADS_COLUMNS) + "\n"
+TRAFFIC_HEADER = ",".join(collect.TRAFFIC_COLUMNS) + "\n"
+
+
+class PageParts(HTMLParser):
+    """Collects what the accessibility contract talks about, from the real markup."""
+
+    def __init__(self, page: str):
+        super().__init__()
+        self.order: list[str] = []
+        self.svgs: list[dict] = []
+        self.texts: dict[str, str] = {}
+        self.direct_labels: list[str] = []
+        self.polylines: list[dict] = []
+        self.table_rows: list[list[str]] = []
+        self.column_headers: list[str] = []
+        self.external: list[str] = []
+        self._open: list[tuple[str, dict]] = []
+        self._cell: list[str] | None = None
+        self._cell_scope: str | None = None
+        self.feed(page)
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        self._open.append((tag, attrs))
+        if tag in ("svg", "table", "figure"):
+            self.order.append(tag)
+        if tag == "svg":
+            self.svgs.append(attrs)
+        if tag == "polyline":
+            self.polylines.append(attrs)
+        if tag == "tr":
+            self.table_rows.append([])
+        if tag in ("td", "th"):
+            self._cell = []
+            self._cell_scope = attrs.get("scope")
+        for name in ("src", "href"):
+            if name in attrs:
+                self.external.append(attrs[name])
+        if tag in ("script", "link", "img", "iframe"):
+            self.external.append(f"<{tag}>")
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self._cell is not None:
+            text = "".join(self._cell)
+            self.table_rows[-1].append(text)
+            if self._cell_scope == "col":
+                self.column_headers.append(text)
+            self._cell = None
+        while self._open:
+            if self._open.pop()[0] == tag:
+                break
+
+    def handle_data(self, data):
+        if not self._open:
+            return
+        tag, attrs = self._open[-1]
+        if self._cell is not None:
+            self._cell.append(data)
+        if tag in ("title", "desc") and "id" in attrs:
+            self.texts[attrs["id"]] = self.texts.get(attrs["id"], "") + data
+        if tag == "text" and attrs.get("class") == "label":
+            self.direct_labels.append(data)
+
+
+def csv_text(header: str, *rows: str) -> str:
+    return header + "".join(row + "\n" for row in rows)
+
+
+def write_stats(directory: Path, downloads="", own="", traffic="") -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "downloads.csv").write_text(downloads or DOWNLOADS_HEADER, encoding="utf-8")
+    (directory / "own-downloads.csv").write_text(own or OWN_HEADER, encoding="utf-8")
+    (directory / "traffic.csv").write_text(traffic or TRAFFIC_HEADER, encoding="utf-8")
+    return directory
+
+
+def page_of(downloads="", own="", traffic="", today="2026-08-21", traffic_skipped=False, subtract_drafts=True) -> str:
+    with tempfile.TemporaryDirectory() as directory:
+        stats = write_stats(Path(directory), downloads, own, traffic)
+        return site.build_page(
+            collect.read_csv(stats / "downloads.csv", collect.DOWNLOADS_COLUMNS),
+            collect.read_csv(stats / "own-downloads.csv", collect.OWN_DOWNLOADS_COLUMNS),
+            collect.read_csv(stats / "traffic.csv", collect.TRAFFIC_COLUMNS),
+            d(today), traffic_skipped, subtract_drafts,
+        )
+
+
+TWO_SNAPSHOTS = csv_text(DOWNLOADS_HEADER, f"2026-08-20,v1.9.0,{ZIP},100", f"2026-08-21,v1.9.0,{ZIP},120")
+TWO_RUNS_OF_FOUR = csv_text(OWN_HEADER, f"1,2026-08-21,{ZIP},3,1", f"2,2026-08-21,{ZIP},3,1")
+
+
+class SiteSeries(unittest.TestCase):
+    def test_the_asset_names_match_the_release_asset_module(self):
+        module = (REPO_ROOT / "build" / "ReleaseAssets.psm1").read_text(encoding="utf-8")
+        archive = re.search(r"-Name ReleaseArchiveName -Value '([^']+)'", module).group(1)
+        versioned = re.search(r"\$script:VersionedArchiveFormat = '([^']+)'", module).group(1)
+        self.assertEqual(site.INSTALL_ASSET_NAME, archive)
+        self.assertEqual(site.VERSIONED_ARCHIVE_FORMAT.replace("{}", "{0}"), versioned)
+
+    def test_only_a_versioned_archive_name_joins_the_versioned_series(self):
+        pattern = site.VERSIONED_ARCHIVE_PATTERN
+        self.assertTrue(pattern.fullmatch("teststand-mcp-v1.9.0.zip"))
+        for name in (ZIP, "teststand-mcp-v1.9.0.zip.sha", "teststand-mcp-vX.zip", "xteststand-mcp-v1.9.0.zip", "teststand-mcp.sha256"):
+            self.assertFalse(pattern.fullmatch(name), name)
+
+    def test_install_series_sum_versioned_archives_and_ignore_other_assets(self):
+        installs = {d("2026-08-21"): {ZIP: 4, "teststand-mcp-v1.9.0.zip": 2, "teststand-mcp-v1.9.1.zip": 1, "teststand-mcp.sha256": 9}}
+        latest, versioned = site.install_series(installs)
+        self.assertEqual(dict(latest.values), {d("2026-08-21"): 4})
+        self.assertEqual(dict(versioned.values), {d("2026-08-21"): 3})
+
+    def test_the_chart_runs_from_the_first_data_point_to_today_and_is_bounded(self):
+        series = [site.Series(site.INSTALL_STYLES["latest"], {d("2026-08-20"): 1})]
+        self.assertEqual(site.chart_days(series, d("2026-08-22")), [d("2026-08-20"), d("2026-08-21"), d("2026-08-22")])
+        self.assertEqual(site.chart_days(series, d("2026-08-19")), [d("2026-08-20")])
+        self.assertEqual(site.chart_days([], d("2026-08-22")), [])
+        self.assertEqual(len(site.chart_days(series, d("2030-01-01"))), site.MAX_CHART_DAYS)
+
+    def test_the_y_axis_uses_integer_ticks_with_at_most_five_steps(self):
+        self.assertEqual(site.y_ticks(0), [0, 1])
+        self.assertEqual(site.y_ticks(3), [0, 1, 2, 3])
+        self.assertEqual(site.y_ticks(12), [0, 5, 10, 15])
+        self.assertEqual(site.y_ticks(100), [0, 20, 40, 60, 80, 100])
+
+    def test_direct_labels_that_would_overlap_are_pushed_apart_and_kept_inside_the_plot(self):
+        placed = site.spread_labels([100.0, 100.0, 101.0], 10, 300)
+        ordered = sorted(placed)
+        self.assertTrue(all(b - a >= site.LABEL_GAP for a, b in zip(ordered, ordered[1:])))
+        low = sorted(site.spread_labels([298.0, 299.0, 300.0], 10, 300))
+        self.assertLessEqual(max(low), 300)
+        self.assertTrue(all(b - a >= site.LABEL_GAP for a, b in zip(low, low[1:])))
+
+    def test_the_series_differ_in_line_style_and_marker_not_only_in_colour(self):
+        styles = [*site.INSTALL_STYLES.values(), *site.TRAFFIC_STYLES.values()]
+        self.assertEqual(len({s.dash for s in styles}), len(styles))
+        self.assertEqual(len({s.marker for s in styles}), len(styles))
+
+
+class SitePage(unittest.TestCase):
+    def test_own_downloads_are_subtracted_on_the_page_by_the_contract(self):
+        parts = PageParts(page_of(TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR))
+        row = next(r for r in parts.table_rows if r and r[0] == "2026-08-21")
+        self.assertEqual(row, ["2026-08-21", "12", "0"])
+
+    def test_the_draft_switch_changes_what_is_subtracted(self):
+        page = page_of(TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR, subtract_drafts=False)
+        row = next(r for r in PageParts(page).table_rows if r and r[0] == "2026-08-21")
+        self.assertEqual(row[1], "18")
+
+    def test_a_negative_result_is_plotted_as_zero(self):
+        own = csv_text(OWN_HEADER, f"1,2026-08-21,{ZIP},30,30")
+        row = next(r for r in PageParts(page_of(TWO_SNAPSHOTS, own)).table_rows if r and r[0] == "2026-08-21")
+        self.assertEqual(row[1], "0")
+
+    def test_the_chart_has_a_title_a_description_and_direct_labels(self):
+        parts = PageParts(page_of(TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR))
+        svg = parts.svgs[0]
+        self.assertEqual(svg["role"], "img")
+        title_id, desc_id = svg["aria-labelledby"].split()
+        self.assertEqual(parts.texts[title_id], "Installs per day")
+        self.assertIn("2026-08-21", parts.texts[desc_id])
+        self.assertIn("12 in total", parts.texts[desc_id])
+        self.assertEqual(parts.direct_labels[:2], [ZIP, "Versioned archives"])
+
+    def test_a_visible_table_of_the_daily_counts_follows_the_chart(self):
+        parts = PageParts(page_of(TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR))
+        self.assertEqual(parts.order[:3], ["figure", "svg", "table"])
+        self.assertEqual(parts.column_headers, ["Date (UTC)", ZIP, "Versioned archives"])
+
+    def test_each_series_is_drawn_with_its_own_dash_pattern(self):
+        parts = PageParts(page_of(TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR))
+        dashes = [line.get("stroke-dasharray", "") for line in parts.polylines]
+        self.assertEqual(len(dashes), 2)
+        self.assertEqual(len(set(dashes)), len(dashes))
+
+    def test_no_data_shows_an_empty_state_instead_of_an_empty_chart(self):
+        page = page_of()
+        self.assertNotIn("<svg", page)
+        self.assertIn("No download snapshot has been recorded yet", page)
+
+    def test_a_baseline_only_page_says_so_instead_of_drawing_a_chart(self):
+        page = page_of(csv_text(DOWNLOADS_HEADER, f"2026-08-20,v1.9.0,{ZIP},100"))
+        self.assertNotIn("<svg", page)
+        self.assertIn("only a baseline", page)
+
+    def test_a_skipped_traffic_collection_is_stated_in_visible_text(self):
+        page = page_of(TWO_SNAPSHOTS, traffic_skipped=True)
+        self.assertIn("STATS_TRAFFIC_TOKEN secret is not set", page)
+        self.assertEqual(len(PageParts(page).svgs), 1)
+
+    def test_recorded_traffic_is_charted_with_views_and_clones_labelled(self):
+        traffic = csv_text(TRAFFIC_HEADER, "2026-08-20,views,7,3", "2026-08-20,clones,2,1", "2026-08-21,views,4,2")
+        page = page_of(TWO_SNAPSHOTS, traffic=traffic)
+        parts = PageParts(page)
+        self.assertEqual(len(parts.svgs), 2)
+        self.assertEqual(parts.direct_labels[-2:], ["Views", "Clones"])
+        self.assertNotIn("STATS_TRAFFIC_TOKEN", page)
+
+    def test_a_present_token_without_data_says_nothing_was_recorded_yet(self):
+        self.assertIn("No views or clones have been recorded yet", page_of(TWO_SNAPSHOTS))
+
+    def test_the_page_loads_nothing_from_outside_and_runs_no_script(self):
+        page = page_of(TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR, traffic=csv_text(TRAFFIC_HEADER, "2026-08-21,views,4,2"))
+        self.assertEqual(PageParts(page).external, [])
+        self.assertNotRegex(page, r"https?://")
+        self.assertIn("default-src 'none'", page)
+
+    def test_series_labels_are_escaped_in_the_chart_and_the_table(self):
+        hostile = site.SeriesStyle("<img src=x onerror=alert(1)>&", "#000000", "", "circle")
+        chart = site.Chart("c", "t<script>", "u", [d("2026-08-21")], [site.Series(hostile, {d("2026-08-21"): 1})])
+        markup = site.render_chart(chart) + site.render_table(chart)
+        self.assertNotIn("<img", markup)
+        self.assertNotIn("<script", markup)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;&amp;", markup)
+
+    def test_a_single_day_chart_still_renders(self):
+        chart = site.Chart("c", "t", "u", [d("2026-08-21")], [site.Series(site.INSTALL_STYLES["latest"], {d("2026-08-21"): 3})])
+        self.assertIn("<polyline", site.render_chart(chart))
+
+
+class SiteCommand(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.out = self.root / "site"
+
+    def run_build(self, *extra, clock=None) -> int:
+        kwargs = {"clock": clock} if clock else {}
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            return site.main(["--stats-dir", str(self.root / "stats"), "--out", str(self.out), *extra], **kwargs)
+
+    def page(self) -> str:
+        return (self.out / "index.html").read_text(encoding="utf-8")
+
+    def test_a_build_from_csv_files_writes_the_page(self):
+        write_stats(self.root / "stats", TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR)
+        self.assertEqual(self.run_build("--today", "2026-08-21"), 0)
+        self.assertIn("<td>12</td>", self.page())
+
+    def test_an_empty_stats_directory_builds_the_empty_state(self):
+        self.assertEqual(self.run_build("--today", "2026-08-21"), 0)
+        self.assertIn("No download snapshot", self.page())
+
+    def test_the_no_subtract_drafts_flag_reaches_the_calculation(self):
+        write_stats(self.root / "stats", TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR)
+        self.assertEqual(self.run_build("--today", "2026-08-21", "--no-subtract-drafts"), 0)
+        self.assertIn("<td>18</td>", self.page())
+
+    def test_the_traffic_skipped_flag_reaches_the_page(self):
+        self.assertEqual(self.run_build("--today", "2026-08-21", "--traffic-skipped"), 0)
+        self.assertIn("STATS_TRAFFIC_TOKEN", self.page())
+
+    def test_a_corrupt_csv_fails_the_build_without_writing_a_page(self):
+        write_stats(self.root / "stats", csv_text(DOWNLOADS_HEADER, f"2026-08-21,v1.9.0,{ZIP},lots"))
+        self.assertEqual(self.run_build("--today", "2026-08-21"), 1)
+        self.assertFalse((self.out / "index.html").exists())
+
+    def test_the_page_extends_to_the_clocks_utc_date_across_midnight(self):
+        write_stats(self.root / "stats", TWO_SNAPSHOTS)
+        before = datetime(2026, 8, 21, 23, 59, 59, tzinfo=timezone.utc)
+        self.assertEqual(self.run_build(clock=lambda: before), 0)
+        self.assertNotIn('<th scope="row">2026-08-22', self.page())
+        self.assertEqual(self.run_build(clock=lambda: before + timedelta(seconds=1)), 0)
+        self.assertIn('<th scope="row">2026-08-22', self.page())
+
+
+class PagesWorkflow(unittest.TestCase):
+    """The workflow contract, checked on the text: there is no YAML parser in the standard library."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (REPO_ROOT / ".github" / "workflows" / "pages.yml").read_text(encoding="utf-8")
+        body = cls.text.split("\njobs:\n", 1)[1]
+        cls.jobs = {name: chunk for name, chunk in re.findall(r"(?ms)^  (\w+):\n(.*?)(?=^  \w+:\n|\Z)", body)}
+
+    def test_it_runs_daily_and_by_hand(self):
+        self.assertIn("cron: '41 8 * * *'", self.text)
+        self.assertRegex(self.text, r"(?m)^  workflow_dispatch:")
+
+    def test_every_action_is_pinned_to_a_full_commit_sha_with_its_version_in_a_comment(self):
+        uses = re.findall(r"(?m)^\s*(?:- )?uses: (\S+)(.*)$", self.text)
+        self.assertEqual(len(uses), 3)
+        for reference, rest in uses:
+            with self.subTest(reference=reference):
+                self.assertRegex(reference, r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}$")
+                self.assertRegex(rest, r"^\s+# v\d+\.\d+\.\d+$")
+
+    def test_permissions_are_granted_per_job_and_nowhere_else(self):
+        self.assertRegex(self.text, r"(?m)^permissions: \{\}$")
+        self.assertEqual(set(self.jobs), {"collect", "deploy"})
+
+        def permissions(job: str) -> list[tuple[str, str]]:
+            block = re.search(r"(?m)^    permissions:\n((?:      .*\n)+)", self.jobs[job]).group(1)
+            return re.findall(r"(?m)^      ([\w-]+): (\w+)", block)
+
+        collect_permissions, deploy_permissions = permissions("collect"), permissions("deploy")
+        self.assertEqual(collect_permissions, [("contents", "write"), ("actions", "read")])
+        self.assertEqual(deploy_permissions, [("pages", "write"), ("id-token", "write")])
+
+    def test_deploying_is_a_separate_job_that_waits_for_collecting(self):
+        self.assertIn("needs: collect", self.jobs["deploy"])
+        self.assertIn("actions/deploy-pages@", self.jobs["deploy"])
+        self.assertNotIn("deploy-pages", self.jobs["collect"])
+        self.assertNotIn("collect.py", self.jobs["deploy"])
+
+    def test_the_traffic_token_reaches_only_the_collector_through_an_environment_variable(self):
+        lines = [line for line in self.text.splitlines() if "STATS_TRAFFIC_TOKEN" in line and not line.lstrip().startswith("#")]
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(any(line.strip().startswith("STATS_TRAFFIC_TOKEN: ${{ secrets.STATS_TRAFFIC_TOKEN }}") for line in lines))
+        self.assertTrue(any("HAS_TRAFFIC_TOKEN: ${{ secrets.STATS_TRAFFIC_TOKEN != '' }}" in line for line in lines))
+        self.assertNotIn("echo", "".join(lines))
+
+    def test_the_scripts_it_runs_exist_and_the_page_is_built_before_the_push_and_the_upload(self):
+        for script in re.findall(r"python3 (\.github/\S+\.py)", self.text):
+            self.assertTrue((REPO_ROOT / script).is_file(), script)
+        steps = [self.text.index(marker) for marker in ("stats/collect.py", "site/build.py", "git push origin", "upload-pages-artifact@")]
+        self.assertEqual(steps, sorted(steps))
+
+    def test_the_stats_branch_is_only_committed_to_when_something_changed(self):
+        self.assertIn("git diff --cached --quiet", self.text)
 
 
 if __name__ == "__main__":
