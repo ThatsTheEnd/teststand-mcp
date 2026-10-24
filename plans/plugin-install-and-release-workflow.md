@@ -1285,9 +1285,9 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
   - [x] Step 4.2: Platform guard
   - [x] Step 4.3: Update-notify hook
   - [x] Step 4.4: hooks.json wiring
-- [ ] Slice 9: Download stats on GitHub Pages
-  - [ ] Step 9.1: collect.py
-  - [ ] Step 9.2: build.py and pages.yml
+- [x] Slice 9: Download stats on GitHub Pages
+  - [x] Step 9.1: collect.py
+  - [x] Step 9.2: build.py and pages.yml
 
 #### Wave 3
 - [ ] Slice 5: Packaging script
@@ -1314,3 +1314,5 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
 - Slice 7: a rehearsal tag (`v<X.Y.Z>-rehearsal`) gives the gate's plain `version` output, so its versioned archive is named `teststand-mcp-vX.Y.Z.zip`.
 - Verifier wording: the Fix line says "delete the draft first" even when the release is already published (seen on the live `v1.8.6` check). Word it by `release.draft` when slice 7 touches the verifier.
 - Slice 11 README: auto-allowed reads of a .seq inside the project still run its SequenceFileLoad callback; open only files you trust
+- Slice 7: `release.yml` uploads an artifact named exactly `own-downloads` holding `own-downloads.json` (AC-18 schema, at most 1 MiB) with `if: always()`; its `run_id` is `"${{ github.run_id }}"` as a string. Only runs of `.github/workflows/release.yml` in this repository, started by `push` or `workflow_dispatch`, are accepted by the collector.
+- Slice 7: `ci.yml` runs `python -m unittest discover -s .github/stats` from the repository root, and `actionlint` covers `pages.yml` too.
