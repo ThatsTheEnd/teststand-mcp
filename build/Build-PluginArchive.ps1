@@ -3,7 +3,9 @@
 #    1. refuses a malformed version, tag, commit or layout;
 #    2. runs the source checks that need no build (skill sources, tool classification, the
 #       plugin.json version placeholder);
-#    3. dotnet publish in the chosen exe layout, and proves the exe carries the version.
+#    3. dotnet publish in the chosen exe layout, and proves the exe carries the version;
+#    4. stages the archive tree (converted agents, stamped plugin.json, bin/CLAUDE.md with the skill
+#       inlined, VERSION.txt) and asserts the layout, the agent flavours and the version stamp.
 #  Every failure is three parts - what is wrong, why it matters, the command that fixes it -
 #  printed to the host, with exit code 1.
 #
@@ -30,8 +32,9 @@ Import-Module (Join-Path $PSScriptRoot 'PluginArchive.psm1') -Force
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $PublishDirName = 'publish'
+$StageDirName = 'stage'
 $StepClock = [Diagnostics.Stopwatch]::StartNew()
-$StepCount = 3
+$StepCount = 4
 
 function Write-Step {
     param([int]$Number, [string]$Text)
@@ -68,11 +71,17 @@ try {
     Write-Step 2 "Publishing the exe ($Layout)"
     [void](New-Item -ItemType Directory -Path $OutDir -Force)
     $publishDir = Join-Path $OutDir $PublishDirName
+    $stageDir = Join-Path $OutDir $StageDirName
+    $release = New-ReleaseRecord -Tag $Tag -Version $Version -Commit $Commit
     try {
         $publishedExe = Publish-PluginExe -RepoRoot $RepoRoot -Layout $Layout -Version $Version -Commit $Commit -PublishDir $publishDir
 
         Write-Step 3 'Checking the published exe'
         Assert-PublishedVersion -ExePath $publishedExe -Version $Version -Commit $Commit
+
+        Write-Step 4 'Staging the plugin tree'
+        New-StagedPlugin -RepoRoot $RepoRoot -PublishDir $publishDir -StageDir $stageDir -Layout $Layout -Release $release
+        Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stageDir -Layout $Layout -Release $release
     } finally {
         Remove-BuildTempTree -Path $publishDir
     }

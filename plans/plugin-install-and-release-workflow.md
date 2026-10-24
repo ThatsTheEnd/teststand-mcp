@@ -730,13 +730,14 @@ Feature: One script produces the plugin archive
 - Stage the tree.
 - Convert the agents (slice 2 module).
 - Write `bin/CLAUDE.md` with every `@` import resolved inline and the YAML frontmatter stripped. `bin/CLAUDE.md` keeps the developer sections deliberately, as the direct route always has.
-- `bin/scripts/` is staged from an explicit list (the two generators and the template). `scripts/Test-LoadPrototype.ps1` and any other maintainer script stay out.
-- Write `VERSION.txt`.
-- Stamp `plugin.json` and check it byte for byte.
+- `bin/` is the publish output minus what the csproj copies into every output (`CLAUDE.md`, `README.md`, `scripts/`, `.claude/`); those come from the repository. `bin/.claude/agents` holds the source agents unchanged (including `link-agents.bat`, which lives in that folder).
+- `bin/scripts/` is staged from an explicit list (the two generators and the template). `scripts/Test-LoadPrototype.ps1` and any other maintainer script stay out. `hooks/` must hold exactly the runtime hook files (`hooks.json`, `tool-classes.json`, `hook-common.ps1` and the `.ps1` hooks).
+- Write `VERSION.txt` (`tag`, `version`, `commit`, `built`, `run`, the format `src/VersionInfo.cs` reads; `run` is `local` outside GitHub Actions).
+- Stamp `plugin.json` and check it byte for byte: the staged text with the version put back must equal the source.
 - Assert the layout (AC-4) and the agent flavours (AC-5) from one table that also drives the staging.
-**TEST**: Run locally. Every slice 5 Outline row has its own fixture: delete a staged file, plant a stray `mcp__teststand__`, leave an unresolved import, drop one converted agent (count mismatch), copy `scripts/Test-LoadPrototype.ps1` into `bin/scripts`, and remove the `commit:` line from `VERSION.txt`. Each fault names itself.
+**TEST**: Run locally. Every slice 5 Outline row has its own fixture in `build/tests/BuildPluginArchive.Tests.ps1`, built from a tiny fake publish directory and the real repository sources: delete a staged file, plant a stray `mcp__teststand__`, leave an unresolved import, drop one converted agent (count mismatch), copy `scripts/Test-LoadPrototype.ps1` into `bin/scripts`, and remove the `commit:` line from `VERSION.txt`. Each fault names itself.
 **REFACTOR**: One staging/assertion table.
-**Files**: `build/Build-PluginArchive.ps1`
+**Files**: `build/Build-PluginArchive.ps1`, `build/PluginArchive.psm1`, `build/tests/BuildPluginArchive.Tests.ps1`
 **Commit**: `feat: stage the plugin tree, convert agents and stamp the version`
 
 #### Step 5.3: Smoke tests, zip, digests, local verify
