@@ -104,6 +104,12 @@ try {
         Assert-True ($run.Output -notmatch 'FAIL  ') "unexpected FAIL line in:`n$($run.Output)"
     }
 
+    Invoke-Case 'real tree: the repository passes every check' {
+        $run = Invoke-Checker $RepoRoot
+        Assert-True ($run.ExitCode -eq 0) "expected exit 0 but got $($run.ExitCode):`n$($run.Output)"
+        Assert-True ($run.Output -notmatch 'FAIL  ') "unexpected FAIL line in:`n$($run.Output)"
+    }
+
     Invoke-Case 'deny-list: a planted date fails and names file and line' {
         $root = New-Fixture
         Add-Line (Join-Path $root 'plugin\skills\teststand-rules\references\rebuild.md') 'Measured 2026-07-29 on a real file.'
