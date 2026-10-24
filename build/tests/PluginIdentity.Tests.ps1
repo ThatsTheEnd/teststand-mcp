@@ -132,6 +132,107 @@ try {
         Assert-Equal '${CLAUDE_PLUGIN_ROOT}/bin/TestStandMCP.exe' $server.command 'command'
         Assert-Equal '${user_config.tsenv_path}' $server.env.'TESTSTAND_MCP_TestStand__EnvironmentPath' 'environment path value'
     }
+
+    # --- Agent conversion ------------------------------------------------------
+    $identity = Get-PluginIdentity
+    $skillReference = 'the teststand-rules skill'
+
+    # A fixture with CRLF endings and non-ASCII text, so "all other bytes unchanged" is checkable.
+    $fixtureBody = (@(
+        '---',
+        'name: fixture-agent',
+        'tools: Read, mcp__teststand__connect_engine, mcp__teststand__open_sequence_file',
+        '---',
+        ('Rules come from CLAUDE.md (Z' + $UmlautU + 'hlke).'),
+        'Call mcp__teststand__connect_engine first.',
+        ''
+    ) -join "`r`n")
+    $fixtureConverted = (@(
+        '---',
+        'name: fixture-agent',
+        ('tools: Read, ' + $ExpectedToolPrefix + 'connect_engine, ' + $ExpectedToolPrefix + 'open_sequence_file'),
+        '---',
+        ('Rules come from ' + $skillReference + ' (Z' + $UmlautU + 'hlke).'),
+        ('Call ' + $ExpectedToolPrefix + 'connect_engine first.'),
+        ''
+    ) -join "`r`n")
+
+    function New-AgentFile {
+        param([string]$Text, [string]$Name = 'fixture-agent.md')
+        $path = Join-Path (New-TempDir) $Name
+        [IO.File]::WriteAllText($path, $Text, $Utf8NoBom)
+        return $path
+    }
+
+    function Get-ConvertedBytes {
+        param([string]$Text)
+        return $Utf8NoBom.GetBytes($Text)
+    }
+
+    # --- Scenario: Converting an agent ----------------------------------------
+    Invoke-Case 'convert: tool names and CLAUDE.md change, every other byte is unchanged' {
+        $converted = ConvertTo-PluginAgent -Path (New-AgentFile $fixtureBody)
+        Assert-Equal ([BitConverter]::ToString((Get-ConvertedBytes $fixtureConverted))) ([BitConverter]::ToString((Get-ConvertedBytes $converted))) 'converted bytes'
+    }
+
+    foreach ($agentName in $SourceAgentNames) {
+        $sourcePath = Join-Path $sourceAgentDir ($agentName + '.md')
+
+        Invoke-Case "convert real agent $agentName : no direct prefix and no claude.md in any case" {
+            $converted = ConvertTo-PluginAgent -Path $sourcePath
+            Assert-True ($converted.IndexOf($DirectToolPrefix, [StringComparison]::OrdinalIgnoreCase) -lt 0) 'direct tool prefix left in the converted agent'
+            Assert-True ($converted.IndexOf('claude.md', [StringComparison]::OrdinalIgnoreCase) -lt 0) 'a claude.md reference is left in the converted agent'
+            Assert-True ($converted.Contains($ExpectedToolPrefix)) 'plugin tool prefix is missing from the converted agent'
+        }
+
+        # --- Scenario: Round trip ----------------------------------------------
+        Invoke-Case "round trip real agent $agentName : byte-identical to the source" {
+            $convertedPath = New-AgentFile (ConvertTo-PluginAgent -Path $sourcePath) ($agentName + '.md')
+            $roundTrip = ConvertFrom-PluginAgent -Path $convertedPath
+            $sourceHex = [BitConverter]::ToString([IO.File]::ReadAllBytes($sourcePath))
+            Assert-Equal $sourceHex ([BitConverter]::ToString((Get-ConvertedBytes $roundTrip))) 'round-trip bytes'
+        }
+    }
+
+    Invoke-Case 'round trip fixture with CRLF and non-ASCII text is byte-identical' {
+        $convertedPath = New-AgentFile (ConvertTo-PluginAgent -Path (New-AgentFile $fixtureBody))
+        $roundTrip = ConvertFrom-PluginAgent -Path $convertedPath
+        Assert-Equal ([BitConverter]::ToString((Get-ConvertedBytes $fixtureBody))) ([BitConverter]::ToString((Get-ConvertedBytes $roundTrip))) 'round-trip bytes'
+    }
+
+    # --- Scenario: A source agent has no tools line ----------------------------
+    Invoke-Case 'convert: a source agent without a tools line fails and names the file' {
+        $path = New-AgentFile "---`nname: no-tools`n---`nBody mentions mcp__teststand__connect_engine.`n" 'no-tools-agent.md'
+        Assert-Throws { ConvertTo-PluginAgent -Path $path } 'no-tools-agent.md'
+    }
+
+    Invoke-Case 'convert: a tools line outside the frontmatter does not count' {
+        $path = New-AgentFile "---`nname: x`n---`ntools: Read`n" 'tools-in-body.md'
+        Assert-Throws { ConvertTo-PluginAgent -Path $path } 'tools-in-body.md'
+    }
+
+    # --- Scenario: A stray tool name survives conversion -----------------------
+    Invoke-Case 'convert: a tool name inside a fenced code block is converted too' {
+        $text = "---`ntools: Read`n---`n``````text`nmcp__teststand__get_loaded_sequence_files`n```````n"
+        $converted = ConvertTo-PluginAgent -Path (New-AgentFile $text)
+        Assert-True ($converted.IndexOf($DirectToolPrefix, [StringComparison]::OrdinalIgnoreCase) -lt 0) 'direct prefix left inside the code block'
+        Assert-True ($converted.Contains($ExpectedToolPrefix + 'get_loaded_sequence_files')) 'code block tool name was not converted'
+    }
+
+    # --- Guards that keep the mapping reversible -------------------------------
+    Invoke-Case 'convert: a claude.md reference in another case fails and names the file' {
+        $path = New-AgentFile "---`ntools: Read`n---`nSee claude.md.`n" 'lowercase-ref.md'
+        Assert-Throws { ConvertTo-PluginAgent -Path $path } 'lowercase-ref.md'
+    }
+
+    Invoke-Case 'convert: a source that already holds the plugin phrase fails (it would not round trip)' {
+        $path = New-AgentFile "---`ntools: Read`n---`nSee $skillReference and CLAUDE.md.`n" 'ambiguous.md'
+        Assert-Throws { ConvertTo-PluginAgent -Path $path } 'ambiguous.md'
+    }
+
+    Invoke-Case 'convert: a missing file fails and names the file' {
+        Assert-Throws { ConvertTo-PluginAgent -Path (Join-Path (New-TempDir) 'absent.md') } 'absent.md'
+    }
 }
 finally {
     foreach ($dir in $script:tempDirs) {
