@@ -6,7 +6,9 @@
 #      location (NOT the process directory), before any Test-Path or .NET I/O;
 #    - Read-Utf8Text, Read-JsonFile, Get-Utf8NoBomEncoding, Get-JsonProperty, Get-PropertyNames;
 #    - Add-GitHubOutput: a step output for later workflow steps;
-#    - Remove-BuildTempTree: temp cleanup that retries and warns.
+#    - Remove-BuildTempTree: temp cleanup that retries and warns;
+#    - Invoke-ChildProcess / New-ChildProcessStartInfo / Stop-ChildProcess: a child program with a
+#      timeout, array arguments and captured output (stopped by process id, never by image name).
 #  Compatible with Windows PowerShell 5.1 and PowerShell 7.
 #  Text is written with explicit .NET UTF-8 (no BOM) APIs: never use
 #  Set-Content -Encoding UTF8 (5.1 writes a BOM).
@@ -150,6 +152,84 @@ function Add-GitHubOutput {
 }
 
 # ----------------------------------------------------------------------------
+#  Child processes
+# ----------------------------------------------------------------------------
+$script:ProcessSettleMilliseconds = 5000   # how long a stopped process, or the pipes of an exited one, may take to settle
+
+# One argument as a Windows command-line element: quoted when it holds a space or a quote, with the
+# backslash rules of CommandLineToArgvW. Windows PowerShell 5.1 has no ProcessStartInfo.ArgumentList,
+# so every caller passes an ARRAY and this quotes each element (a path is data, never script text).
+function ConvertTo-ArgumentElement {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    if ($Text.Length -gt 0 -and $Text -notmatch '[\s"]') { return $Text }
+    $escaped = [regex]::Replace($Text, '(\\*)"', '$1$1\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)\z', '$1$1')
+    return '"' + $escaped + '"'
+}
+
+# A start-info with all three streams redirected, no window and UTF-8 text.
+function New-ChildProcessStartInfo {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$FilePath, [string[]]$ArgumentList = @(), [string]$WorkingDirectory)
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $FilePath
+    $info.Arguments = (@($ArgumentList | ForEach-Object { ConvertTo-ArgumentElement $_ })) -join ' '
+    if ($WorkingDirectory) { $info.WorkingDirectory = Resolve-BuildPath $WorkingDirectory }
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.StandardOutputEncoding = $script:Utf8NoBom
+    $info.StandardErrorEncoding = $script:Utf8NoBom
+    return $info
+}
+
+# Stops ONE process by its id (never by image name: another process of the same program may be
+# somebody else's) and waits briefly for it to go.
+function Stop-ChildProcess {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Diagnostics.Process]$Process)
+    if ($Process.HasExited) { return }
+    Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+    [void]$Process.WaitForExit($script:ProcessSettleMilliseconds)
+}
+
+# Runs a program to completion with stdin closed (the program sees EOF), a hard timeout and both
+# output streams captured. A non-zero exit does not throw; a timeout stops that process and says so.
+function Invoke-ChildProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [string]$WorkingDirectory,
+        [int]$TimeoutSeconds = 120
+    )
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $process = [Diagnostics.Process]::Start((New-ChildProcessStartInfo -FilePath $FilePath -ArgumentList $ArgumentList -WorkingDirectory $WorkingDirectory))
+    try {
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.StandardInput.Close()
+        $finished = $process.WaitForExit($TimeoutSeconds * 1000)
+        if (-not $finished) { Stop-ChildProcess $process }
+        # A grandchild that inherited the pipes can hold them open after the program has exited: take what arrived.
+        $drained = [Threading.Tasks.Task]::WaitAll(@($stdout, $stderr), $script:ProcessSettleMilliseconds)
+        return [pscustomobject]@{
+            ExitCode  = $(if ($finished) { $process.ExitCode } else { $null })
+            TimedOut  = (-not $finished)
+            Stdout    = $(if ($drained) { $stdout.Result } else { '' })
+            Stderr    = $(if ($drained) { $stderr.Result } else { '' })
+            ElapsedMs = $clock.ElapsedMilliseconds
+        }
+    } finally {
+        Stop-ChildProcess $process
+        $process.Dispose()
+    }
+}
+
+# ----------------------------------------------------------------------------
 #  Temp cleanup
 # ----------------------------------------------------------------------------
 # A scanner or a lingering handle can make the first recursive delete fail; retry, then warn
@@ -171,4 +251,5 @@ function Remove-BuildTempTree {
 }
 
 Export-ModuleMember -Function Get-Utf8NoBomEncoding, Resolve-BuildPath, Write-BuildFailure, Get-ScriptFailureText,
-    Read-Utf8Text, Read-JsonFile, Get-JsonProperty, Get-PropertyNames, Add-GitHubOutput, Remove-BuildTempTree
+    Read-Utf8Text, Read-JsonFile, Get-JsonProperty, Get-PropertyNames, Add-GitHubOutput, Remove-BuildTempTree,
+    ConvertTo-ArgumentElement, New-ChildProcessStartInfo, Stop-ChildProcess, Invoke-ChildProcess

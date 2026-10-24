@@ -658,7 +658,7 @@ All other registered tools go to `prompt`, including `diff_sequence_files`, `com
 ### Slice 5: Packaging script
 
 **Depends-on:** 0, 1, 2, 3, 4, 6
-**Files:** `build/Build-PluginArchive.ps1`, `.gitignore`
+**Files:** `build/Build-PluginArchive.ps1`, `build/PluginArchive.psm1`, `build/PluginSmoke.psm1`, `build/BuildCommon.psm1`, `build/tests/BuildPluginArchive.Tests.ps1`, `.gitignore` (already ignores `artifacts/`)
 
 **Behavior:**
 
@@ -711,15 +711,16 @@ Feature: One script produces the plugin archive
 
 **Complexity**: complex
 **IMPLEMENT**:
-- `#Requires -Version 7`. Windows PowerShell 5.1 writes backslash zip entries.
-- Parameters: `-Version -Tag -Commit -OutDir -Layout` (default from slice 0).
-- Pre-build: run `Test-SkillSources.ps1` and `PluginHooks.Tests.ps1`.
-- Run `dotnet publish -c Release -p:Platform=x86 -r win-x86 …` per layout, with `-p:Version` and `-p:SourceRevisionId=<sha>`.
-- Assert `ProductVersion`.
-- A `Fail` helper writes what / why / fix.
-**TEST**: Run locally with `-Version 0.0.0-ci`, once with the default layout and once with an explicit other layout. Then the placeholder, skill-check and version-mismatch faults from the Outline. For the mismatch, publish with one version and assert against another.
+- No `#Requires -Version 7`: the station has only Windows PowerShell 5.1, so the script targets 5.1 and stays 7-compatible. The 5.1 backslash-entry problem is handled in step 5.3 by writing the zip entry by entry with explicit forward-slash names.
+- The stages live in `build/PluginArchive.psm1` (one function per stage, so each can be tested alone); `build/Build-PluginArchive.ps1` only orders them. A shared child-process helper (array arguments, timeout, stop by process id) goes into `build/BuildCommon.psm1`.
+- Parameters: `-Version -Tag -Commit -OutDir -Layout` (default `folder`, from slice 0). `-Version` is `X.Y.Z` or `X.Y.Z-suffix` (`0.0.0-ci`); `-Tag` defaults to `v<Version>`; `-Commit` defaults to `git rev-parse HEAD` and must be the full SHA.
+- Pre-build, before the slow publish: `Test-SkillSources.ps1`, the classification check (`ToolClassification.psm1`: every registered tool is classified) and the `"version": "0.0.0"` placeholder of `plugin.json`. The hook suite was split into several `build/tests/*.Tests.ps1` files and stays out of the packaging script: CI runs it (slice 7).
+- Run `dotnet publish -c Release -p:Platform=x86 -r win-x86 …` into a fresh `<OutDir>\publish`, with `-p:Version` and `-p:SourceRevisionId=<sha>` (the csproj has one target framework, so no `--framework`). `OutDir` defaults to `artifacts\`, which `.gitignore` already covers.
+- Assert `ProductVersion` is `<version>+<commit>`.
+- A `Write-BuildFailure` call (what / why / fix) reports every fault.
+**TEST**: Run locally with `-Version 0.0.0-ci`, once with the default layout and once with an explicit other layout. Then the placeholder, skill-check, unclassified-tool and version-mismatch faults from the Outline. For the mismatch, assert a foreign exe against the requested version. `build/tests/BuildPluginArchive.Tests.ps1` holds one case per Outline row; the real end-to-end run per layout is opt-in (`TESTSTAND_MCP_PACKAGE_E2E=1`).
 **REFACTOR**: Keep the layout-specific bits in one table.
-**Files**: `build/Build-PluginArchive.ps1`, `.gitignore`
+**Files**: `build/Build-PluginArchive.ps1`, `build/PluginArchive.psm1`, `build/BuildCommon.psm1`, `build/tests/BuildPluginArchive.Tests.ps1`
 **Commit**: `feat: packaging script with source checks and the chosen exe layout`
 
 #### Step 5.2: Stage, convert, resolve, stamp, assert
