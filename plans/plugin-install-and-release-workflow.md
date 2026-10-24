@@ -389,7 +389,9 @@ Feature: Plugin users get the TestStand usage rules
 ### Slice 4: Plugin hooks
 
 **Depends-on:** 0, 2
-**Files:** `plugin/hooks/hooks.json`, `plugin/hooks/allow-readonly.ps1`, `plugin/hooks/tool-classes.json`, `plugin/hooks/platform-guard.sh`, `plugin/hooks/update-notify.ps1`, `build/New-HooksJson.ps1`, `build/tests/PluginHooks.Tests.ps1`
+**Files:** `plugin/hooks/hooks.json`, `plugin/hooks/allow-readonly.ps1`, `plugin/hooks/tool-classes.json`, `plugin/hooks/platform-guard.ps1`, `plugin/hooks/platform-guard.sh`, `plugin/hooks/hook-common.ps1`, `plugin/hooks/update-notify.ps1`, `build/New-HooksJson.ps1`, `build/ToolClassification.psm1`, `build/tests/PluginHooks.Tests.ps1`
+
+**Shell decision (slice 0 fact 10):** on Windows a hook command runs in Git Bash when present, else PowerShell, and Git Bash must not be required. All Windows hook logic is therefore a Windows PowerShell 5.1 script pinned to `"shell": "powershell"`. `platform-guard.sh` (POSIX `sh`) only carries the non-Windows message and is **not wired into `hooks.json`**: the official hooks documentation says that "without Git Bash, a shell-form hook with no `shell` set runs in PowerShell, where it can fail", and that "a hook that can't start is a non-blocking error", which shows a `<hook name> hook error` notice, so a Windows station without Git Bash would see an error from a `sh` entry. The file and its tests stay, ready for a host where a POSIX entry can be wired safely. The consequence is that AC-15's non-Windows message is not delivered at run time. The quotes are recorded in `docs/validation/claude-code-plugin-facts.md` (facts 10 and 15).
 
 **Behavior:**
 
@@ -576,23 +578,25 @@ user_name_exists validate_sequence_plan
 ```
 
 All other registered tools go to `prompt`, including `diff_sequence_files`, `compare_sequence_files` and `find_file`, which look read-only by name.
+
+**Audit result (built):** the committed allow-list has **75** tools and `prompt` has 177 (252 registered). `get_step_unique_id` (reads `Step.UniqueStepId`, no setter, no save), `find_in_file` (engine search over one loaded sequence file, no replacement, no save) and `get_report_text` (reads `Execution.ReportText` of an in-memory execution, takes no path) are **kept**. `read_csv_lines` **moved to `prompt`**: it opens the CSV input record stream on any path the caller names and returns its lines, an arbitrary file read. The verdicts and reasons are recorded under `audit` in `tool-classes.json` and checked against the lists; the permanent exclusions sit under `neverAllow`. The classification check is `build/ToolClassification.psm1`, shared by the test and `New-HooksJson.ps1`.
 **TEST**: `PluginHooks.Tests.ps1` runs the allowed case, both Outlines, the malformed input, and the named-exclusion invariant. The classification check runs against `Register("…")` in `src/Tools/TestStandToolRegistry.cs`, plus fixture classifications for each fault row. It runs under both `powershell.exe` and `pwsh`.
 **REFACTOR**: Sort both arrays, one name per line.
-**Files**: `plugin/hooks/allow-readonly.ps1`, `plugin/hooks/tool-classes.json`, `build/tests/PluginHooks.Tests.ps1`
+**Files**: `plugin/hooks/allow-readonly.ps1`, `plugin/hooks/hook-common.ps1`, `plugin/hooks/tool-classes.json`, `build/ToolClassification.psm1`, `build/tests/PluginHooks.Tests.ps1`
 **Commit**: `feat: auto-allow read-only TestStand tools, classify every tool`
 
 #### Step 4.2: Platform guard
 
 **Complexity**: standard
-**IMPLEMENT**: Use POSIX `sh`, and run on `startup` only.
-- Non-Windows: one message.
-- Windows: one combined ASCII warning. TestStand is detected by the `TestStand` env var, then the `…\National Instruments\TestStand*` folders under both Program Files roots. Python is found through `py -3` first, then `python`. Also check `python-docx`, Pillow, and Edge/Chrome.
-- Always: the `additionalContext` rules pointer, if slice 0 confirmed the field. Otherwise this part is dropped and recorded.
-- The optional-dependency part is throttled to once per 24 h per missing set, using the same cache location as the notify hook (`TESTSTAND_MCP_STATE_DIR` overrides it, so the tests stay isolated). A different missing set warns again at once. The fix shown for a missing TestStand is "install NI TestStand 2019 or later, or start Claude Code where TestStand is installed". `TESTSTAND_MCP_NO_PLATFORM_WARNING=1` switches it off. A missing TestStand is never throttled.
-- The shell follows the slice 0 finding. If Claude Code on Windows needs Git for Windows to run `sh`, that requirement goes in the README prerequisites, not only in troubleshooting.
-**TEST**: Stubbed `uname`, `PATH` and env for every Outline row, the launcher fallback, the throttle and the opt-out. Check that the output is ASCII and that each case prints exactly one message.
-**REFACTOR**: One `emit` helper for JSON escaping.
-**Files**: `plugin/hooks/platform-guard.sh`, `build/tests/PluginHooks.Tests.ps1`
+**IMPLEMENT**: Run on `startup` only. The Windows part is `plugin/hooks/platform-guard.ps1` (Windows PowerShell 5.1, pinned to `"shell": "powershell"`). `plugin/hooks/platform-guard.sh` (POSIX `sh`) carries only the non-Windows message, and exits 0 silently when `uname` reports MINGW, MSYS, CYGWIN or Windows, so a Windows station with Git Bash never gets a double message. The `.sh` entry is not wired (see the Shell decision above).
+- Non-Windows (`.sh`): one systemMessage saying the server needs Windows with NI TestStand.
+- Windows (`.ps1`): one combined ASCII warning. TestStand is detected by the `TestStand` env var, then the `…\National Instruments\TestStand*` folders under the Program Files roots (`ProgramW6432`, `ProgramFiles`, `ProgramFiles(x86)`). Python is found through `py -3` first, then `python`; one probe per interpreter, cut off after 1.5 s, answers whether `python-docx` and Pillow import. Edge/Chrome is looked up the way `scripts/generate_teststand_doc.py` does.
+- Always: the `additionalContext` rules pointer (slice 0 fact 6 confirmed the field).
+- The optional-dependency part is throttled to once per 24 h per missing set (a stored time of exactly 24 h or more, or in the future, is expired), using the same cache location as the notify hook: `TESTSTAND_MCP_STATE_DIR`, else `${CLAUDE_PLUGIN_DATA}`, else `%LOCALAPPDATA%\teststand-mcp\`. A different missing set warns again at once. The fix shown for a missing TestStand is "install NI TestStand 2019 or later, or start Claude Code where TestStand is installed". `TESTSTAND_MCP_NO_PLATFORM_WARNING=1` switches the optional part off (and does not consume the throttle). A missing TestStand is never throttled.
+- Git Bash is **not** required: nothing here runs in Git Bash, so no README prerequisite is needed.
+**TEST**: Injected `PATH` (stub `py` / `python` launchers), Program Files roots, env and clock (`TESTSTAND_MCP_NOW`) for every Outline row, the launcher fallback, a hanging interpreter, the throttle (23 h 59 m 59 s against exactly 24 h), a changed set, a clock that moved back, a corrupt or unwritable state, the state-directory precedence and the opt-out. For the `.sh`, a stubbed `uname` for Linux, Darwin and every Windows value, a failing `uname` and a hostile value. Check that the output is ASCII and that each case prints exactly one message.
+**REFACTOR**: One `emit` helper for JSON escaping (`emit_system_message` in the `.sh`, `Write-HookOutput` in `hook-common.ps1`).
+**Files**: `plugin/hooks/platform-guard.ps1`, `plugin/hooks/platform-guard.sh`, `plugin/hooks/hook-common.ps1`, `build/tests/PluginHooks.Tests.ps1`
 **Commit**: `feat: warn on unsupported hosts and missing doc-agent dependencies`
 
 #### Step 4.3: Update-notify hook
