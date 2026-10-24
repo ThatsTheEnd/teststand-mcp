@@ -457,9 +457,96 @@ function Add-OwnDownload {
     Save-OwnDownloads -Record $record -Path $Path
 }
 
+# ----------------------------------------------------------------------------
+#  The asset set that was verified is the asset set that goes live. The release workflow calls this
+#  (through Assert-ReleaseAssetSet.ps1) on the body of GET releases/{id} just BEFORE it publishes the
+#  verified draft and again just AFTER: a person or a stray job could add, replace or remove an asset
+#  between the verification and the publish call, and the verification would then say nothing about what
+#  users download. Asset ids are compared (a replaced asset gets a new id), as a set: order is irrelevant.
+#  -ExpectedAssetIds is the verifier's asset_ids output, {"<asset name>": <id>, ...}.
+# ----------------------------------------------------------------------------
+$script:AssetIdPattern = '\A[0-9]+\z'
+$script:AssetSetFixes = @{
+    Restart = 'Delete the draft (gh release delete <tag>, or in the web UI) and start a new release run: the verified assets are no longer what the release holds.'
+    NotLive = 'The release is still a draft, so nothing is live: start a new release run (delete the draft first).'
+    Live    = 'The release is already live with assets nobody verified: delete it so releases/latest falls back to the previous release (safe only once an earlier workflow-built release exists), or fix forward by releasing the next patch version (see CONTRIBUTING).'
+}
+
+function ConvertFrom-ExpectedAssetIds {
+    param([AllowEmptyString()][string]$Text)
+    $fail = {
+        param($Reason)
+        Write-BuildFailure -What "The verified asset ids are unusable: $Reason." `
+            -Why 'They are the verifier''s asset_ids output, the only record of what was verified; without them the release cannot be compared with it. Running it again will not help.' `
+            -Fix 'Check that the verification step wrote asset_ids to its step output, then start a new release run.'
+    }
+    if ([string]::IsNullOrWhiteSpace($Text)) { & $fail 'the value is empty' }
+    try { $json = $Text | ConvertFrom-Json } catch { & $fail 'it is not valid JSON' }
+    $expected = New-OrdinalOrderedMap   # id -> asset name
+    foreach ($property in @(Get-PropertyNames $json)) {
+        $id = [string](Get-JsonProperty $json $property)
+        if ($id -cnotmatch $script:AssetIdPattern) { & $fail "'$property' has the id '$id', which is not a number" }
+        $expected[$id] = $property
+    }
+    if ($expected.Count -eq 0) { & $fail 'it lists no asset' }
+    return $expected
+}
+
+function Assert-ReleaseAssetSet {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$ReleaseJson,
+        [AllowEmptyString()][string]$ExpectedAssetIds,
+        [AllowEmptyString()][string]$ReleaseId,
+        [ValidateSet('BeforePublish', 'AfterPublish')][string]$Stage
+    )
+    $after = ($Stage -ceq 'AfterPublish')
+    $when = if ($after) { 'after the publish call' } else { 'before publishing' }
+    $expected = ConvertFrom-ExpectedAssetIds $ExpectedAssetIds
+
+    $release = $null
+    if (-not [string]::IsNullOrWhiteSpace($ReleaseJson)) { try { $release = $ReleaseJson | ConvertFrom-Json } catch { $release = $null } }
+    if ($null -eq $release -or $null -eq $release.PSObject.Properties['assets']) {   # an empty list is still a list
+        Write-BuildFailure -What "The release response $when is not a release (empty, not JSON, or without an asset list)." `
+            -Why 'The asset set cannot be compared without it. Running it again may help if the API call failed transiently.' `
+            -Fix $(if ($after) { $script:AssetSetFixes.Live } else { $script:AssetSetFixes.Restart })
+    }
+
+    $problems = @()
+    $actualId = [string](Get-JsonProperty $release 'id')
+    if ($actualId -cne $ReleaseId) { $problems += "the API answered with release $actualId, not release $ReleaseId" }
+    $draft = Get-JsonProperty $release 'draft'
+    $isLive = $false
+    if ($draft -isnot [bool]) {
+        $problems += 'the response has no draft flag'
+    } else {
+        $isLive = (-not $draft)
+        if (-not $after -and -not $draft) { $problems += 'the release is not a draft any more' }
+        if ($after -and $draft) { $problems += 'the release is still a draft' }
+    }
+
+    $actual = New-OrdinalOrderedMap   # id -> asset name
+    foreach ($asset in @(Get-JsonProperty $release 'assets')) {
+        if ($null -eq $asset) { continue }
+        $actual[[string](Get-JsonProperty $asset 'id')] = [string](Get-JsonProperty $asset 'name')
+    }
+    foreach ($id in $expected.Keys) { if (-not $actual.Contains($id)) { $problems += "$($expected[$id]) (id $id) is missing" } }
+    foreach ($id in $actual.Keys) { if (-not $expected.Contains($id)) { $problems += "$($actual[$id]) (id $id) was not verified" } }
+
+    if ($problems.Count -eq 0) {
+        Write-Host "Release $ReleaseId holds exactly the $($expected.Count) verified assets ($(if ($isLive) { 'published' } else { 'draft' }))."
+        return
+    }
+    $fix = if ($isLive) { $script:AssetSetFixes.Live } elseif ($after) { $script:AssetSetFixes.NotLive } else { $script:AssetSetFixes.Restart }
+    $state = if ($isLive) { 'The release is live: it' } else { 'The release' }
+    Write-BuildFailure -What "$state does not match what was verified ($when): $($problems -join '; ')." `
+        -Why 'Publishing, or having published, assets the verification never saw would make its result meaningless. Running it again will not help: the release changed after it was verified.' `
+        -Fix $fix
+}
+
 Export-ModuleMember -Variable ReleaseRepoSlug, ReleaseArchiveName, ReleaseDigestName, ReleaseManifestName, ReleaseUploaderLogin, ArchiveProblemKinds
 Export-ModuleMember -Function Get-VersionedArchiveName, Get-RequiredAssetNames, Get-LatestDownloadUrl,
     Get-FileSha256, Get-StreamSha256, Format-HashLine, ConvertFrom-HashLines,
     ConvertFrom-ReleaseTag, Get-TagRejection,
     New-ArchiveDigest, ConvertFrom-DigestText, New-ArchiveManifest, Compare-ArchiveManifest,
-    Read-OwnDownloads, Add-OwnDownload
+    Read-OwnDownloads, Add-OwnDownload, Assert-ReleaseAssetSet

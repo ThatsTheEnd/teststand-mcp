@@ -275,6 +275,17 @@ try {
         Assert-True ($step -cmatch "TESTSTAND_MCP_REQUIRE_PWSH:\s*'?1'?") 'the step must set TESTSTAND_MCP_REQUIRE_PWSH=1'
     }
 
+    Invoke-Case 'ci.yml: a hanging script is stopped after 600 s per host, and the job outlives two such hangs so the FAIL summary still prints' {
+        $step = $ciSteps[(Get-StepIndex $ciSteps 'Invoke-ScriptTests\.ps1' 'script tests')].Text
+        $perScript = [regex]::Match($step, 'Invoke-ScriptTests\.ps1 -TimeoutSeconds ([0-9]+)')
+        Assert-True $perScript.Success 'the script tests must pass -TimeoutSeconds'
+        Assert-Equal '600' $perScript.Groups[1].Value 'the per-script timeout'
+        $jobMinutes = [int][regex]::Match($ciJob, '(?m)^    timeout-minutes: ([0-9]+)\s*$').Groups[1].Value
+        $hangMinutes = 2 * [int]$perScript.Groups[1].Value / 60
+        $everythingElseMinutes = 30
+        Assert-True ($jobMinutes -ge ($hangMinutes + $everythingElseMinutes)) "the job allows $jobMinutes min, but two hangs ($hangMinutes min) plus the normal run ($everythingElseMinutes min) need more"
+    }
+
     Invoke-Case 'ci.yml: packaging uses version 0.0.0-ci into its own clean output folder and the artifact holds the four assets' {
         $pack = $ciSteps[(Get-StepIndex $ciSteps 'Build-PluginArchive\.ps1' 'packaging')].Text
         Assert-Contains $pack '-Version' 'the version argument'
@@ -294,17 +305,33 @@ try {
     }
 
     # ============================================================================================
-    #  release.yml
+    #  release.yml (two jobs: package builds with a read-only token, release publishes)
     # ============================================================================================
     $release = Read-WorkflowText 'release.yml'
     $releaseCode = Remove-CommentLines $release
+    $packageJob = Get-JobText $release 'package'
     $releaseJob = Get-JobText $release 'release'
+    $packageSteps = @(Get-Steps $packageJob)
     $releaseSteps = @(Get-Steps $releaseJob)
     $releaseEnv = Get-TopLevelBlock $releaseCode 'env'
+    $packageCode = Remove-CommentLines $packageJob
+    $releaseJobCode = Remove-CommentLines $releaseJob
 
     function Get-ReleaseStep {
         param([string]$Pattern, [string]$What)
         return $releaseSteps[(Get-StepIndex $releaseSteps $Pattern $What)]
+    }
+
+    function Get-PackageStep {
+        param([string]$Pattern, [string]$What)
+        return $packageSteps[(Get-StepIndex $packageSteps $Pattern $What)]
+    }
+
+    # The granted permissions of a job, as "name: level" strings.
+    function Get-GrantedPermissions {
+        param([string]$JobText)
+        $block = [regex]::Match($JobText, '(?m)^    permissions:\s*\n((?:      .+\n?)+)').Groups[1].Value
+        return @($block -split "`n" | Where-Object { $_.Trim().Length -gt 0 } | ForEach-Object { ($_ -creplace '#.*\z', '').Trim() })
     }
 
     Invoke-Case 'release.yml: a pushed tag of any name starts it (so a malformed tag is answered), and a manual run takes the dry-run inputs' {
@@ -320,56 +347,97 @@ try {
         Assert-True ($on -cmatch '(?s)      tag:.*?required: true') 'the rehearsal tag is required'
     }
 
-    Invoke-Case 'release.yml: releases are serialised per ref and a running release is never cancelled' {
+    Invoke-Case 'release.yml: every tag push waits in ONE queue, a dry run queues per ref, and a running release is never cancelled' {
         $concurrency = Get-TopLevelBlock $releaseCode 'concurrency'
-        Assert-True ($concurrency -cmatch 'group:\s*release-\$\{\{ github\.ref \}\}') 'the concurrency group must be release-<ref>'
+        Assert-True ($concurrency -cmatch "group:\s*release-\$\{\{ github\.event_name == 'push' && 'publish' \|\| github\.ref \}\}") 'the group must be release-publish for a push and release-<ref> otherwise'
         Assert-True ($concurrency -cmatch 'cancel-in-progress:\s*false') 'a release in progress must not be cancelled'
     }
 
-    Invoke-Case 'release.yml: nothing by default, and the one job holds contents: write and nothing else' {
+    Invoke-Case 'release.yml: nothing by default; only the release job may write, the package job only reads' {
         Assert-True ((Get-TopLevelBlock $releaseCode 'permissions') -cmatch '(?m)^permissions:\s*\{\}\s*$') 'top-level permissions must be {}'
-        $permissions = [regex]::Match($releaseJob, '(?m)^    permissions:\s*\n((?:      .+\n?)+)').Groups[1].Value
-        $granted = @($permissions -split "`n" | Where-Object { $_.Trim().Length -gt 0 } | ForEach-Object { ($_ -creplace '#.*\z', '').Trim() })
-        Assert-Equal 'contents: write' ($granted -join '|') 'the permissions of the release job'
+        Assert-Equal 'contents: write' ((Get-GrantedPermissions $releaseJob) -join '|') 'the permissions of the release job'
+        Assert-Equal 'contents: read' ((Get-GrantedPermissions $packageJob) -join '|') 'the permissions of the package job'
+        Assert-Equal 1 @([regex]::Matches($releaseCode, 'contents: write')).Count 'contents: write appears once, on the release job'
     }
 
-    Invoke-Case 'release.yml: runs on windows-latest, in the designed order, each step exactly once' {
-        Assert-True ($releaseJob -cmatch '(?m)^    runs-on: windows-latest\s*$') 'the job must run on windows-latest'
-        $order = @(
+    Invoke-Case 'release.yml: the two jobs are split by what they may do: build code only in package, the write token only in release' {
+        Assert-True ($releaseJob -cmatch '(?m)^    needs: package\s*$') 'release must need package, so a failed package creates nothing'
+        Assert-True ($packageJob -cnotmatch '(?m)^    needs:') 'package needs nothing'
+        foreach ($job in @($packageJob, $releaseJob)) { Assert-True ($job -cmatch '(?m)^    runs-on: windows-latest\s*$') 'both jobs run on windows-latest' }
+        foreach ($buildWord in @('dotnet', 'Build-PluginArchive', 'setup-dotnet', 'nuget', 'msbuild')) {
+            Assert-NotContains $releaseJobCode $buildWord 'the release job (it holds the write token and runs no build)'
+        }
+        foreach ($releaseWord in @('gh api', 'gh release', 'GH_TOKEN', 'github.token', 'secrets.', 'Assert-PublishedRelease', 'Assert-ReleaseAssetSet', 'contents: write')) {
+            Assert-NotContains $packageCode $releaseWord 'the package job (it runs build code and gets no token)'
+        }
+        Assert-Contains $packageCode 'Build-PluginArchive.ps1' 'the package job builds'
+        foreach ($output in @('tag', 'version', 'rehearsal')) {
+            Assert-True ($packageJob -cmatch "(?m)^      ${output}:\s*\`$\{\{ steps\.gate\.outputs\.${output} \}\}") "the package job passes the gate output $output on"
+        }
+        Assert-True ($releaseJob -cmatch '(?m)^      RELEASE_TAG:\s*\$\{\{ needs\.package\.outputs\.tag \}\}') 'the release job takes the tag the gate validated'
+    }
+
+    Invoke-Case 'release.yml: the assets travel as a short-lived artifact and the release job starts from a fresh checkout of the tagged commit' {
+        $upload = Get-PackageStep 'actions/upload-artifact@' 'upload release-assets'
+        Assert-True ($upload.Text -cmatch '(?m)^\s+name: release-assets\s*$') 'the artifact is called release-assets'
+        Assert-True ($upload.Text -cmatch 'if-no-files-found:\s*error') 'an empty upload must fail the package job'
+        Assert-True ($upload.Text -cmatch '(?m)^\s+retention-days:\s*[1-3]\s*$') 'a short retention'
+        Assert-Contains $upload.Text '/teststand-mcp*' 'the four assets, by their common prefix'
+        $download = Get-ReleaseStep 'actions/download-artifact@' 'download release-assets'
+        Assert-True ($download.Text -cmatch '(?m)^\s+name: release-assets\s*$') 'the release job downloads that artifact'
+        $checkout = Get-ReleaseStep 'actions/checkout@' 'release checkout'
+        Assert-True ($checkout.Text -cmatch 'ref:\s*\$\{\{ github\.sha \}\}') 'a fresh checkout at github.sha'
+        Assert-True ($checkout.Text -cmatch 'persist-credentials:\s*false') 'the checkout leaves no credential behind'
+        Assert-Before $releaseSteps 'actions/checkout@' 'actions/download-artifact@' 'checkout before download'
+    }
+
+    Invoke-Case 'release.yml: the package job runs in the designed order and the release job in its own, each step exactly once' {
+        $packageOrder = @(
             @{ Pattern = 'actions/checkout@'; What = 'checkout' }
             @{ Pattern = '::error::A release is cut by pushing a tag'; What = 'refuse a manual real release' }
             @{ Pattern = 'Assert-ReleaseTag\.ps1'; What = 'tag gate' }
             @{ Pattern = 'A dry run needs a rehearsal tag'; What = 'require a rehearsal tag' }
             @{ Pattern = 'actions/setup-dotnet@'; What = 'setup-dotnet' }
             @{ Pattern = 'Build-PluginArchive\.ps1'; What = 'packaging' }
+            @{ Pattern = 'actions/upload-artifact@'; What = 'upload the assets' }
+        )
+        for ($index = 1; $index -lt $packageOrder.Count; $index++) {
+            Assert-Before $packageSteps $packageOrder[$index - 1].Pattern $packageOrder[$index].Pattern "$($packageOrder[$index - 1].What) before $($packageOrder[$index].What)"
+        }
+        Assert-Equal ($packageSteps.Count - 1) (Get-StepIndex $packageSteps 'actions/upload-artifact@' 'upload') 'the upload is the last step of the package job'
+        $releaseOrder = @(
+            @{ Pattern = 'actions/checkout@'; What = 'checkout' }
+            @{ Pattern = 'actions/download-artifact@'; What = 'download the assets' }
             @{ Pattern = 'gh release create'; What = 'create the draft' }
             @{ Pattern = '--clobber'; What = 'inject the fault' }
             @{ Pattern = '(?m)^\s+id: verify\s*$'; What = 'verify the draft' }
+            @{ Pattern = '(?m)^\s+id: recheck\s*$'; What = 'recheck the assets before publishing' }
             @{ Pattern = '(?m)^\s+id: publish\s*$'; What = 'publish' }
+            @{ Pattern = '(?m)^\s+id: recheck_after\s*$'; What = 'recheck the assets after publishing' }
             @{ Pattern = '(?m)^\s+id: latest\s*$'; What = 'fetch releases/latest' }
             @{ Pattern = '-X DELETE'; What = 'clean up the rehearsal' }
             @{ Pattern = 'actions/upload-artifact@'; What = 'upload own-downloads' }
         )
-        for ($index = 1; $index -lt $order.Count; $index++) {
-            Assert-Before $releaseSteps $order[$index - 1].Pattern $order[$index].Pattern "$($order[$index - 1].What) before $($order[$index].What)"
+        for ($index = 1; $index -lt $releaseOrder.Count; $index++) {
+            Assert-Before $releaseSteps $releaseOrder[$index - 1].Pattern $releaseOrder[$index].Pattern "$($releaseOrder[$index - 1].What) before $($releaseOrder[$index].What)"
         }
-        Assert-Equal ($releaseSteps.Count - 1) (Get-StepIndex $releaseSteps 'actions/upload-artifact@' 'upload') 'the upload of own-downloads is the last step'
+        Assert-Equal ($releaseSteps.Count - 1) (Get-StepIndex $releaseSteps 'actions/upload-artifact@' 'upload') 'the upload of own-downloads is the last step of the release job'
     }
 
     Invoke-Case 'release.yml: the tag is user input and reaches the gate only through env, the dry run only through a manual run' {
         Assert-True ($releaseEnv -cmatch "TAG:\s*\$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.tag \|\| github\.ref_name \}\}") 'TAG must be the dispatch input or the pushed ref name'
         Assert-True ($releaseEnv -cmatch "DRY_RUN:\s*\$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.dry_run \}\}") 'DRY_RUN must be true only for a manual run that asked for it'
         Assert-True ($releaseEnv -cmatch "INJECT_FAULT:\s*\$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.inject_fault \|\| 'none' \}\}") 'INJECT_FAULT must be none for a push'
-        $gate = (Get-ReleaseStep 'Assert-ReleaseTag\.ps1' 'tag gate').Text
+        $gate = (Get-PackageStep 'Assert-ReleaseTag\.ps1' 'tag gate').Text
         Assert-Contains $gate '-Tag $env:TAG' 'the gate gets the tag from the environment'
         Assert-Contains $gate '$rehearsal = ($env:DRY_RUN -eq ''true'')' 'a rehearsal is whatever DRY_RUN says, never the shape of the tag'
         Assert-Contains $gate '-Rehearsal:$rehearsal' 'the gate is told about the rehearsal'
     }
 
     Invoke-Case 'release.yml: a manual run that is not a dry run is refused before anything else, and a dry run needs a rehearsal tag' {
-        $refuse = Get-ReleaseStep '::error::A release is cut by pushing a tag' 'refusal'
+        $refuse = Get-PackageStep '::error::A release is cut by pushing a tag' 'refusal'
         Assert-True ((Get-StepField $refuse 'if') -cmatch "env\.EVENT_NAME == 'workflow_dispatch' && env\.DRY_RUN != 'true'") 'the refusal applies to a manual run without dry_run'
-        $rehearsal = Get-ReleaseStep 'A dry run needs a rehearsal tag' 'rehearsal tag requirement'
+        $rehearsal = Get-PackageStep 'A dry run needs a rehearsal tag' 'rehearsal tag requirement'
         $condition = Get-StepField $rehearsal 'if'
         Assert-Contains $condition "env.DRY_RUN == 'true'" 'only for a dry run'
         Assert-Contains $condition "steps.gate.outputs.rehearsal != 'true'" 'fails when the gate did not see a rehearsal tag'
@@ -404,10 +472,30 @@ try {
         Assert-True ($releaseEnv -cnotmatch 'github\.token|secrets\.') 'no token in workflow-level env'
     }
 
-    Invoke-Case 'release.yml: publishing is by the verifier release id, only after a successful verify, and never in a dry run' {
+    Invoke-Case 'release.yml: the asset ids are checked again just before and just after the publish call, by the script and never in a dry run' {
+        $before = Get-ReleaseStep '(?m)^\s+id: recheck\s*$' 'recheck before'
+        $after = Get-ReleaseStep '(?m)^\s+id: recheck_after\s*$' 'recheck after'
+        foreach ($check in @(@{ Step = $before; Stage = 'BeforePublish' }, @{ Step = $after; Stage = 'AfterPublish' })) {
+            $text = $check.Step.Text
+            Assert-Contains $text 'Assert-ReleaseAssetSet.ps1' 'the comparison lives in a script, not in the YAML'
+            Assert-Contains $text "-Stage $($check.Stage)" 'the stage'
+            Assert-Contains $text 'gh api "repos/$env:REPO/releases/$env:RELEASE_ID"' 'the release is read by the id the verifier reported'
+            Assert-Contains $text '-ExpectedAssetIds $env:ASSET_IDS' 'the verified asset ids are the reference'
+            Assert-Contains $text '-ReleaseId $env:RELEASE_ID' 'the id the response must carry'
+            Assert-True ($text -cmatch 'ASSET_IDS:\s*\$\{\{ steps\.verify\.outputs\.asset_ids \}\}') 'the reference is the verifier output'
+            Assert-True ($text -cmatch 'RELEASE_ID:\s*\$\{\{ steps\.verify\.outputs\.release_id \}\}') 'the id is the verifier output'
+            Assert-Contains (Get-StepField $check.Step 'if') "env.DRY_RUN != 'true'" 'never in a dry run'
+        }
+        Assert-Contains (Get-StepField $before 'if') "steps.verify.outcome == 'success'" 'the first check follows a successful verify'
+        Assert-Contains (Get-StepField $after 'if') "steps.publish.outcome == 'success'" 'the second check follows the publish call'
+        Assert-True ($before.Text -cmatch '-notmatch ''\^\[0-9\]\+\$''') 'an unset release id stops the step before the API call'
+    }
+
+    Invoke-Case 'release.yml: publishing is by the verifier release id, only after a successful verify and recheck, and never in a dry run' {
         $publish = Get-ReleaseStep '(?m)^\s+id: publish\s*$' 'publish'
         $condition = Get-StepField $publish 'if'
         Assert-Contains $condition "steps.verify.outcome == 'success'" 'only after the verify step succeeded'
+        Assert-Contains $condition "steps.recheck.outcome == 'success'" 'only after the asset ids were checked again'
         Assert-Contains $condition "env.DRY_RUN != 'true'" 'never in a dry run'
         Assert-True ($publish.Text -cmatch 'RELEASE_ID:\s*\$\{\{ steps\.verify\.outputs\.release_id \}\}') 'the id is the verifier output'
         Assert-Contains $publish.Text '-X PATCH' 'the release is edited through the API'
@@ -422,6 +510,7 @@ try {
         $latest = Get-ReleaseStep '(?m)^\s+id: latest\s*$' 'latest'
         $condition = Get-StepField $latest 'if'
         Assert-Contains $condition "steps.publish.outcome == 'success'" 'only after the publish step succeeded'
+        Assert-Contains $condition "steps.recheck_after.outcome == 'success'" 'only when the live asset set is the verified one'
         Assert-Contains $condition "env.DRY_RUN != 'true'" 'never in a dry run'
         Assert-True ($latest.Text -cmatch 'ARCHIVE_SHA256:\s*\$\{\{ steps\.verify\.outputs\.archive_sha256 \}\}') 'the expected hash is the verifier output'
         Assert-Contains $latest.Text '-Latest' 'the public latest download'
@@ -444,10 +533,11 @@ try {
         $condition = Get-StepField $cleanup 'if'
         Assert-Contains $condition 'always()' 'cleanup runs after a failed verify too'
         Assert-Contains $condition "env.DRY_RUN == 'true'" 'dry runs only'
-        Assert-Contains $condition "steps.gate.outputs.rehearsal == 'true'" 'only for a tag the gate accepted as a rehearsal'
+        Assert-Contains $condition "needs.package.outputs.rehearsal == 'true'" 'only for a tag the gate accepted as a rehearsal'
         Assert-Contains $cleanup.Text 'releases/$id' 'a draft is deleted by its id'
         Assert-Contains $cleanup.Text '.draft == true' 'only drafts are deleted'
         Assert-Contains $cleanup.Text 'git/refs/tags/' 'the tag is deleted too'
+        Assert-Contains $cleanup.Text "-match 'HTTP 404'" 'only a 404 means the tag is absent; any other failed probe is a failure'
     }
 
     Invoke-Case 'release.yml: own-downloads is uploaded under the exact name the collector reads, even when the run failed' {
@@ -464,8 +554,8 @@ try {
     }
 
     Invoke-Case 'release.yml: every step that calls GitHub or a build script has its own timeout' {
-        foreach ($step in $releaseSteps) {
-            if ($step.Text -cmatch 'gh (api|release)|Assert-PublishedRelease|Build-PluginArchive|Assert-ReleaseTag') {
+        foreach ($step in @($packageSteps) + @($releaseSteps)) {
+            if ($step.Text -cmatch 'gh (api|release)|Assert-PublishedRelease|Assert-ReleaseAssetSet|Build-PluginArchive|Assert-ReleaseTag') {
                 Assert-True ($null -ne (Get-StepField $step 'timeout-minutes')) "step '$($step.Name)' has no timeout-minutes"
             }
         }
@@ -484,6 +574,20 @@ try {
                 Assert-Equal 0 $errors.Count "parse errors in a run: block of ${file}: $(@($errors | ForEach-Object { $_.Message }) -join '; ')`n$block"
             }
         }
+
+        # The runner ends a PowerShell step with `exit $LASTEXITCODE` of the LAST native command. A block that lets a
+        # native command fail on purpose (a probe that may answer 404) would therefore turn a good run red, unless
+        # it ends with an explicit exit of its own.
+        Invoke-Case "$file : a run: block that tolerates a failing native command ends with an explicit exit 0 or exit 1" {
+            $tolerant = 0
+            foreach ($block in @(Get-RunValues (Read-WorkflowText $file))) {
+                if ($block -cnotmatch "ErrorActionPreference = 'Continue'|\`$LASTEXITCODE -eq 0") { continue }
+                $tolerant++
+                $last = @($block -split "`n" | Where-Object { $_.Trim().Length -gt 0 -and $_.Trim() -cnotmatch '\A#' })[-1].Trim()
+                Assert-True ($last -cmatch '\Aexit [01]\z') "a block that tolerates a native failure must end with 'exit 0' or 'exit 1', but ends with: $last"
+            }
+            if ($file -ceq 'release.yml') { Assert-True ($tolerant -ge 1) 'the rehearsal cleanup is the tolerant block this rule exists for, and it was not found' }
+        }
     }
 
     Invoke-Case 'release.yml and ci.yml: nothing is bound to one repository, so the fork rehearsal runs the same files' {
@@ -492,6 +596,13 @@ try {
             Assert-NotContains $code 'teststand-mcp/' 'a workflow'
         }
         Assert-True ($releaseEnv -cmatch 'REPO:\s*\$\{\{ github\.repository \}\}') 'the repository is github.repository'
+    }
+
+    Invoke-Case 'release.yml: the header says what the verification does not prove and why the build is a separate job' {
+        Assert-Contains $release 'does NOT prove' 'the provenance limit is stated'
+        Assert-Contains $release 'genuine' 'the provenance limit names the build'
+        Assert-Contains $release 'attestation' 'the follow-up is named'
+        Assert-Contains $release 'release` is skipped' 'a failed package job creates nothing'
     }
 }
 finally {

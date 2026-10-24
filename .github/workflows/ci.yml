@@ -40,7 +40,11 @@ defaults:
 jobs:
   check:
     runs-on: windows-latest
-    timeout-minutes: 45
+    # Arithmetic: the whole job takes about 30 minutes (setup, unit tests, the script tests under two
+    # hosts, packaging). One script that hangs is stopped after 600 s per host, 2 x 10 = 20 minutes
+    # more, and only then does Invoke-ScriptTests print its FAIL summary. 30 + 20 = 50, plus a margin:
+    # the job must outlive that, or the summary would be lost to a bare cancellation.
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -68,7 +72,7 @@ jobs:
         env:
           TESTSTAND_MCP_REQUIRE_PWSH: '1' # a missing pwsh must fail here, not skip
         run: |
-          & .\build\Invoke-ScriptTests.ps1
+          & .\build\Invoke-ScriptTests.ps1 -TimeoutSeconds 600
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run the stats tests

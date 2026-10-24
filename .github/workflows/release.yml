@@ -1,18 +1,38 @@
 # The release workflow: a pushed tag becomes a published release, but only after the DRAFT of that
 # release has been downloaded back and verified the way a user would download it.
 #
-#   tag gate -> package -> create a DRAFT with the four assets -> verify the draft through the API
-#   -> publish by the release id the verifier returned -> fetch releases/latest like a user and
-#   compare it with the verified archive.
+#   job `package` (read-only token):  tag gate -> build and package -> keep the four assets as an artifact
+#   job `release` (write token):      create a DRAFT with them -> verify the draft through the API -> check
+#                                     that the draft still holds the verified asset ids -> publish by the
+#                                     release id the verifier returned -> check the live asset ids again
+#                                     -> fetch releases/latest like a user and compare it with the
+#                                     verified archive.
+#
+# Why two jobs: everything that RUNS BUILD CODE (dotnet restore and publish execute NuGet packages and
+# MSBuild targets) has only a read-only token. The job that holds `contents: write` runs no dotnet and
+# no build: it only checks out the repository at the tagged commit (for the verifier scripts), takes the
+# four files from the artifact and talks to the releases API. If `package` fails, `release` is skipped
+# and creates nothing, not even a draft.
 #
 # Load-bearing choices (do not "simplify" them away):
 #   * `tags: ['**']`: a tag of any name starts the run, so a malformed tag (V1.9.0, v1.9, v1.9.0-rc)
 #     fails at the tag gate with the retag commands instead of being silently ignored by a filter.
 #   * A DRAFT first: a failed verification leaves a draft, so releases/latest never moves.
 #   * Publishing is by the verifier's release id, never by tag name: a stale draft with the same tag
-#     can then never be the one that goes live (the verifier refuses two releases for one tag).
+#     can then never be the one that goes live (the verifier refuses two releases for one tag). The
+#     asset ids are compared again just before and just after the publish call, so an asset that was
+#     added, replaced or removed after the verification stops the release instead of going live.
 #   * The fixed asset name teststand-mcp.zip is what users fetch from releases/latest/download/.
 #   * Tag names, inputs and refs are user input: they reach `run:` only through env, never inline.
+#   * Tag pushes share ONE queue (`release-publish`), so two tags can never publish at the same time
+#     and `releases/latest` ends up at the tag that was pushed last. GitHub keeps one RUNNING and one
+#     PENDING run per queue: a third tag pushed while two are waiting replaces the pending one, so
+#     push release tags one at a time.
+#
+# What the verification does NOT prove: that the build is genuine. It proves that the uploaded files
+# are intact (digest, manifest, versioned copy) and were uploaded with this repository's workflow
+# token. A compromised build step would produce a consistent, verified, malicious release. Build
+# provenance attestation is a follow-up and is deliberately not part of this workflow yet.
 #
 # A manual run is a DRY RUN: it packages, creates a draft under the rehearsal tag
 # v<X.Y.Z>-rehearsal, verifies it through the API, then deletes the draft and its tag. It never
@@ -44,12 +64,12 @@ on:
           - corrupt-zip
         default: none
 
-# Nothing by default; the one job states what it needs.
+# Nothing by default; every job states what it needs.
 permissions: {}
 
-# Releases are serialised per ref and a release that is running is never cancelled half-way.
+# All tag pushes wait in one queue; a running release is never cancelled half-way. A dry run queues per ref.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'push' && 'publish' || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -71,11 +91,15 @@ defaults:
     shell: powershell   # Windows PowerShell 5.1, the host the maintainers package with
 
 jobs:
-  release:
+  package:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     permissions:
-      contents: write   # create, edit and delete releases, upload their assets, delete the rehearsal tag
+      contents: read
+    outputs:
+      tag: ${{ steps.gate.outputs.tag }}
+      version: ${{ steps.gate.outputs.version }}
+      rehearsal: ${{ steps.gate.outputs.rehearsal }}
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -116,16 +140,47 @@ jobs:
           & .\build\Build-PluginArchive.ps1 -Version $env:RELEASE_VERSION -Tag $env:RELEASE_TAG -OutDir $env:OUT_DIR
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # The files are already compressed archives: store them as they are.
+      - name: Keep the four assets for the release job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: ${{ env.OUT_DIR }}/teststand-mcp*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  release:
+    needs: package
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write   # create, edit and delete releases, upload their assets, delete the rehearsal tag
+    env:
+      RELEASE_TAG: ${{ needs.package.outputs.tag }}
+    steps:
+      # The repository at the tagged commit: only the verifier and gate scripts are used from it.
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download the four assets built by the package job
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: ${{ env.OUT_DIR }}
+
       - name: Create the draft release with the four assets
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.gate.outputs.tag }}
           TARGET_SHA: ${{ github.sha }}
         timeout-minutes: 15
         run: |
           $assets = @(Get-ChildItem -LiteralPath $env:OUT_DIR -File | ForEach-Object { $_.FullName })
           if ($assets.Count -ne 4) {
-            Write-Host "::error::The packaging step left $($assets.Count) asset(s) in $env:OUT_DIR; a release has exactly four."
+            Write-Host "::error::The package job left $($assets.Count) asset(s) in $env:OUT_DIR; a release has exactly four."
             exit 1
           }
           $notes = 'Built and verified by the release workflow. Install it through the Claude Code plugin marketplace.'
@@ -141,7 +196,6 @@ jobs:
         if: env.DRY_RUN == 'true' && env.INJECT_FAULT == 'corrupt-zip'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.gate.outputs.tag }}
         timeout-minutes: 10
         run: |
           Import-Module .\build\ReleaseAssets.psm1 -Force
@@ -156,16 +210,33 @@ jobs:
         id: verify
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.gate.outputs.tag }}
         timeout-minutes: 30
         run: |
           $rehearsal = ($env:DRY_RUN -eq 'true')
           & .\build\Assert-PublishedRelease.ps1 -Repo $env:REPO -Tag $env:RELEASE_TAG -Token $env:GH_TOKEN -OwnDownloadsPath $env:OWN_DOWNLOADS_FILE -Rehearsal:$rehearsal
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Check that the draft still holds exactly the verified assets
+        id: recheck
+        if: env.DRY_RUN != 'true' && steps.verify.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.verify.outputs.release_id }}
+          ASSET_IDS: ${{ steps.verify.outputs.asset_ids }}
+        timeout-minutes: 5
+        run: |
+          if ($env:RELEASE_ID -notmatch '^[0-9]+$') {
+            Write-Host '::error::The verification did not report the id of the release it verified, so there is nothing safe to publish.'
+            exit 1
+          }
+          $body = (gh api "repos/$env:REPO/releases/$env:RELEASE_ID") -join "`n"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\build\Assert-ReleaseAssetSet.ps1 -ReleaseJson $body -ExpectedAssetIds $env:ASSET_IDS -ReleaseId $env:RELEASE_ID -Stage BeforePublish
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Publish the verified release as the latest release
         id: publish
-        if: env.DRY_RUN != 'true' && steps.verify.outcome == 'success'
+        if: env.DRY_RUN != 'true' && steps.verify.outcome == 'success' && steps.recheck.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_ID: ${{ steps.verify.outputs.release_id }}
@@ -182,9 +253,23 @@ jobs:
             exit 1
           }
 
+      - name: Check that the published release holds exactly the verified assets
+        id: recheck_after
+        if: env.DRY_RUN != 'true' && steps.publish.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.verify.outputs.release_id }}
+          ASSET_IDS: ${{ steps.verify.outputs.asset_ids }}
+        timeout-minutes: 5
+        run: |
+          $body = (gh api "repos/$env:REPO/releases/$env:RELEASE_ID") -join "`n"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\build\Assert-ReleaseAssetSet.ps1 -ReleaseJson $body -ExpectedAssetIds $env:ASSET_IDS -ReleaseId $env:RELEASE_ID -Stage AfterPublish
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Fetch releases/latest as users do and compare it with the verified archive
         id: latest
-        if: env.DRY_RUN != 'true' && steps.publish.outcome == 'success'
+        if: env.DRY_RUN != 'true' && steps.publish.outcome == 'success' && steps.recheck_after.outcome == 'success'
         env:
           ARCHIVE_SHA256: ${{ steps.verify.outputs.archive_sha256 }}
         timeout-minutes: 15
@@ -193,13 +278,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Delete the rehearsal draft and its tag (dry run only)
-        if: always() && env.DRY_RUN == 'true' && steps.gate.outputs.rehearsal == 'true'
+        if: always() && env.DRY_RUN == 'true' && needs.package.outputs.rehearsal == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.gate.outputs.tag }}
         timeout-minutes: 5
         run: |
-          # Best effort: every call is checked below, and a failed run must still reach the end.
+          # Best effort: every call is checked below, and a failed run must still reach the end. A native
+          # command that is ALLOWED to fail (the tag probe) must not be the last writer of $LASTEXITCODE,
+          # because the runner ends the step with it: the block ends with an explicit exit.
           $ErrorActionPreference = 'Continue'
           $failed = $false
           # Only DRAFTS carrying the rehearsal tag; a published release is never touched.
@@ -211,14 +297,20 @@ jobs:
             if ($LASTEXITCODE -ne 0) { Write-Host "::error::Could not delete the rehearsal draft $id."; $failed = $true } else { Write-Host "Deleted the rehearsal draft $id." }
           }
           # A draft has no git tag yet; a tag only exists when something created it, and then it must go too.
-          gh api "repos/$env:REPO/git/ref/tags/$env:RELEASE_TAG" --silent
-          if ($LASTEXITCODE -eq 0) {
+          # Only a 404 means "absent"; any other failure is a failure.
+          $probe = (gh api "repos/$env:REPO/git/ref/tags/$env:RELEASE_TAG" 2>&1 | Out-String)
+          $probeExit = $LASTEXITCODE
+          if ($probeExit -eq 0) {
             gh api -X DELETE "repos/$env:REPO/git/refs/tags/$env:RELEASE_TAG"
             if ($LASTEXITCODE -ne 0) { Write-Host "::error::Could not delete the rehearsal tag $env:RELEASE_TAG."; $failed = $true } else { Write-Host "Deleted the rehearsal tag $env:RELEASE_TAG." }
-          } else {
+          } elseif ($probe -match 'HTTP 404') {
             Write-Host "No tag $env:RELEASE_TAG exists, so none is deleted."
+          } else {
+            Write-Host "::error::Could not check whether the rehearsal tag $env:RELEASE_TAG exists: $probe"
+            $failed = $true
           }
           if ($failed) { exit 1 }
+          exit 0
 
       # The stats collector reads this artifact (name, file name and schema are its contract). It is
       # uploaded even when the run failed: the downloads that happened still count.

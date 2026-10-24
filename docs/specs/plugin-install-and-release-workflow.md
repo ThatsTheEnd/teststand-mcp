@@ -189,6 +189,14 @@ bin/CLAUDE.md                   the user rules of the skill, generated; no READM
   first one is fixed forward. A manual `dry_run` of the workflow rehearses the whole draft path and
   then deletes the draft.
 
+  **What the verification does not prove.** It proves that the uploaded files are intact (digest,
+  manifest, versioned copy) and were uploaded with this repository's workflow token. It does not
+  prove that the build is genuine: a compromised build step would produce a consistent release that
+  verifies. Build provenance attestation is a follow-up and is not part of this feature. To keep
+  build code away from the write token, the workflow builds in a job with a read-only token and
+  publishes from a second job that runs no build code. That job also compares the asset ids of the
+  release with the verified ones immediately before and immediately after the publish call.
+
 ### PR build check
 
 - **AC-9** A pull request to `main` runs all of the following. It publishes nothing.
@@ -427,6 +435,7 @@ bin/CLAUDE.md                   the user rules of the skill, generated; no READM
 | CRUD sweep: release (create = tag push; read = install/verify; update = asset replacement → rejected by AC-8 at publish only; delete = out of scope) | `inferable` | inference | Replacement after publish goes undetected, because the daily verify was declined. The human accepted this when declining. |
 | CRUD sweep: plugin install (create AC-10, read AC-10, update AC-11–13, delete = `claude plugin uninstall`, a Claude Code built-in, no criterion needed) | `inferable` | inference | Uninstall is not this repo's behaviour. |
 | Auth sweep | `inferable` | inference | Workflows use `GITHUB_TOKEN` with least privilege (`contents: write` only in release, `pages`/`id-token` only in deploy). The stats token is optional and read-only. Users need no credentials, because the repo is public. |
+| Build provenance (slice 7 review, 2026-10-24) | `requires-stakeholder-input` | human | The read-back (AC-8) proves integrity and the uploader, not that the build is genuine. Build provenance attestation is a follow-up and is deliberately not added now. The workflow limits the exposure instead: the build job has a read-only token, the job with `contents: write` runs no build, and the asset ids are re-checked around the publish call. |
 | Error-handling sweep | `inferable` | inference | Every workflow step fails loudly with a diagnosis (AC-1 to AC-8). The hooks fail silent and non-blocking (AC-13 to AC-15). |
 | LOW_VALUE: unit tests for `hooks.json` wiring | `inferable` | inference | Skipped. No branching logic, and the install smoke check (AC-10) covers it. |
 | Build AC gate (2026-10-24) | `inferable` | spec-compliance-review + human | 12 criteria were tightened for verifiability, with no design change. The changes: AC-2's budget source, flow 3's definition and layout order; AC-4's exact `bin/scripts` set; AC-5's case-insensitive match; AC-6's outside-observable form; AC-8's retry trigger; AC-9's script set; AC-10's version and profile; AC-12's two-session bound; AC-13's timeouts; AC-15's detection rule and command; AC-16's structure and deny-list; AC-17's unverified outcome; AC-18's draft rule. The user chose "apply and build". |
