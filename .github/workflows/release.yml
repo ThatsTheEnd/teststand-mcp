@@ -1,0 +1,231 @@
+# The release workflow: a pushed tag becomes a published release, but only after the DRAFT of that
+# release has been downloaded back and verified the way a user would download it.
+#
+#   tag gate -> package -> create a DRAFT with the four assets -> verify the draft through the API
+#   -> publish by the release id the verifier returned -> fetch releases/latest like a user and
+#   compare it with the verified archive.
+#
+# Load-bearing choices (do not "simplify" them away):
+#   * `tags: ['**']`: a tag of any name starts the run, so a malformed tag (V1.9.0, v1.9, v1.9.0-rc)
+#     fails at the tag gate with the retag commands instead of being silently ignored by a filter.
+#   * A DRAFT first: a failed verification leaves a draft, so releases/latest never moves.
+#   * Publishing is by the verifier's release id, never by tag name: a stale draft with the same tag
+#     can then never be the one that goes live (the verifier refuses two releases for one tag).
+#   * The fixed asset name teststand-mcp.zip is what users fetch from releases/latest/download/.
+#   * Tag names, inputs and refs are user input: they reach `run:` only through env, never inline.
+#
+# A manual run is a DRY RUN: it packages, creates a draft under the rehearsal tag
+# v<X.Y.Z>-rehearsal, verifies it through the API, then deletes the draft and its tag. It never
+# publishes. `inject_fault: corrupt-zip` replaces the uploaded zip with corrupt bytes: the run must
+# fail at the verification, publish nothing, and still clean up. This is also how the fork
+# rehearsal exercises the whole path before the first real tag.
+name: release
+
+on:
+  push:
+    tags: ['**']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Rehearsal tag, v<X.Y.Z>-rehearsal (the draft is created under it and deleted again)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run: package, create the draft, verify it, delete it. A release is cut by pushing a tag, so this must stay ticked.'
+        required: true
+        type: boolean
+        default: true
+      inject_fault:
+        description: 'Fault to inject after the upload, to prove that a bad draft is never published'
+        required: true
+        type: choice
+        options:
+          - none
+          - corrupt-zip
+        default: none
+
+# Nothing by default; the one job states what it needs.
+permissions: {}
+
+# Releases are serialised per ref and a release that is running is never cancelled half-way.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REPO: ${{ github.repository }}
+  EVENT_NAME: ${{ github.event_name }}
+  # 'true' only for a manual run that asked for it. A pushed tag is never a rehearsal, whatever its name.
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+  INJECT_FAULT: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_fault || 'none' }}
+  # User input: the pushed ref name, or the rehearsal tag of a manual run. Only the gate trusts it.
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  OUT_DIR: artifacts/release
+  # Outside OUT_DIR, so it is never uploaded as a release asset.
+  OWN_DOWNLOADS_FILE: artifacts/own-downloads.json
+
+defaults:
+  run:
+    shell: powershell   # Windows PowerShell 5.1, the host the maintainers package with
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write   # create, edit and delete releases, upload their assets, delete the rehearsal tag
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Refuse a manual run that is not a dry run
+        if: env.EVENT_NAME == 'workflow_dispatch' && env.DRY_RUN != 'true'
+        run: |
+          Write-Host '::error::A release is cut by pushing a tag vX.Y.Z. A manual run is only a dry run: tick dry_run.'
+          exit 1
+
+      - name: Check the tag (the gate)
+        id: gate
+        timeout-minutes: 5
+        run: |
+          $rehearsal = ($env:DRY_RUN -eq 'true')
+          & .\build\Assert-ReleaseTag.ps1 -Tag $env:TAG -Rehearsal:$rehearsal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Require a rehearsal tag for a dry run
+        if: env.DRY_RUN == 'true' && steps.gate.outputs.rehearsal != 'true'
+        run: |
+          Write-Host '::error::A dry run needs a rehearsal tag v<X.Y.Z>-rehearsal, so that its draft and tag can never collide with a real release.'
+          exit 1
+
+      - name: Install .NET 8
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Package the plugin archive
+        env:
+          RELEASE_VERSION: ${{ steps.gate.outputs.version }}
+          RELEASE_TAG: ${{ steps.gate.outputs.tag }}
+        timeout-minutes: 30
+        run: |
+          & .\build\Build-PluginArchive.ps1 -Version $env:RELEASE_VERSION -Tag $env:RELEASE_TAG -OutDir $env:OUT_DIR
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Create the draft release with the four assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.gate.outputs.tag }}
+          TARGET_SHA: ${{ github.sha }}
+        timeout-minutes: 15
+        run: |
+          $assets = @(Get-ChildItem -LiteralPath $env:OUT_DIR -File | ForEach-Object { $_.FullName })
+          if ($assets.Count -ne 4) {
+            Write-Host "::error::The packaging step left $($assets.Count) asset(s) in $env:OUT_DIR; a release has exactly four."
+            exit 1
+          }
+          $notes = 'Built and verified by the release workflow. Install it through the Claude Code plugin marketplace.'
+          if ($env:DRY_RUN -eq 'true') {
+            # The rehearsal tag does not exist: the draft names it and points at this commit.
+            gh release create $env:RELEASE_TAG @assets --repo $env:REPO --draft --title $env:RELEASE_TAG --notes $notes --target $env:TARGET_SHA
+          } else {
+            gh release create $env:RELEASE_TAG @assets --repo $env:REPO --draft --verify-tag --title $env:RELEASE_TAG --notes $notes
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Corrupt the uploaded zip (dry run only, to prove a bad draft is never published)
+        if: env.DRY_RUN == 'true' && env.INJECT_FAULT == 'corrupt-zip'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.gate.outputs.tag }}
+        timeout-minutes: 10
+        run: |
+          Import-Module .\build\ReleaseAssets.psm1 -Force
+          $folder = Join-Path $env:RUNNER_TEMP 'corrupt-zip'
+          [void](New-Item -ItemType Directory -Path $folder -Force)
+          $corrupt = Join-Path $folder $ReleaseArchiveName
+          [IO.File]::WriteAllBytes($corrupt, [byte[]](80, 75, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 255, 254, 253))
+          gh release upload $env:RELEASE_TAG $corrupt --clobber --repo $env:REPO
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify the draft the way a user would download it
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.gate.outputs.tag }}
+        timeout-minutes: 30
+        run: |
+          $rehearsal = ($env:DRY_RUN -eq 'true')
+          & .\build\Assert-PublishedRelease.ps1 -Repo $env:REPO -Tag $env:RELEASE_TAG -Token $env:GH_TOKEN -OwnDownloadsPath $env:OWN_DOWNLOADS_FILE -Rehearsal:$rehearsal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish the verified release as the latest release
+        id: publish
+        if: env.DRY_RUN != 'true' && steps.verify.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.verify.outputs.release_id }}
+        timeout-minutes: 5
+        run: |
+          if ($env:RELEASE_ID -notmatch '^[0-9]+$') {
+            Write-Host '::error::The verification did not report the id of the release it verified, so there is nothing safe to publish.'
+            exit 1
+          }
+          $isDraft = gh api -X PATCH "repos/$env:REPO/releases/$env:RELEASE_ID" -F draft=false -f make_latest=true --jq '.draft'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($isDraft -ne 'false') {
+            Write-Host "::error::Release $env:RELEASE_ID is still a draft after the publish call."
+            exit 1
+          }
+
+      - name: Fetch releases/latest as users do and compare it with the verified archive
+        id: latest
+        if: env.DRY_RUN != 'true' && steps.publish.outcome == 'success'
+        env:
+          ARCHIVE_SHA256: ${{ steps.verify.outputs.archive_sha256 }}
+        timeout-minutes: 15
+        run: |
+          & .\build\Assert-PublishedRelease.ps1 -Latest -Repo $env:REPO -ExpectedArchiveSha256 $env:ARCHIVE_SHA256 -OwnDownloadsPath $env:OWN_DOWNLOADS_FILE
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Delete the rehearsal draft and its tag (dry run only)
+        if: always() && env.DRY_RUN == 'true' && steps.gate.outputs.rehearsal == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.gate.outputs.tag }}
+        timeout-minutes: 5
+        run: |
+          # Best effort: every call is checked below, and a failed run must still reach the end.
+          $ErrorActionPreference = 'Continue'
+          $failed = $false
+          # Only DRAFTS carrying the rehearsal tag; a published release is never touched.
+          $ids = @(gh api --paginate "repos/$env:REPO/releases?per_page=100" --jq '.[] | select(.draft == true and .tag_name == $ENV.RELEASE_TAG) | .id')
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::Could not list the releases to find the rehearsal draft.'; exit 1 }
+          foreach ($id in $ids) {
+            if ($id -notmatch '^[0-9]+$') { continue }
+            gh api -X DELETE "repos/$env:REPO/releases/$id"
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::Could not delete the rehearsal draft $id."; $failed = $true } else { Write-Host "Deleted the rehearsal draft $id." }
+          }
+          # A draft has no git tag yet; a tag only exists when something created it, and then it must go too.
+          gh api "repos/$env:REPO/git/ref/tags/$env:RELEASE_TAG" --silent
+          if ($LASTEXITCODE -eq 0) {
+            gh api -X DELETE "repos/$env:REPO/git/refs/tags/$env:RELEASE_TAG"
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::Could not delete the rehearsal tag $env:RELEASE_TAG."; $failed = $true } else { Write-Host "Deleted the rehearsal tag $env:RELEASE_TAG." }
+          } else {
+            Write-Host "No tag $env:RELEASE_TAG exists, so none is deleted."
+          }
+          if ($failed) { exit 1 }
+
+      # The stats collector reads this artifact (name, file name and schema are its contract). It is
+      # uploaded even when the run failed: the downloads that happened still count.
+      - name: Report this run's own downloads to the stats collector
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: own-downloads
+          path: ${{ env.OWN_DOWNLOADS_FILE }}
+          if-no-files-found: warn
