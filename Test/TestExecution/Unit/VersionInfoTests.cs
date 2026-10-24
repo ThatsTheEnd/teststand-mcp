@@ -166,6 +166,39 @@ public class VersionInfoTests
         Assert.That(info.Note, Does.Contain("unreadable"));
     }
 
+    // ── --version text ────────────────────────────────────────────────────────
+
+    [Test]
+    public void FormatForCli_TaggedBuild_ListsVersionTagAndCommitButNotDev()
+    {
+        var path = WriteVersionTxt("tag: v1.9.0\n");
+
+        var text = VersionInfo.Resolve("1.9.0+abc123", path).FormatForCli();
+
+        Assert.That(text, Does.Contain("1.9.0"));
+        Assert.That(text, Does.Contain("v1.9.0"));
+        Assert.That(text, Does.Contain("abc123"));
+        Assert.That(text, Does.Not.Contain("-dev"));
+    }
+
+    [Test]
+    public void FormatForCli_UntaggedBuild_ReportsTheDevVersion()
+    {
+        var text = VersionInfo.Resolve(informationalVersion: null, versionTxtPath: null).FormatForCli();
+
+        Assert.That(text, Does.Contain("0.0.0-dev"));
+    }
+
+    [Test]
+    public void FormatForCli_TaggedBuildWithoutVersionTxt_StatesTheMetadataIsAbsent()
+    {
+        var text = VersionInfo.Resolve("1.9.0+abc123", Path.Combine(_tempDir, "VERSION.txt")).FormatForCli();
+
+        Assert.That(text, Does.Contain("1.9.0"));
+        Assert.That(text, Does.Contain("abc123"));
+        Assert.That(text, Does.Contain("absent"));
+    }
+
     [Test]
     public void UntaggedBuild_WithoutVersionTxt_HasNoNote()
     {

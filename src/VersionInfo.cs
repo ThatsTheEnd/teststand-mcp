@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using System.Reflection;
 
 namespace TestStandMCP;
@@ -26,6 +27,9 @@ public sealed record VersionInfo(
     string? Run,
     string? Note)
 {
+    /// <summary>Product name shown in front of the version by <c>--version</c>.</summary>
+    public const string ProductName = "TestStand MCP Server";
+
     /// <summary>The version of a build nobody stamped (the csproj default).</summary>
     public const string UntaggedVersion = "0.0.0-dev";
 
@@ -58,6 +62,25 @@ public sealed record VersionInfo(
         // An untagged local build has no release metadata by design, so its absence is not worth a note.
         var note = version == UntaggedVersion ? null : metadata.Note;
         return new VersionInfo(version, commit, metadata.Tag, metadata.Built, metadata.Run, note);
+    }
+
+    /// <summary>The multi-line text <c>--version</c> prints; a field that is not known is left out.</summary>
+    public string FormatForCli()
+    {
+        var text = new StringBuilder();
+        text.AppendLine($"{ProductName} {Version}");
+        AppendField(text, "tag", Tag);
+        AppendField(text, "commit", Commit);
+        AppendField(text, "built", Built);
+        AppendField(text, "run", Run);
+        AppendField(text, "note", Note);
+        return text.ToString();
+    }
+
+    private static void AppendField(StringBuilder text, string label, string? value)
+    {
+        if (!string.IsNullOrEmpty(value))
+            text.AppendLine($"  {label + ":",-8}{value}");
     }
 
     private static string DefaultVersionTxtPath() =>

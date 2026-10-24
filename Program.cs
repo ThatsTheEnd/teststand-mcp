@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.DependencyInjection;
@@ -36,6 +37,10 @@ internal class Program
     private const int  STD_ERROR_HANDLE = -12;
     private const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
 
+    private const string VersionFlag   = "--version";
+    private const string ListToolsFlag = "--list-tools";
+    private const string JsonFlag      = "--json";
+
     static async Task<int> Main(string[] args)
     {
         // Out-of-process prototype-load worker (spawned by the server itself). Handle it FIRST —
@@ -45,6 +50,13 @@ internal class Program
         // LoadPrototypeWorker for the rationale (isolating the 0xC06D007E .lvlibp delay-load crash).
         if (args.Length > 0 && args[0] == "--load-prototype-worker")
             return await LoadPrototypeWorker.RunAsync(args);
+
+        // Informational flags are answered HERE — before AllocConsole, the banner, configuration and
+        // DI — so they work on a machine without TestStand (CI, the packaging smoke test), write to
+        // STDOUT where a caller can capture them, and never start an engine.
+        var earlyExitCode = TryRunInformationalCommand(args);
+        if (earlyExitCode.HasValue)
+            return earlyExitCode.Value;
 
         // When launched as an MCP subprocess stdin is redirected — allocate a visible
         // console window so Console.Error output (banner + command panel) is visible.
@@ -144,24 +156,6 @@ internal class Program
         logger.LogInformation("Platform: {OS}", Environment.OSVersion);
         logger.LogInformation("Runtime: {Runtime}", RuntimeInformation.FrameworkDescription);
 
-        // Handle --version flag
-        if (args.Contains("--version"))
-        {
-            Console.WriteLine("TestStand MCP Server 1.0.0");
-            return 0;
-        }
-
-        // Handle --list-tools flag (useful for debugging)
-        if (args.Contains("--list-tools"))
-        {
-            var registry = sp.GetRequiredService<TestStandToolRegistry>();
-            Console.Error.WriteLine("\nAvailable Tools:");
-            foreach (var tool in registry.GetTools())
-                Console.Error.WriteLine($"  {tool.Name,-35} {tool.Description}");
-            Console.Error.WriteLine();
-            return 0;
-        }
-
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) =>
         {
@@ -205,6 +199,56 @@ internal class Program
         Console.Error.Flush();
         TerminateProcess(GetCurrentProcess(), (uint)exitCode);
         return exitCode; // not reached
+    }
+
+    /// <summary>
+    /// Handles <c>--version</c> and <c>--list-tools [--json]</c>. Returns the exit code when a flag was
+    /// handled, or null when the process should carry on and serve MCP.
+    /// </summary>
+    private static int? TryRunInformationalCommand(string[] args)
+    {
+        if (args.Contains(VersionFlag))
+        {
+            Console.Out.Write(VersionInfo.Current.FormatForCli());
+            return 0;
+        }
+
+        if (args.Contains(ListToolsFlag))
+        {
+            WriteToolList(CreateToolRegistryWithoutEngine(), asJson: args.Contains(JsonFlag));
+            return 0;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// A registry built from the bare minimum: logging plus the two services whose constructors only
+    /// store a logger. No configuration, no engine connection, no COM — so listing the tools needs no
+    /// TestStand installation.
+    /// </summary>
+    private static TestStandToolRegistry CreateToolRegistryWithoutEngine()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<ITestStandService, TestStandService>();
+        services.AddSingleton<ISequenceEditorService, SequenceEditorService>();
+        services.AddSingleton<TestStandToolRegistry>();
+        return services.BuildServiceProvider().GetRequiredService<TestStandToolRegistry>();
+    }
+
+    private static void WriteToolList(TestStandToolRegistry registry, bool asJson)
+    {
+        if (asJson)
+        {
+            Console.Out.WriteLine(JsonSerializer.Serialize(registry.GetTools().Select(tool => tool.Name)));
+            return;
+        }
+
+        Console.Out.WriteLine("Available Tools:");
+        foreach (var tool in registry.GetTools())
+            Console.Out.WriteLine($"  {tool.Name,-35} {tool.Description}");
+        Console.Out.WriteLine();
     }
 
     /// <summary>
