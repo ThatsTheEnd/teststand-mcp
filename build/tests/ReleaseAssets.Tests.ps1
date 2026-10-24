@@ -39,6 +39,7 @@ $TagTable = @(
 
 $script:Failures = 0
 $script:TempDirs = @()
+$script:FailedRuns = @()
 
 function Invoke-Case {
     param([string]$Name, [scriptblock]$Body)
@@ -104,7 +105,9 @@ function Invoke-Script {
     param([string]$Path, [hashtable]$Arguments = @{})
     $global:LASTEXITCODE = 0
     $lines = @(& $Path @Arguments *>&1 | ForEach-Object { "$_" })
-    return @{ ExitCode = $global:LASTEXITCODE; Output = ($lines -join "`n") }
+    $run = @{ ExitCode = $global:LASTEXITCODE; Output = ($lines -join "`n") }
+    if ($run.ExitCode -ne 0) { $script:FailedRuns += @(@{ Script = (Split-Path -Leaf $Path); Output = $run.Output }) }
+    return $run
 }
 
 # Runs an environment-variable override around a block, restoring the old value.
@@ -159,7 +162,7 @@ try {
         Assert-Equal 'teststand-mcp.manifest.sha256' $ReleaseManifestName 'manifest'
         Assert-Equal 'teststand-mcp-v1.9.0.zip' (Get-VersionedArchiveName -Version '1.9.0') 'versioned archive'
         Assert-Equal 'teststand-mcp-v0.0.0-ci.zip' (Get-VersionedArchiveName -Version '0.0.0-ci') 'versioned archive of a ci build'
-        Assert-Equal 'teststand-mcp.zip|teststand-mcp-v1.9.0.zip|teststand-mcp.sha256|teststand-mcp.manifest.sha256' ((Get-RequiredAssetNames -Version '1.9.0') -join '|') 'required assets in download order'
+        Assert-Equal 'teststand-mcp.zip|teststand-mcp.sha256|teststand-mcp.manifest.sha256|teststand-mcp-v1.9.0.zip' ((Get-RequiredAssetNames -Version '1.9.0') -join '|') 'required assets in download order'
     }
 
     Invoke-Case 'contract: the latest-download URL builder gives the fixed archive URL' {
@@ -387,6 +390,17 @@ try {
         Assert-Contains $message 'then Z' 'second fix line'
     }
 
+    Invoke-Case 'Get-ScriptFailureText: a Write-BuildFailure message passes through, any other error is wrapped into three parts' {
+        $built = $null
+        try { Write-BuildFailure -What 'w' -Why 'y' -Fix 'f' } catch { $built = $_ }
+        Assert-Equal $built.Exception.Message (Get-ScriptFailureText -ErrorRecord $built) 'pass-through'
+        $plain = $null
+        try { throw 'something odd' } catch { $plain = $_ }
+        $text = Get-ScriptFailureText -ErrorRecord $plain
+        Assert-ThreePartFailure $text
+        Assert-Contains $text 'something odd' 'the original message'
+    }
+
     Invoke-Case 'Write-BuildFailure: an empty part is refused, so no failure can lack one' {
         foreach ($call in @(
             { Write-BuildFailure -What '' -Why 'w' -Fix 'f' }
@@ -475,6 +489,400 @@ try {
         Assert-ThreePartFailure $message
         Assert-Contains $message 'bad.json' 'file name'
     }
+
+    # --- Verifier fixtures -------------------------------------------------------------
+    $BotLogin = 'github-actions[bot]'
+    $ApiAssetUrlFormat = 'https://api.github.com/repos/Zuehlke/teststand-mcp/releases/assets/{0}'
+    $FirstAssetId = 1000
+    $DefaultRetryDelay = 30
+    $FakeToken = 'ghs_FAKE_TOKEN_FOR_TESTS'
+
+    # A release as a user would download it: the four assets of version 1.9.0 in one directory.
+    function New-ReleaseFixture {
+        param([string]$Version = '1.9.0')
+        $staged = New-StagedTree
+        $dir = Join-Path (New-TempDir) 'assets'
+        [void](New-Item -ItemType Directory -Path $dir)
+        $zip = Join-Path $dir 'teststand-mcp.zip'
+        New-ZipFromDirectory $staged $zip
+        Write-TextFile (Join-Path $dir 'teststand-mcp.sha256') (New-ArchiveDigest -ArchivePath $zip)
+        Write-TextFile (Join-Path $dir 'teststand-mcp.manifest.sha256') (New-ArchiveManifest -StagedDir $staged)
+        Copy-Item -LiteralPath $zip -Destination (Join-Path $dir "teststand-mcp-v$Version.zip")
+        return @{ Dir = $dir; Version = $Version; Tag = "v$Version"; Staged = $staged }
+    }
+
+    # The GitHub releases-list JSON for one release (plus a decoy), with an uploader per asset.
+    function New-ReleaseJsonText {
+        param([string]$Tag, [string[]]$AssetNames, [hashtable]$UploaderByAsset = @{}, [bool]$Draft = $true)
+        $assets = @()
+        for ($index = 0; $index -lt $AssetNames.Count; $index++) {
+            $name = $AssetNames[$index]
+            $login = $BotLogin
+            if ($UploaderByAsset.ContainsKey($name)) { $login = $UploaderByAsset[$name] }
+            $id = $FirstAssetId + $index
+            $assets += @{ id = $id; name = $name; url = ($ApiAssetUrlFormat -f $id); uploader = @{ login = $login } }
+        }
+        $decoy = @{ tag_name = 'v0.0.1'; draft = $false; assets = @() }
+        $release = @{ tag_name = $Tag; draft = $Draft; assets = $assets }
+        return (ConvertTo-Json -InputObject @($decoy, $release) -Depth 6)
+    }
+
+    function Invoke-LocalVerify {
+        param($Fixture, [hashtable]$UploaderByAsset = @{}, [switch]$NoReleaseJson, [hashtable]$Extra = @{})
+        $arguments = @{ Tag = $Fixture.Tag; LocalDir = $Fixture.Dir }
+        if (-not $NoReleaseJson) {
+            $jsonPath = Join-Path (New-TempDir) 'release.json'
+            Write-TextFile $jsonPath (New-ReleaseJsonText -Tag $Fixture.Tag -AssetNames (Get-RequiredAssetNames -Version $Fixture.Version) -UploaderByAsset $UploaderByAsset)
+            $arguments.ReleaseJson = $jsonPath
+        }
+        foreach ($key in $Extra.Keys) { $arguments[$key] = $Extra[$key] }
+        return Invoke-Script $VerifierPath $arguments
+    }
+
+    # A fake GitHub API at the HTTP boundary. $Plan decides, per asset and per download count, whether a
+    # download fails (returns the failure text) or succeeds ($null). $State records every request.
+    # $ListedJson overrides the releases listing.
+    function New-FakeApi {
+        param($Fixture, [scriptblock]$Plan = { param($Name, $Count) $null }, [string]$ReleasesFailure = $null, [string]$ListedTag = $null, [string]$ListedJson = $null)
+        if (-not $ListedTag) { $ListedTag = $Fixture.Tag }
+        $names = @(Get-RequiredAssetNames -Version $Fixture.Version)
+        $json = $ListedJson
+        if (-not $json) { $json = New-ReleaseJsonText -Tag $ListedTag -AssetNames $names }
+        $dir = $Fixture.Dir
+        $nameById = @{}
+        foreach ($release in @($json | ConvertFrom-Json | ForEach-Object { $_ })) {
+            foreach ($asset in @($release.assets)) { $nameById[[string]$asset.id] = $asset.name }
+        }
+        $state = @{ Calls = (New-Object System.Collections.ArrayList); Downloads = @{} }
+        $http = {
+            param($Uri, $Headers, $OutFile, $TimeoutSeconds)
+            [void]$state.Calls.Add(@{ Uri = $Uri; Headers = $Headers; OutFile = $OutFile; TimeoutSeconds = $TimeoutSeconds })
+            if ($Uri -match '/releases\?') {
+                if ($ReleasesFailure) { throw $ReleasesFailure }
+                return $json
+            }
+            if ($Uri -match '/releases/assets/(\d+)\z') {
+                $name = $nameById[$Matches[1]]
+                if (-not $state.Downloads.ContainsKey($name)) { $state.Downloads[$name] = 0 }
+                $state.Downloads[$name] = $state.Downloads[$name] + 1
+                $failure = & $Plan $name $state.Downloads[$name]
+                if ($failure) { throw $failure }
+                Copy-Item -LiteralPath (Join-Path $dir $name) -Destination $OutFile
+                return
+            }
+            throw "unexpected request $Uri"
+        }.GetNewClosure()
+        return @{ Http = $http; State = $state }
+    }
+
+    function Invoke-ApiVerify {
+        param($Fixture, $Api, [string]$OwnDownloadsPath, [hashtable]$Extra = @{})
+        $delays = New-Object System.Collections.ArrayList
+        $delay = { param([int]$Seconds) [void]$delays.Add($Seconds) }.GetNewClosure()
+        $arguments = @{ Repo = $ExpectedRepoSlug; Tag = $Fixture.Tag; Token = $FakeToken; HttpGet = $Api.Http; Delay = $delay; Draft = $true }
+        if ($OwnDownloadsPath) { $arguments.OwnDownloadsPath = $OwnDownloadsPath }
+        foreach ($key in $Extra.Keys) { $arguments[$key] = $Extra[$key] }
+        $run = Invoke-Script $VerifierPath $arguments
+        $run.Delays = @($delays)
+        return $run
+    }
+
+    function Get-AssetRequests {
+        param($Api)
+        return @($Api.State.Calls | Where-Object { $_.Uri -match '/releases/assets/' })
+    }
+
+    # --- Scenario: A CI-built draft verifies -------------------------------------------
+    Invoke-Case 'verify local: four assets, bot uploader, matching digest and manifest -> exit 0' {
+        $run = Invoke-LocalVerify (New-ReleaseFixture)
+        Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-Contains $run.Output 'verified' 'success line'
+        Assert-Contains $run.Output 'Downloaded 0 asset' 'local mode downloads nothing and says so'
+    }
+
+    Invoke-Case 'verify local: without a release json the uploader check is skipped and the output says so' {
+        $run = Invoke-LocalVerify (New-ReleaseFixture) -NoReleaseJson
+        Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-Contains $run.Output 'uploader check skipped' 'skip notice'
+    }
+
+    # --- Scenario Outline: A release that must not go live ------------------------------
+    $RerunWillNotHelp = 'A re-run will not help'
+    $FaultRows = @(
+        @{ Fault = 'the zip was uploaded by a person'; Uploader = @{ 'teststand-mcp.zip' = 'alice' }
+           Expect = @("teststand-mcp.zip was uploaded by 'alice'", 'github-actions[bot]') }
+        @{ Fault = "the zip's hash differs from the digest"
+           Mutate = { param($fx) Write-TextFile (Join-Path $fx.Dir 'teststand-mcp.sha256') (('0' * 64) + '  teststand-mcp.zip' + "`n") }
+           Expect = @('teststand-mcp.zip does not match teststand-mcp.sha256') }
+        @{ Fault = 'one manifest entry differs from the archive'
+           Mutate = { param($fx)
+               $path = Join-Path $fx.Dir 'teststand-mcp.manifest.sha256'
+               $lines = @([IO.File]::ReadAllText($path, $Utf8NoBom) -split "`n" | Where-Object { $_ } | ForEach-Object { if ($_.EndsWith('  bin/appsettings.json')) { ('0' * 64) + '  bin/appsettings.json' } else { $_ } })
+               Write-TextFile $path (($lines -join "`n") + "`n") }
+           Expect = @("archive entry 'bin/appsettings.json' differs from the manifest") }
+        @{ Fault = 'the archive has an entry the manifest lacks'
+           Mutate = { param($fx)
+               $path = Join-Path $fx.Dir 'teststand-mcp.manifest.sha256'
+               $lines = @([IO.File]::ReadAllText($path, $Utf8NoBom) -split "`n" | Where-Object { $_ -and -not $_.EndsWith('  VERSION.txt') })
+               Write-TextFile $path (($lines -join "`n") + "`n") }
+           Expect = @("archive entry 'VERSION.txt' is not listed in the manifest") }
+        @{ Fault = 'the manifest lists an entry the archive lacks'
+           Mutate = { param($fx)
+               $path = Join-Path $fx.Dir 'teststand-mcp.manifest.sha256'
+               Write-TextFile $path ([IO.File]::ReadAllText($path, $Utf8NoBom) + (Get-Sha256Of ([byte[]](9))) + "  bin/ghost.dll`n") }
+           Expect = @("the manifest lists 'bin/ghost.dll' but the archive has no such entry") }
+        @{ Fault = 'the version-named copy differs from the fixed zip'
+           Mutate = { param($fx) [IO.File]::WriteAllBytes((Join-Path $fx.Dir 'teststand-mcp-v1.9.0.zip'), [byte[]](1, 2, 3)) }
+           Expect = @('teststand-mcp-v1.9.0.zip differs from teststand-mcp.zip') }
+        @{ Fault = 'teststand-mcp.zip is missing'
+           Mutate = { param($fx) Remove-Item -LiteralPath (Join-Path $fx.Dir 'teststand-mcp.zip') }
+           Expect = @('teststand-mcp.zip is missing from the release') }
+        @{ Fault = 'teststand-mcp.sha256 is missing'
+           Mutate = { param($fx) Remove-Item -LiteralPath (Join-Path $fx.Dir 'teststand-mcp.sha256') }
+           Expect = @('teststand-mcp.sha256 is missing from the release') }
+        @{ Fault = 'teststand-mcp.manifest.sha256 is missing'
+           Mutate = { param($fx) Remove-Item -LiteralPath (Join-Path $fx.Dir 'teststand-mcp.manifest.sha256') }
+           Expect = @('teststand-mcp.manifest.sha256 is missing from the release') }
+        @{ Fault = 'the version-named copy is missing'
+           Mutate = { param($fx) Remove-Item -LiteralPath (Join-Path $fx.Dir 'teststand-mcp-v1.9.0.zip') }
+           Expect = @('teststand-mcp-v1.9.0.zip is missing from the release') }
+    )
+    foreach ($row in $FaultRows) {
+        Invoke-Case "verify local fault: $($row.Fault) -> exit 1, names the fault, says a re-run will not help, gives the fix" {
+            $fixture = New-ReleaseFixture
+            if ($row.ContainsKey('Mutate')) { & $row.Mutate $fixture }
+            $uploaders = @{}
+            if ($row.ContainsKey('Uploader')) { $uploaders = $row.Uploader }
+            $run = Invoke-LocalVerify $fixture -UploaderByAsset $uploaders
+            Assert-Equal 1 $run.ExitCode 'exit code'
+            Assert-ThreePartFailure $run.Output
+            foreach ($phrase in $row.Expect) { Assert-Contains $run.Output $phrase 'fault text' }
+            Assert-Contains $run.Output $RerunWillNotHelp 're-run advice'
+        }
+    }
+
+    Invoke-Case 'verify local fault: a missing zip is reported alone, not as a cascade of dependent faults' {
+        $fixture = New-ReleaseFixture
+        Remove-Item -LiteralPath (Join-Path $fixture.Dir 'teststand-mcp.zip')
+        $run = Invoke-LocalVerify $fixture
+        Assert-NotContains $run.Output 'does not match' 'a hash comparison against a missing zip'
+        Assert-NotContains $run.Output 'differs from' 'a comparison against a missing zip'
+    }
+
+    Invoke-Case 'verify local fault: two faults are both named in one failure' {
+        $fixture = New-ReleaseFixture
+        Remove-Item -LiteralPath (Join-Path $fixture.Dir 'teststand-mcp.sha256')
+        [IO.File]::WriteAllBytes((Join-Path $fixture.Dir 'teststand-mcp-v1.9.0.zip'), [byte[]](1))
+        $run = Invoke-LocalVerify $fixture
+        Assert-Contains $run.Output 'teststand-mcp.sha256 is missing from the release' 'first fault'
+        Assert-Contains $run.Output 'teststand-mcp-v1.9.0.zip differs from teststand-mcp.zip' 'second fault'
+    }
+
+    Invoke-Case 'verify local fault: a digest that names another file or is malformed is a fault' {
+        $fixture = New-ReleaseFixture
+        Write-TextFile (Join-Path $fixture.Dir 'teststand-mcp.sha256') ((Get-FileSha256 (Join-Path $fixture.Dir 'teststand-mcp.zip')) + "  other.zip`n")
+        $run = Invoke-LocalVerify $fixture
+        Assert-Equal 1 $run.ExitCode 'exit code for a digest naming another file'
+        Assert-Contains $run.Output 'other.zip' 'digest file name'
+        Write-TextFile (Join-Path $fixture.Dir 'teststand-mcp.sha256') "garbage`n"
+        $run = Invoke-LocalVerify $fixture
+        Assert-Equal 1 $run.ExitCode 'exit code for a malformed digest'
+        Assert-Contains $run.Output 'teststand-mcp.sha256' 'malformed digest names the file'
+    }
+
+    Invoke-Case 'verify local: a LocalDir that does not exist fails with the three parts' {
+        $run = Invoke-Script $VerifierPath @{ Tag = 'v1.9.0'; LocalDir = (Join-Path (New-TempDir) 'nope') }
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-ThreePartFailure $run.Output
+    }
+
+    Invoke-Case 'verify local: a release json that is not JSON still gives a three-part failure naming the error' {
+        $fixture = New-ReleaseFixture
+        $jsonPath = Join-Path (New-TempDir) 'broken.json'
+        Write-TextFile $jsonPath '{ this is not json'
+        $run = Invoke-Script $VerifierPath @{ Tag = $fixture.Tag; LocalDir = $fixture.Dir; ReleaseJson = $jsonPath }
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-ThreePartFailure $run.Output
+        Assert-Contains $run.Output 'Unexpected error' 'unexpected-error label'
+    }
+
+    Invoke-Case 'verify: neither -Repo nor -LocalDir fails with the three parts' {
+        $run = Invoke-Script $VerifierPath @{ Tag = 'v1.9.0' }
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-ThreePartFailure $run.Output
+    }
+
+    Invoke-Case 'verify: a child process under -File exits 1 for a faulty release and 0 for a good one' {
+        $powershell = (Get-Process -Id $PID).Path
+        $good = New-ReleaseFixture
+        & $powershell -NoProfile -ExecutionPolicy Bypass -File $VerifierPath -Tag $good.Tag -LocalDir $good.Dir *> $null
+        Assert-Equal 0 $LASTEXITCODE 'exit code for a good release'
+        Remove-Item -LiteralPath (Join-Path $good.Dir 'teststand-mcp.sha256')
+        & $powershell -NoProfile -ExecutionPolicy Bypass -File $VerifierPath -Tag $good.Tag -LocalDir $good.Dir *> $null
+        Assert-Equal 1 $LASTEXITCODE 'exit code for a faulty release'
+    }
+
+    # --- API mode through a fake HTTP boundary --------------------------------------------
+    Invoke-Case 'verify api: reads the draft through the API with the token, downloads four assets, exit 0' {
+        $fixture = New-ReleaseFixture
+        $api = New-FakeApi $fixture
+        $run = Invoke-ApiVerify $fixture $api
+        Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-Contains $run.Output 'Downloaded 4 asset(s) in 1 attempt' 'download count'
+        $listing = @($api.State.Calls | Where-Object { $_.Uri -match '/releases\?' })[0]
+        Assert-True ($listing.Uri.StartsWith('https://api.github.com/repos/Zuehlke/teststand-mcp/releases?')) "listing url was $($listing.Uri)"
+        Assert-Equal "Bearer $FakeToken" $listing.Headers['Authorization'] 'listing authorization'
+        $requests = Get-AssetRequests $api
+        Assert-Equal 4 $requests.Count 'asset requests'
+        foreach ($request in $requests) {
+            Assert-Equal 'application/octet-stream' $request.Headers['Accept'] "accept header of $($request.Uri)"
+            Assert-Equal "Bearer $FakeToken" $request.Headers['Authorization'] "authorization of $($request.Uri)"
+            Assert-True ($request.TimeoutSeconds -gt 0) 'every web call carries a timeout'
+        }
+        Assert-True ($listing.TimeoutSeconds -gt 0) 'the listing call carries a timeout'
+        Assert-NotContains $run.Output $FakeToken 'output (the token must never be printed)'
+    }
+
+    Invoke-Case 'verify api: without a token no Authorization header is sent' {
+        $fixture = New-ReleaseFixture
+        $api = New-FakeApi $fixture
+        $run = Invoke-ApiVerify $fixture $api -Extra @{ Token = '' }
+        Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        foreach ($call in $api.State.Calls) { Assert-True (-not $call.Headers.ContainsKey('Authorization')) "Authorization sent to $($call.Uri)" }
+    }
+
+    Invoke-Case 'verify api: an asset uploaded by a person fails and is not retried' {
+        $fixture = New-ReleaseFixture
+        $listJson = New-ReleaseJsonText -Tag $fixture.Tag -AssetNames (Get-RequiredAssetNames -Version $fixture.Version) -UploaderByAsset @{ 'teststand-mcp.zip' = 'alice' }
+        $api = New-FakeApi $fixture -ListedJson $listJson
+        $run = Invoke-ApiVerify $fixture $api
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-Contains $run.Output "teststand-mcp.zip was uploaded by 'alice'" 'fault'
+        Assert-Equal 0 $run.Delays.Count 'a retry delay was used for a non-download fault'
+    }
+
+    Invoke-Case 'verify api: no release for the tag explains that a draft needs -Token, and is not retried' {
+        $fixture = New-ReleaseFixture
+        $api = New-FakeApi $fixture -ListedTag 'v9.9.9'
+        $run = Invoke-ApiVerify $fixture $api
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-ThreePartFailure $run.Output
+        Assert-Contains $run.Output 'v1.9.0' 'tag'
+        Assert-Contains $run.Output '-Token' 'draft hint'
+        Assert-Equal 0 (Get-AssetRequests $api).Count 'asset requests'
+    }
+
+    Invoke-Case 'verify api: the releases list failing is a three-part failure and is not retried' {
+        $fixture = New-ReleaseFixture
+        $api = New-FakeApi $fixture -ReleasesFailure 'The remote server returned an error: (403) rate limit exceeded.'
+        $run = Invoke-ApiVerify $fixture $api
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-ThreePartFailure $run.Output
+        Assert-Contains $run.Output 'rate limit' 'cause'
+        Assert-Equal 0 $run.Delays.Count 'retry delays'
+    }
+
+    # --- Scenario Outline: One retry for upload settling -----------------------------------
+    Invoke-Case 'retry: first attempt cannot download (HTTP error), second passes -> exit 0 after a 30 s wait' {
+        $fixture = New-ReleaseFixture
+        $api = New-FakeApi $fixture -Plan { param($Name, $Count) if ($Name -eq 'teststand-mcp.sha256' -and $Count -eq 1) { 'The remote server returned an error: (502) Bad Gateway.' } }
+        $run = Invoke-ApiVerify $fixture $api
+        Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-Equal 1 $run.Delays.Count 'number of waits'
+        Assert-Equal $DefaultRetryDelay $run.Delays[0] 'wait in seconds'
+        Assert-Contains $run.Output 'in 2 attempt' 'attempt count'
+    }
+
+    Invoke-Case 'retry: first attempt cannot download (timeout), second fails again -> exit non-zero, says a re-run may help' {
+        $fixture = New-ReleaseFixture
+        $api = New-FakeApi $fixture -Plan { param($Name, $Count) if ($Name -eq 'teststand-mcp.zip') { 'The operation has timed out.' } }
+        $run = Invoke-ApiVerify $fixture $api
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-ThreePartFailure $run.Output
+        Assert-Contains $run.Output 'timed out' 'cause'
+        Assert-Contains $run.Output 'A re-run may help' 're-run advice'
+        Assert-Equal 1 $run.Delays.Count 'exactly one retry'
+        Assert-Equal 2 $api.State.Downloads['teststand-mcp.zip'] 'zip request count (no third attempt)'
+    }
+
+    Invoke-Case 'retry: first attempt cannot download, second downloads but the hash differs -> exit non-zero naming the hash' {
+        $fixture = New-ReleaseFixture
+        Write-TextFile (Join-Path $fixture.Dir 'teststand-mcp.sha256') (('0' * 64) + '  teststand-mcp.zip' + "`n")
+        $api = New-FakeApi $fixture -Plan { param($Name, $Count) if ($Name -eq 'teststand-mcp.manifest.sha256' -and $Count -eq 1) { 'timeout' } }
+        $run = Invoke-ApiVerify $fixture $api
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-Contains $run.Output 'does not match teststand-mcp.sha256' 'fault'
+        Assert-Equal 1 $run.Delays.Count 'exactly one retry'
+    }
+
+    Invoke-Case 'retry: downloads but the hash differs on the first attempt -> exit non-zero WITHOUT retrying' {
+        $fixture = New-ReleaseFixture
+        Write-TextFile (Join-Path $fixture.Dir 'teststand-mcp.sha256') (('0' * 64) + '  teststand-mcp.zip' + "`n")
+        $api = New-FakeApi $fixture
+        $run = Invoke-ApiVerify $fixture $api
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-Contains $run.Output 'does not match teststand-mcp.sha256' 'fault'
+        Assert-Contains $run.Output $RerunWillNotHelp 're-run advice'
+        Assert-Equal 0 $run.Delays.Count 'no wait'
+        Assert-Equal 1 $api.State.Downloads['teststand-mcp.zip'] 'zip downloaded once'
+    }
+
+    Invoke-Case 'retry: a missing asset is not retried either' {
+        $fixture = New-ReleaseFixture
+        $listJson = New-ReleaseJsonText -Tag $fixture.Tag -AssetNames @('teststand-mcp.zip', 'teststand-mcp.sha256', 'teststand-mcp-v1.9.0.zip')
+        $api = New-FakeApi $fixture -ListedJson $listJson
+        $run = Invoke-ApiVerify $fixture $api
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-Contains $run.Output 'teststand-mcp.manifest.sha256 is missing from the release' 'fault'
+        Assert-Equal 0 $run.Delays.Count 'no wait'
+    }
+
+    # --- Own-downloads record from the verifier ----------------------------------------------
+    Invoke-Case 'own-downloads: verify + retry + final fetch count 3 for the zip and equal the shared fixture' {
+        $fixture = New-ReleaseFixture
+        $recordPath = Join-Path (New-TempDir) 'own-downloads.json'
+        $api = New-FakeApi $fixture -Plan { param($Name, $Count) if ($Name -eq 'teststand-mcp.sha256' -and $Count -eq 1) { 'The remote server returned an error: (502) Bad Gateway.' } }
+        $dateBefore = [DateTime]::UtcNow.ToString('yyyy-MM-dd')
+        Use-EnvironmentVariable 'GITHUB_RUN_ID' '1234567890' {
+            $script:VerifyRun = Invoke-ApiVerify $fixture $api -OwnDownloadsPath $recordPath
+            # the workflow's last step: the public fetch of the fixed zip
+            Add-OwnDownload -Path $recordPath -AssetName $ReleaseArchiveName
+        }
+        $dateAfter = [DateTime]::UtcNow.ToString('yyyy-MM-dd')
+        Assert-Equal 0 $script:VerifyRun.ExitCode "exit code. Output was:`n$($script:VerifyRun.Output)"
+        $record = Read-OwnDownloads -Path $recordPath
+        $expected = Read-OwnDownloads -Path $OwnDownloadsFixturePath
+        Assert-Equal 3 $record.Assets['teststand-mcp.zip'] 'zip downloads'
+        Assert-Equal $expected.RunId $record.RunId 'run_id'
+        Assert-True (($record.Date -ceq $dateBefore) -or ($record.Date -ceq $dateAfter)) "date $($record.Date) is not today"
+        Assert-Equal $expected.Draft $record.Draft 'draft'
+        Assert-Equal (($expected.Assets.Keys | Sort-Object) -join ',') (($record.Assets.Keys | Sort-Object) -join ',') 'asset names'
+        foreach ($name in $expected.Assets.Keys) { Assert-Equal $expected.Assets[$name] $record.Assets[$name] "count of $name" }
+    }
+
+    Invoke-Case 'own-downloads: without -Draft the verifier records draft false; local mode records nothing' {
+        $fixture = New-ReleaseFixture
+        $recordPath = Join-Path (New-TempDir) 'own-downloads.json'
+        Use-EnvironmentVariable 'GITHUB_RUN_ID' '55' {
+            [void](Invoke-ApiVerify $fixture (New-FakeApi $fixture) -OwnDownloadsPath $recordPath -Extra @{ Draft = $false })
+        }
+        Assert-Equal $false (Read-OwnDownloads -Path $recordPath).Draft 'draft flag'
+        $localRecord = Join-Path (New-TempDir) 'local-downloads.json'
+        [void](Invoke-LocalVerify (New-ReleaseFixture) -Extra @{ OwnDownloadsPath = $localRecord })
+        Assert-True (-not (Test-Path -LiteralPath $localRecord)) 'local mode must not create a download record'
+    }
+
+    # --- Every failing script run, anywhere above, has the three parts -------------------------
+    Invoke-Case 'every failing run of every build script prints What, Why and Fix' {
+        Assert-True ($script:FailedRuns.Count -ge 20) "expected at least 20 failing runs to check, found $($script:FailedRuns.Count)"
+        foreach ($failed in $script:FailedRuns) {
+            try { Assert-ThreePartFailure $failed.Output } catch { throw "$($failed.Script): $($_.Exception.Message)" }
+        }
+    }
+
+    # --- Scenario: The existing hand-cut release is recognised (manual, needs network) -------------
+    # Not part of this file: no network in tests. Run by hand:
+    #   powershell -File build\Assert-PublishedRelease.ps1 -Repo Zuehlke/teststand-mcp -Tag v1.8.6
 }
 finally {
     Remove-Module ReleaseAssets -ErrorAction SilentlyContinue

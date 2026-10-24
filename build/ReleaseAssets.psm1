@@ -34,11 +34,12 @@ function Get-VersionedArchiveName {
     return ($script:VersionedArchiveFormat -f $Version)
 }
 
-# Download order: the fixed zip first, because every other check needs it.
+# Download order: the fixed zip first (every other check needs it), the small digest and
+# manifest next, and the second full-size zip last so a cheap fault stops the run before it.
 function Get-RequiredAssetNames {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Version)
-    return @($ReleaseArchiveName, (Get-VersionedArchiveName -Version $Version), $ReleaseDigestName, $ReleaseManifestName)
+    return @($ReleaseArchiveName, $ReleaseDigestName, $ReleaseManifestName, (Get-VersionedArchiveName -Version $Version))
 }
 
 function Get-LatestDownloadUrl {
@@ -75,6 +76,18 @@ function Write-BuildFailure {
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Fix
     )
     throw (Format-BuildFailure -What $What -Why $Why -Fix $Fix)
+}
+
+# What a script prints for a caught error: a Write-BuildFailure message as it is, anything else
+# wrapped into the same three parts so even a bug in a script never prints a bare exception.
+function Get-ScriptFailureText {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$ErrorRecord)
+    $message = $ErrorRecord.Exception.Message
+    if ($message -cmatch '\AWhat: ') { return $message }
+    return Format-BuildFailure -What "Unexpected error: $message" `
+        -Why 'The script hit a problem it does not handle itself, so it reached no verdict. A re-run may help only if the cause is transient.' `
+        -Fix ("Re-run it; if it repeats, report it with this output.`n" + $ErrorRecord.ScriptStackTrace)
 }
 
 # ----------------------------------------------------------------------------
@@ -376,7 +389,7 @@ function Add-OwnDownload {
 
 Export-ModuleMember -Variable ReleaseRepoSlug, ReleaseArchiveName, ReleaseDigestName, ReleaseManifestName
 Export-ModuleMember -Function Get-VersionedArchiveName, Get-RequiredAssetNames, Get-LatestDownloadUrl,
-    Write-BuildFailure, Format-BuildFailure, Get-FileSha256, Get-StreamSha256,
+    Write-BuildFailure, Format-BuildFailure, Get-ScriptFailureText, Get-FileSha256, Get-StreamSha256,
     ConvertFrom-ReleaseTag, Get-TagRejection,
     New-ArchiveDigest, ConvertFrom-DigestText, New-ArchiveManifest, Test-ArchiveManifest,
     Read-OwnDownloads, Add-OwnDownload

@@ -33,6 +33,6 @@ try {
     Write-Host "Tag $($result.Tag) is valid: version $($result.Version)"
     exit 0
 } catch {
-    Write-Host $_.Exception.Message
+    Write-Host (Get-ScriptFailureText -ErrorRecord $_)
     exit 1
 }
