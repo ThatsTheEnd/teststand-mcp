@@ -1230,9 +1230,9 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
 - [x] Slice 2: Plugin identity, manifests and agent generation
   - [x] Step 2.1: Manifests and identity
   - [x] Step 2.2: Agent conversion
-- [ ] Slice 3: Rules skill as the single source of user-facing rules
-  - [ ] Step 3.1: Write the skill and its source check
-  - [ ] Step 3.2: CLAUDE.md imports the skill
+- [x] Slice 3: Rules skill as the single source of user-facing rules
+  - [x] Step 3.1: Write the skill and its source check
+  - [x] Step 3.2: CLAUDE.md imports the skill
 - [ ] Slice 6: Release assets, tag gate and release verifier
   - [ ] Step 6.1: ReleaseAssets module and tag gate
   - [ ] Step 6.2: Release verifier
