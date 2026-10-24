@@ -918,7 +918,7 @@ Feature: Workflows run the same scripts a maintainer runs
 ### Slice 9: Download stats on GitHub Pages
 
 **Depends-on:** 6
-**Files:** `.github/workflows/pages.yml`, `.github/stats/collect.py`, `.github/stats/test_collect.py`, `.github/site/build.py`
+**Files:** `.github/workflows/pages.yml`, `.github/stats/collect.py`, `.github/stats/github_api.py`, `.github/stats/stats_csv.py`, `.github/stats/net_installs.py`, `.github/stats/test_collect.py`, `.github/site/build.py`
 
 **Behavior:**
 
@@ -996,13 +996,13 @@ Feature: Install counts over time
 **IMPLEMENT**: Stdlib only. Read the releases and assets, and the `own-downloads.json` artifacts of `release.yml` runs (`actions: read`). Read traffic only with the token. "Today" is injectable for tests. On any API error the run exits non-zero before writing.
 **TEST**: `test_collect.py` with canned API JSON (normal, no token, unchanged) and with own-download records read from the shared `build/tests/fixtures/own-downloads.json`.
 **REFACTOR**: A pure "rows from JSON" function.
-**Files**: `.github/stats/collect.py`, `.github/stats/test_collect.py`
+**Files**: `.github/stats/collect.py`, `.github/stats/github_api.py`, `.github/stats/stats_csv.py`, `.github/stats/net_installs.py`, `.github/stats/test_collect.py` (the collector was split into the client, the CSV layer and the pure domain in review round 1)
 **Commit**: `feat: collect release download counts`
 
 #### Step 9.2: build.py and pages.yml
 
 **Complexity**: standard
-**IMPLEMENT**: A static page with an inline SVG (`role="img"`, `<title>`, `<desc>`), direct labels and a data table. No CDN. Workflow: cron `41 8 * * *` plus `workflow_dispatch`, a `stats` branch worktree and `deploy-pages`, with permissions per job.
+**IMPLEMENT**: A static page with an inline SVG (`role="img"`, `<title>`, `<desc>`), direct labels and a data table. No CDN. Workflow: cron `17 0 * * *` plus `workflow_dispatch`, a `stats` branch worktree and `deploy-pages`, with permissions per job. Review round 1 consequences, recorded in AC-18: a snapshot means the counts at the end of UTC day D, dated the previous UTC day by a run just after midnight (hence the cron time); the raw totals include the assets of draft releases; own-download artifacts are accepted only from `release.yml` runs of this repository; the token reaches git only through a single-use extra header (`persist-credentials: false`).
 **TEST**: `test_collect.py` covers the subtraction and checks the markup for the accessibility elements. Run `build.py` on fixture CSVs.
 **REFACTOR**: One CSV schema constant.
 **Files**: `.github/site/build.py`, `.github/workflows/pages.yml`, `.github/stats/test_collect.py`

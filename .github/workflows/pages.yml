@@ -7,8 +7,16 @@
 #            source is not set to "GitHub Actions" fails only this job: the statistics have
 #            already been committed by then, and ci.yml and release.yml are separate workflows.
 #
-# Any API error, a rate limit included, fails `collect` before a file is written, so nothing
-# is committed. A run whose counts equal the last snapshot commits nothing.
+# A snapshot means "the counts at the end of UTC day D", recorded shortly after midnight under
+# the date D (cron 00:17 UTC, snapshot dated the previous day). The own downloads of the release
+# workflow carry their UTC date, so a release run on day D is subtracted from D's snapshot. A
+# manual run (workflow_dispatch) during the day also records the previous day, with counts that
+# already include part of today; that is accepted, the next scheduled run adds only the rest.
+#
+# Any API error on the releases, the artifact list or the traffic, a rate limit included, fails
+# `collect` before a file is written, so nothing is committed. A run whose counts equal the last
+# snapshot commits nothing. The token is never stored in .git/config: it is handed to the
+# git commands that need it through a single-use http.extraheader.
 #
 # The own-downloads records come from the `own-downloads` artifacts of release.yml runs
 # (file own-downloads.json, schema in docs/specs/plugin-install-and-release-workflow.md, AC-18).
@@ -16,7 +24,7 @@ name: pages
 
 on:
   schedule:
-    - cron: '41 8 * * *'
+    - cron: '17 0 * * *'
   workflow_dispatch:
 
 # Every job states its own permissions; the workflow grants nothing by default.
@@ -39,17 +47,22 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: true # the stats branch is pushed with this checkout's token
+          persist-credentials: false # the token is passed to the git commands that need it, below
 
       - name: Check out the stats branch as a worktree
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          git_auth=(-c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth")
           stats_dir="$RUNNER_TEMP/stats"
           status=0
-          git ls-remote --exit-code --heads origin stats >/dev/null || status=$?
+          git "${git_auth[@]}" ls-remote --exit-code --heads origin stats >/dev/null || status=$?
           case "$status" in
             0)
-              git fetch --no-tags --depth=1 origin '+refs/heads/stats:refs/remotes/origin/stats'
+              git "${git_auth[@]}" fetch --no-tags --depth=1 origin '+refs/heads/stats:refs/remotes/origin/stats'
               git worktree add -B stats "$stats_dir" refs/remotes/origin/stats
               ;;
             2)
@@ -80,6 +93,8 @@ jobs:
           python3 .github/site/build.py --stats-dir "$RUNNER_TEMP/stats" --out "$RUNNER_TEMP/site" "${args[@]}"
 
       - name: Commit the statistics when they changed
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/stats"
@@ -90,7 +105,9 @@ jobs:
           fi
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
             commit --quiet -m "stats: snapshot $(date -u +%F)"
-          git push origin HEAD:refs/heads/stats
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/stats
 
       - name: Upload the page
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0

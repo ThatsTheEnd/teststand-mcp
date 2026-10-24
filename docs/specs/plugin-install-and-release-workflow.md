@@ -332,12 +332,23 @@ bin/README.md, bin/CLAUDE.md
 - **AC-18 Download stats.** A daily scheduled run (also runnable by hand) records the cumulative
   `download_count` of each release asset to the `stats` branch as CSV. It then deploys a Pages
   site that charts installs over time, with downloads by the repository's own workflows subtracted.
+  A snapshot means the cumulative counts at the end of UTC day D. The run is scheduled just after
+  midnight (`17 0 * * *`) and dates its snapshot the previous UTC day. A run started by hand
+  during the day also records the previous day, with counts that already include part of today.
+  The raw counts include the assets of draft releases, so a draft download shows up in the same
+  day's delta as its own-download record. Installs on a day are the delta to the previous
+  snapshot; when the snapshots are more than one day apart, the whole delta is booked on the
+  later date and the table row and chart description say "since <previous date>". The chart
+  shows two download series, the latest-archive asset `teststand-mcp.zip` and all versioned
+  archives `teststand-mcp-vX.Y.Z.zip` summed, and covers at most the last 366 days.
   Every download a workflow makes is recorded per asset and per date in one run artifact: each
   verify attempt, the retry, and the final public fetch. The collector subtracts those counts per
   asset and per date, clamped at zero. A test on the shared fixture checks that the subtracted value
   equals the recorded count. The record is
   `{ "run_id", "counts": { "<YYYY-MM-DD>": { "<asset>": { "draft": n, "published": m } } } }`, so
-  each download carries its own date and phase. Whether
+  each download carries its own date and phase. The collector accepts such an artifact only from
+  a run of `release.yml` of this repository (not a fork) started by a push or by hand, and only
+  when the record's `run_id` names that run. Whether
   downloads of a *draft* raise `download_count` is measured on the first release, and the
   collector has a switch for both outcomes. If they count, the `draft` counts are subtracted with
   the `published` ones. If they do not, only the `published` counts are subtracted. The
