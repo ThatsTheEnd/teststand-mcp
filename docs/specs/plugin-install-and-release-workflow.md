@@ -296,9 +296,12 @@ bin/README.md, bin/CLAUDE.md
   - a check: ask Claude to call `get_engine_paths`, and `environmentActive` must be true;
   - the per-session alternative `connect_engine(tsenv_path=…)`.
 
-  It states that edits to the plugin's own `bin/appsettings.json` are lost on update. If the AC-2
-  spike confirms that Claude Code `userConfig` can feed the server's environment, the README shows
-  `userConfig` instead and drops `setx`. Otherwise it shows `setx`. If the `environmentActive` check
+  It states that edits to the plugin's own `bin/appsettings.json` are lost on update. The AC-2 spike
+  confirmed that Claude Code `userConfig` can feed the server's environment. The plugin's
+  `tsenv_path` therefore goes to its own variable `TestStand:PluginEnvironmentPath`, which wins over
+  `TestStand:EnvironmentPath` only when it is non-blank and not an unexpanded `${…}` placeholder. A
+  machine-wide setting therefore survives a plugin install with the field left empty. The README
+  shows `userConfig` as the plugin route and keeps `setx` as the machine-wide alternative. If the `environmentActive` check
   could not be run because no `.tsenv` station was available, the README marks the route
   "unverified" and the PR records it. That is an accepted outcome for this criterion.
 

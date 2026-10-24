@@ -1220,16 +1220,16 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
 ### Slices (grouped by wave)
 
 #### Wave 1
-- [ ] Slice 0: Spike — exe layout and Claude Code plugin facts
-  - [ ] Step 0.1: Layout spike on the station
-  - [ ] Step 0.2: Claude Code plugin facts
-- [ ] Slice 1: Version identity and early CLI flags
-  - [ ] Step 1.1: Pure version resolver
-  - [ ] Step 1.2: Early `--version` and `--list-tools --json`
-  - [ ] Step 1.3: One version everywhere
-- [ ] Slice 2: Plugin identity, manifests and agent generation
-  - [ ] Step 2.1: Manifests and identity
-  - [ ] Step 2.2: Agent conversion
+- [x] Slice 0: Spike — exe layout and Claude Code plugin facts
+  - [x] Step 0.1: Layout spike on the station
+  - [x] Step 0.2: Claude Code plugin facts
+- [x] Slice 1: Version identity and early CLI flags
+  - [x] Step 1.1: Pure version resolver
+  - [x] Step 1.2: Early `--version` and `--list-tools --json`
+  - [x] Step 1.3: One version everywhere
+- [x] Slice 2: Plugin identity, manifests and agent generation
+  - [x] Step 2.1: Manifests and identity
+  - [x] Step 2.2: Agent conversion
 - [ ] Slice 3: Rules skill as the single source of user-facing rules
   - [ ] Step 3.1: Write the skill and its source check
   - [ ] Step 3.2: CLAUDE.md imports the skill
