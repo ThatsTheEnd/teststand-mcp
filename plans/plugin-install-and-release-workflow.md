@@ -1273,11 +1273,11 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
   - [x] Step 6.2: Release verifier
 
 #### Wave 2
-- [ ] Slice 4: Plugin hooks
-  - [ ] Step 4.1: Allow hook with a literal classification
-  - [ ] Step 4.2: Platform guard
-  - [ ] Step 4.3: Update-notify hook
-  - [ ] Step 4.4: hooks.json wiring
+- [x] Slice 4: Plugin hooks
+  - [x] Step 4.1: Allow hook with a literal classification
+  - [x] Step 4.2: Platform guard
+  - [x] Step 4.3: Update-notify hook
+  - [x] Step 4.4: hooks.json wiring
 - [ ] Slice 9: Download stats on GitHub Pages
   - [ ] Step 9.1: collect.py
   - [ ] Step 9.2: build.py and pages.yml
