@@ -6,6 +6,7 @@
 #    Get-RegisteredToolParameters : tool name -> parameter names, from the same calls;
 #    Read-ToolClasses        : tool-classes.json as an object;
 #    Get-ClassList           : one list of it (allow, prompt) as an array;
+#    Get-ClassifiedToolNames : both lists together; Get-ToolSourcePath: where the two source files live;
 #    Get-ToolClassificationViolation : the violations of one classification (empty = valid);
 #    Assert-ToolClassification : the same check as a three-part build failure.
 #  Compatible with Windows PowerShell 5.1 and PowerShell 7.
@@ -55,6 +56,29 @@ function Get-RegisteredToolParameters {
         $parameters[$starts[$index].Groups[1].Value] = @([regex]::Matches($block, $script:ParameterCallPattern) | ForEach-Object { $_.Groups[1].Value })
     }
     return $parameters
+}
+
+# ----------------------------------------------------------------------------
+#  Where the classification and the tool registry live (relative to the repository root)
+# ----------------------------------------------------------------------------
+$script:ToolClassesRelative = 'plugin\hooks\tool-classes.json'
+$script:ToolRegistryRelative = 'src\Tools\TestStandToolRegistry.cs'
+
+function Get-ToolSourcePath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$RepoRoot)
+    return [pscustomobject]@{
+        Classes  = (Join-Path $RepoRoot $script:ToolClassesRelative)
+        Registry = (Join-Path $RepoRoot $script:ToolRegistryRelative)
+    }
+}
+
+# Every tool name the classification file puts in the allow or the prompt list.
+function Get-ClassifiedToolNames {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ClassesPath)
+    $classes = Read-ToolClasses -Path $ClassesPath
+    return @((Get-ClassList $classes 'allow') + (Get-ClassList $classes 'prompt'))
 }
 
 function New-Violation {
@@ -192,4 +216,4 @@ function Assert-ToolClassification {
         -Fix 'Put every registered tool in exactly one of the allow and prompt lists (literal names only), keep the named exclusions out of allow, and declare every path argument of an allow-listed tool.'
 }
 
-Export-ModuleMember -Function Read-ToolClasses, Get-ClassList, Get-RegisteredToolNames, Get-RegisteredToolParameters, Get-ToolClassificationViolation, Assert-ToolClassification
+Export-ModuleMember -Function Read-ToolClasses, Get-ClassList, Get-ClassifiedToolNames, Get-ToolSourcePath, Get-RegisteredToolNames, Get-RegisteredToolParameters, Get-ToolClassificationViolation, Assert-ToolClassification

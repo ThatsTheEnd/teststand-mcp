@@ -1,12 +1,14 @@
 # ============================================================================
-#  BuildPluginArchive.Tests.ps1 - plain PowerShell asserts for build/Build-PluginArchive.ps1 and
-#  build/PluginArchive.psm1 (plus the child-process helpers of build/BuildCommon.psm1).
+#  BuildPluginArchive.Tests.ps1 - plain PowerShell asserts for build/Build-PluginArchive.ps1 and its
+#  modules: PluginArchive, PluginStaging, PluginSmoke, SkillSources and the child-process and file
+#  helpers of BuildCommon.
 #  Runs under Windows PowerShell 5.1 and PowerShell 7:
 #    powershell.exe -NoProfile -ExecutionPolicy Bypass -File build\tests\BuildPluginArchive.Tests.ps1
 #  Prints PASS/FAIL per case and exits non-zero when any case fails.
 #  Every row of the Gherkin "The script stops with a fix" outline has its own case: the fault is
 #  planted, and the failure text must name the fault (What), say why it matters (Why) and give the
-#  command that fixes it (Fix). Faults that need no publish run on a tiny fake tree, so they are fast.
+#  concrete change that fixes it (Fix). Faults that need no publish run on a tiny fake publish
+#  output and the real repository sources, so they are fast.
 #  The ONE real end-to-end run per layout is opt-in (TESTSTAND_MCP_PACKAGE_E2E=1): it publishes the
 #  real exe (about 180 MB for the folder layout).
 #  ASCII only on purpose: 5.1 reads a BOM-less script as ANSI.
@@ -21,6 +23,7 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $SampleCommit = ('0123456789abcdef' * 2) + '01234567'   # 40 hex characters
 $SampleVersion = '1.9.0'
 $ForeignExe = Join-Path $env:SystemRoot 'System32\cmd.exe'   # an exe whose ProductVersion is not ours
+$ProcessSettleSeconds = 10                                    # BuildCommon waits at most this long for a stopped process to go
 
 . (Join-Path $PSScriptRoot 'TestHarness.ps1')
 $script:TempDirPrefix = 'BuildPluginArchiveTests_'
@@ -33,15 +36,18 @@ function Get-ThrownMessage {
     return $null
 }
 
-# Passes only when the body fails with the three labelled parts and every needle appears in the text.
+# Passes only when the body fails with the three labelled parts, every needle appears in the text
+# and every $Fix needle appears in the Fix part (the last part of the text).
 function Assert-FailsWith {
-    param([scriptblock]$Body, [string[]]$Needles)
+    param([scriptblock]$Body, [string[]]$Needles = @(), [string[]]$Fix = @())
     $text = Get-ThrownMessage $Body
     if ($null -eq $text) { throw 'expected a failure but none was thrown' }
     foreach ($label in @('What', 'Why', 'Fix')) {
         Assert-True ($text -cmatch "(?m)^${label}: +\S") "failure has no '${label}:' line with content. Failure was:`n$text"
     }
     foreach ($needle in $Needles) { Assert-Contains $text $needle 'failure text' }
+    $fixPart = $text.Substring($text.IndexOf("`nFix:", [StringComparison]::Ordinal))
+    foreach ($needle in $Fix) { Assert-Contains $fixPart $needle 'the Fix part' }
 }
 
 function Write-TextFile {
@@ -50,13 +56,75 @@ function Write-TextFile {
     [IO.File]::WriteAllText($Path, $Text, $Utf8NoBom)
 }
 
+# Runs a body with environment variables set (a $null value removes one), then restores them.
+function Use-Environment {
+    param([hashtable]$Values, [scriptblock]$Body)
+    $saved = @{}
+    foreach ($name in $Values.Keys) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
+    try {
+        foreach ($name in $Values.Keys) { [Environment]::SetEnvironmentVariable($name, $Values[$name]) }
+        & $Body
+    } finally {
+        foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
+    }
+}
+
+# Fails when a process with this command-line fragment is still running; stops such leftovers first.
+function Assert-NoProcessWithCommandLine {
+    param([string]$ProgramName, [string]$Fragment)
+    $left = @(Get-CimInstance Win32_Process -Filter "Name='$ProgramName'" | Where-Object { $_.CommandLine -like "*$Fragment*" })
+    foreach ($process in $left) { Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue }
+    Assert-Equal 0 $left.Count "leftover $ProgramName processes with '$Fragment'"
+}
+
+# A .cmd standing in for an exe; $Lines are its batch lines.
+function New-FakeExe {
+    param([string[]]$Lines)
+    $path = Join-Path (New-TempDir) 'TestStandMCP.cmd'
+    [IO.File]::WriteAllText($path, ((@('@echo off') + $Lines) -join "`r`n") + "`r`n", $Utf8NoBom)
+    return $path
+}
+
+function Invoke-Git {
+    param([string]$Directory, [string[]]$Arguments)
+    $result = Invoke-ChildProcess -FilePath 'git' -ArgumentList (@('-C', $Directory) + $Arguments) -TimeoutSeconds 60
+    Assert-Equal 0 $result.ExitCode "git $($Arguments -join ' ') said: $($result.Stdout) $($result.Stderr)"
+}
+
+# A small checkout: the folders and files the packaging reads, copied from this repository, as a git
+# repository with everything added. -Mutate runs on the copy before git sees it; -WithBuild adds build/.
+function New-RepoFixture {
+    param([scriptblock]$Mutate = $null, [switch]$WithBuild)
+    $root = New-TempDir
+    foreach ($relative in @('plugin', '.claude\agents', 'scripts')) {
+        [void](New-Item -ItemType Directory -Path (Split-Path -Parent (Join-Path $root $relative)) -Force)
+        Copy-Item -LiteralPath (Join-Path $RepoRoot $relative) -Destination (Join-Path $root $relative) -Recurse
+    }
+    foreach ($relative in @('CLAUDE.md', 'Program.cs', 'src\Tools\TestStandToolRegistry.cs')) {
+        [void](New-Item -ItemType Directory -Path (Split-Path -Parent (Join-Path $root $relative)) -Force)
+        Copy-Item -LiteralPath (Join-Path $RepoRoot $relative) -Destination (Join-Path $root $relative)
+    }
+    if ($WithBuild) {
+        [void](New-Item -ItemType Directory -Path (Join-Path $root 'build'))
+        Get-ChildItem -LiteralPath $BuildDir -File | Where-Object { $_.Extension -in '.ps1', '.psm1' } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $root 'build') }
+    }
+    if ($null -ne $Mutate) { & $Mutate $root }
+    Invoke-Git $root @('init', '-q')
+    Invoke-Git $root @('add', '-A')
+    return $root
+}
+
 try {
     Import-Module (Join-Path $BuildDir 'BuildCommon.psm1') -Force
     Import-Module (Join-Path $BuildDir 'ReleaseAssets.psm1') -Force
+    Import-Module (Join-Path $BuildDir 'ToolClassification.psm1') -Force
+    Import-Module (Join-Path $BuildDir 'SkillSources.psm1') -Force
+    Import-Module (Join-Path $BuildDir 'PluginStaging.psm1') -Force
     Import-Module (Join-Path $BuildDir 'PluginArchive.psm1') -Force
+    Import-Module (Join-Path $BuildDir 'PluginSmoke.psm1') -Force
 
     # ======================================================================
-    #  Child-process helpers (BuildCommon)
+    #  Child-process and file helpers (BuildCommon)
     # ======================================================================
     Invoke-Case 'child process: arguments with spaces and quotes arrive as single elements' {
         $echo = Join-Path (New-TempDir) 'echo-args.ps1'
@@ -64,8 +132,7 @@ try {
         $result = Invoke-ChildProcess -FilePath $HostPath -TimeoutSeconds 60 -ArgumentList @('-NoProfile', '-File', $echo, 'one two', 'say "hi"')
         Assert-Equal 0 $result.ExitCode 'exit code'
         Assert-Equal '[one two][say "hi"]' $result.Stdout 'both arguments arrive whole'
-        $quoted = ConvertTo-ArgumentElement 'C:\Program Files\x y\'
-        Assert-Equal '"C:\Program Files\x y\\"' $quoted 'a trailing backslash is doubled inside the quotes'
+        Assert-Equal '"C:\Program Files\x y\\"' (ConvertTo-ArgumentElement 'C:\Program Files\x y\') 'a trailing backslash is doubled inside the quotes'
         Assert-Equal 'plain' (ConvertTo-ArgumentElement 'plain') 'plain text stays unquoted'
         Assert-Equal '""' (ConvertTo-ArgumentElement '') 'the empty argument is an empty pair of quotes'
     }
@@ -78,12 +145,66 @@ try {
         Assert-True ($clock.Elapsed.TotalSeconds -lt 60) "the timeout took $($clock.Elapsed.TotalSeconds) s"
     }
 
+    Invoke-Case 'child process: stopping a timed-out wrapper stops the program it started too' {
+        $marker = Get-Random -Minimum 700000 -Maximum 799999
+        $exe = New-FakeExe @("ping -n $marker 127.0.0.1 >nul")
+        try {
+            $result = Invoke-ChildProcess -FilePath $exe -TimeoutSeconds 2
+            Assert-True $result.TimedOut 'the wrapper was not reported as timed out'
+            Assert-NoProcessWithCommandLine 'PING.EXE' "-n $marker "
+        } finally { Assert-NoProcessWithCommandLine 'PING.EXE' "-n $marker " }
+    }
+
     Invoke-Case 'child process: a non-zero exit is reported, not thrown, and stdout and stderr are captured separately' {
         $result = Invoke-ChildProcess -FilePath $HostPath -TimeoutSeconds 60 `
             -ArgumentList @('-NoProfile', '-Command', '[Console]::Out.Write("to-out"); [Console]::Error.Write("to-err"); exit 3')
         Assert-Equal 3 $result.ExitCode 'exit code'
         Assert-Equal 'to-out' $result.Stdout 'stdout'
         Assert-Equal 'to-err' $result.Stderr 'stderr'
+    }
+
+    Invoke-Case 'child process: Invoke-BuildScript runs a script under the same host with its arguments' {
+        $script = Join-Path (New-TempDir) 'args.ps1'
+        Write-TextFile $script 'param($Name); [Console]::Out.Write("hello $Name")'
+        $result = Invoke-BuildScript -ScriptPath $script -ArgumentList @('-Name', 'a b') -TimeoutSeconds 60
+        Assert-Equal 'hello a b' $result.Stdout 'stdout'
+    }
+
+    Invoke-Case 'child process: Assert-ChildOutcome names a timeout, a non-zero exit and carries the output; exit 0 passes' {
+        $ok = [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Stdout = 'fine'; Stderr = '' }
+        Assert-ChildOutcome -Result $ok -Name 'tool' -TimeoutSeconds 5 -Why 'w' -Fix 'f'
+        $failed = [pscustomobject]@{ ExitCode = 4; TimedOut = $false; Stdout = "line1`nline2"; Stderr = 'oops' }
+        Assert-FailsWith { Assert-ChildOutcome -Result $failed -Name 'tool' -TimeoutSeconds 5 -Why 'because' -Fix 'do this' } @('tool failed (exit code 4)', 'line1', 'oops', 'because') -Fix @('do this')
+        $stuck = [pscustomobject]@{ ExitCode = $null; TimedOut = $true; Stdout = ''; Stderr = '' }
+        Assert-FailsWith { Assert-ChildOutcome -Result $stuck -Name 'tool' -TimeoutSeconds 5 -Why 'because' -Fix 'do this' } @('tool did not finish within 5 s and was stopped')
+    }
+
+    Invoke-Case 'child process: Get-OutputExcerpt takes the first or the last non-blank lines' {
+        $text = "a`n`nb`nc`nd"
+        Assert-Equal "a`nb" (Get-OutputExcerpt $text -Mode First -Count 2) 'first two'
+        Assert-Equal "c`nd" (Get-OutputExcerpt $text -Mode Last -Count 2) 'last two'
+        Assert-Equal '(no output)' (Get-OutputExcerpt " `n" ) 'blank text'
+    }
+
+    Invoke-Case 'files: Get-RelativeFileList lists forward-slash names in ordinal order and is empty for a missing folder' {
+        $dir = New-TempDir
+        Write-TextFile (Join-Path $dir 'b.txt') '1'
+        Write-TextFile (Join-Path $dir 'B2.txt') '1'
+        Write-TextFile (Join-Path $dir '.hidden\a.txt') '1'
+        Assert-Equal '.hidden/a.txt,B2.txt,b.txt' ((Get-RelativeFileList $dir) -join ',') 'names'
+        Assert-Equal 0 (Get-RelativeFileList (Join-Path $dir 'missing')).Count 'missing folder'
+    }
+
+    Invoke-Case 'files: a junction below the folder is refused' {
+        $dir = New-TempDir
+        $target = New-TempDir
+        Write-TextFile (Join-Path $target 'outside.txt') 'x'
+        $link = Join-Path $dir 'link'
+        $made = Invoke-ChildProcess -FilePath (Join-Path $env:SystemRoot 'System32\cmd.exe') -ArgumentList @('/c', 'mklink', '/J', $link, $target) -TimeoutSeconds 30
+        Assert-Equal 0 $made.ExitCode "mklink said: $($made.Stdout) $($made.Stderr)"
+        try {
+            Assert-FailsWith { Get-RelativeFileList $dir } @($link, 'junction or symbolic link') -Fix @('rmdir')
+        } finally { [IO.Directory]::Delete($link) }
     }
 
     # ======================================================================
@@ -101,15 +222,13 @@ try {
     }
 
     Invoke-Case 'layout: an unknown layout fails and lists the valid ones' {
-        Assert-FailsWith { Get-ArchiveLayout 'zip-of-doom' } @("Unknown exe layout 'zip-of-doom'", 'folder', 'single-file', 'framework-dependent', '-Layout')
+        Assert-FailsWith { Get-ArchiveLayout 'zip-of-doom' } @("Unknown exe layout 'zip-of-doom'", 'folder', 'single-file', 'framework-dependent') -Fix @('-Layout')
     }
 
     Invoke-Case 'version: X.Y.Z and X.Y.Z-suffix are accepted, anything else is refused with the fix' {
         foreach ($good in @('1.9.0', '0.0.0-ci', '10.20.30', '1.9.0-rc.1')) { Assert-BuildVersion $good }
         foreach ($bad in @('', 'v1.9.0', '1.9', '1.9.0.1', '01.9.0', '1.9.0-', '1.9.0 ', '1.9.0-ci/x')) {
-            $text = Get-ThrownMessage { Assert-BuildVersion $bad }
-            Assert-True ($null -ne $text) "version [$bad] was accepted"
-            Assert-Contains $text 'Fix:' "failure for [$bad]"
+            Assert-FailsWith { Assert-BuildVersion $bad } @() -Fix @('-Version 1.9.0')
         }
     }
 
@@ -121,16 +240,98 @@ try {
     Invoke-Case 'commit: only a full lower-case 40-character SHA is accepted' {
         Assert-BuildCommit $SampleCommit
         foreach ($bad in @('', $SampleCommit.Substring(1), ($SampleCommit + '0'), $SampleCommit.ToUpperInvariant(), ('g' * 40))) {
-            Assert-FailsWith { Assert-BuildCommit $bad } @('40-character', 'git rev-parse HEAD')
+            Assert-FailsWith { Assert-BuildCommit $bad } @('40-character') -Fix @('git rev-parse HEAD')
         }
     }
 
-    Invoke-Case 'tag: v<version> and its rehearsal are accepted, another version is refused' {
+    Invoke-Case 'tag: exactly v<version> and v<version>-rehearsal are accepted' {
         Assert-BuildTag -Tag 'v1.9.0' -Version '1.9.0'
         Assert-BuildTag -Tag 'v1.9.0-rehearsal' -Version '1.9.0'
         Assert-BuildTag -Tag 'v0.0.0-ci' -Version '0.0.0-ci'
-        Assert-FailsWith { Assert-BuildTag -Tag 'v1.8.0' -Version '1.9.0' } @("'v1.8.0'", '1.9.0', '-Tag v1.9.0')
-        Assert-FailsWith { Assert-BuildTag -Tag '' -Version '1.9.0' } @('Fix:')
+    }
+
+    Invoke-Case 'tag: a tag that merely starts with v<version>, or differs in case or length, is refused' {
+        Assert-FailsWith { Assert-BuildTag -Tag 'v1.9.10' -Version '1.9.1' } @("'v1.9.10'", '1.9.1') -Fix @('-Tag v1.9.1')
+        Assert-FailsWith { Assert-BuildTag -Tag 'v1.9.0.1' -Version '1.9.0' } @("'v1.9.0.1'")
+        Assert-FailsWith { Assert-BuildTag -Tag 'V1.9.0' -Version '1.9.0' } @("'V1.9.0'")
+        Assert-FailsWith { Assert-BuildTag -Tag 'v1.9.0-rehearsal2' -Version '1.9.0' } @("'v1.9.0-rehearsal2'")
+        Assert-FailsWith { Assert-BuildTag -Tag 'v1.8.0' -Version '1.9.0' } @("'v1.8.0'", '-Tag v1.9.0')
+        Assert-FailsWith { Assert-BuildTag -Tag '' -Version '1.9.0' } @('does not belong to version 1.9.0')
+    }
+
+    Invoke-Case 'release record: the run is the CI run URL under GitHub Actions and local otherwise' {
+        Use-Environment @{ GITHUB_SERVER_URL = 'https://github.com'; GITHUB_REPOSITORY = 'o/r'; GITHUB_RUN_ID = '42' } {
+            Assert-Equal 'https://github.com/o/r/actions/runs/42' (Get-RunUrl) 'run URL'
+        }
+        Use-Environment @{ GITHUB_SERVER_URL = $null; GITHUB_REPOSITORY = $null; GITHUB_RUN_ID = $null } { Assert-Equal 'local' (Get-RunUrl) 'run outside CI' }
+        Use-Environment @{ GITHUB_SERVER_URL = 'https://github.com'; GITHUB_REPOSITORY = 'o/r'; GITHUB_RUN_ID = $null } { Assert-Equal 'local' (Get-RunUrl) 'a partial CI environment is not a run URL' }
+    }
+
+    Invoke-Case 'release record: New-ReleaseRecord carries the five VERSION.txt values, the build time in UTC ISO-8601' {
+        $record = Use-Environment @{ GITHUB_SERVER_URL = $null; GITHUB_REPOSITORY = $null; GITHUB_RUN_ID = $null } { New-ReleaseRecord -Tag 'v1.9.0' -Version '1.9.0' -Commit $SampleCommit }
+        Assert-Equal 'v1.9.0,1.9.0,local' ("$($record.tag),$($record.version),$($record.run)") 'values'
+        Assert-Equal $SampleCommit $record.commit 'commit'
+        Assert-True ($record.built -cmatch '\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\z') "built was [$($record.built)]"
+    }
+
+    Invoke-Case 'commit time: the timestamp of a commit of this checkout, and a clear fix for one that is not' {
+        $head = (Invoke-ChildProcess -FilePath 'git' -ArgumentList @('-C', $RepoRoot, 'rev-parse', 'HEAD') -TimeoutSeconds 30).Stdout.Trim()
+        Assert-True ((Get-CommitTimestamp -RepoRoot $RepoRoot -Commit $head).Year -ge 2026) 'the commit time of HEAD'
+        Assert-FailsWith { Get-CommitTimestamp -RepoRoot $RepoRoot -Commit $SampleCommit } @("git show $SampleCommit") -Fix @('git rev-parse HEAD')
+    }
+
+    # ======================================================================
+    #  SkillSources: the skill-import rules in one place
+    # ======================================================================
+    function New-SkillFixture {
+        param([string]$ClaudeMd, [string[]]$SkillFiles = @('SKILL.md', 'references/a.md'))
+        $root = New-TempDir
+        Write-TextFile (Join-Path $root 'CLAUDE.md') $ClaudeMd
+        foreach ($name in $SkillFiles) { Write-TextFile (Join-Path $root "plugin\skills\teststand-rules\$name") "---`nname: x`n---`n`n# Text of $name`n" }
+        return $root
+    }
+    $Begin = $ImportsBeginMarker
+    $End = $ImportsEndMarker
+
+    Invoke-Case 'skill imports: the real CLAUDE.md names SKILL.md first and every reference, each below plugin/skills' {
+        $plan = @(Get-SkillImportPlan -RepoRoot $RepoRoot)
+        Assert-Equal 6 $plan.Count 'imports'
+        Assert-Equal 'SKILL.md' (Split-Path -Leaf $plan[0].FullPath) 'first import'
+        foreach ($import in $plan) { Assert-True (Test-Path -LiteralPath $import.FullPath -PathType Leaf) "$($import.FullPath) does not exist" }
+    }
+
+    Invoke-Case 'skill imports: a begin marker on the very first line works, and prose lines in the block are fine' {
+        $root = New-SkillFixture "$Begin`nSome intro without a path.`n`n@plugin/skills/teststand-rules/SKILL.md`n@plugin/skills/teststand-rules/references/a.md`n$End`n"
+        Assert-Equal 'SKILL.md,a.md' ((@(Get-SkillImportPlan -RepoRoot $root) | ForEach-Object { Split-Path -Leaf $_.FullPath }) -join ',') 'plan'
+    }
+
+    Invoke-Case 'fault: an import block line that mentions an @ path but is not a whole-line import' {
+        $root = New-SkillFixture "$Begin`n@plugin/skills/teststand-rules/SKILL.md extra words`n$End`n"
+        Assert-FailsWith { Get-SkillImportPlan -RepoRoot $root } @('not a whole-line import', 'extra words') -Fix @('line of its own')
+        $indented = New-SkillFixture "$Begin`n  @plugin/skills/teststand-rules/SKILL.md`n$End`n"
+        Assert-FailsWith { Get-SkillImportPlan -RepoRoot $indented } @('not a whole-line import')
+    }
+
+    Invoke-Case 'fault: an import that leaves plugin/skills through ".." is refused' {
+        $root = New-SkillFixture "$Begin`n@plugin/skills/../../CLAUDE.md`n$End`n"
+        Assert-FailsWith { Get-SkillImportPlan -RepoRoot $root } @('outside', 'plugin') -Fix @('plugin/skills')
+    }
+
+    Invoke-Case 'fault: an import of a file that does not exist, markers that are missing, and an empty block' {
+        Assert-FailsWith { Get-SkillImportPlan -RepoRoot (New-SkillFixture "$Begin`n@plugin/skills/teststand-rules/gone.md`n$End`n") } @('gone.md', 'does not exist') -Fix @('git checkout')
+        Assert-FailsWith { Get-SkillImportPlan -RepoRoot (New-SkillFixture "# rules`n@plugin/skills/teststand-rules/SKILL.md`n") } @('skill-imports:begin') -Fix @('Test-SkillSources.ps1')
+        Assert-FailsWith { Get-SkillImportPlan -RepoRoot (New-SkillFixture "$Begin`n$End`n") } @('with lines between them')
+        Assert-FailsWith { Get-SkillImportPlan -RepoRoot (New-SkillFixture "$Begin`njust prose`n$End`n") } @('no @ import')
+    }
+
+    Invoke-Case 'skill imports: frontmatter is matched with or without a BOM and inlined text drops it' {
+        $bom = [string][char]0xFEFF
+        Assert-True (Get-FrontmatterMatch "---`nname: x`n---`nbody").Success 'plain frontmatter'
+        Assert-True (Get-FrontmatterMatch "${bom}---`r`nname: x`r`n---`r`nbody").Success 'BOM and CRLF'
+        Assert-True (-not (Get-FrontmatterMatch "no frontmatter`n---`nx`n---`n").Success) 'a fence that is not at the start'
+        $file = Join-Path (New-TempDir) 'a.md'
+        Write-TextFile $file "---`nname: x`n---`n`n# Title`n`nbody`n`n"
+        Assert-Equal "# Title`n`nbody" (Read-SkillFileText $file) 'inlined text'
     }
 
     # ======================================================================
@@ -140,7 +341,7 @@ try {
         $dir = New-TempDir
         $path = Join-Path $dir 'plugin.json'
         Write-TextFile $path "{ `"name`": `"x`", `"version`": `"1.2.3`" }"
-        Assert-FailsWith { Assert-ManifestPlaceholder -ManifestPath $path } @($path, '0 occurrences', '0.0.0', 'git checkout')
+        Assert-FailsWith { Assert-ManifestPlaceholder -ManifestPath $path } @($path, '0 occurrences', '0.0.0') -Fix @('git checkout -- plugin/.claude-plugin/plugin.json')
     }
 
     Invoke-Case 'fault: plugin.json with the placeholder twice is just as wrong' {
@@ -152,16 +353,15 @@ try {
 
     Invoke-Case 'placeholder: the committed manifest carries exactly one, wherever whitespace puts it' {
         Assert-ManifestPlaceholder -ManifestPath (Join-Path $RepoRoot 'plugin\.claude-plugin\plugin.json')
-        $match = Find-VersionPlaceholder -Text '{"version":"0.0.0"}' -Path 'inline'
-        Assert-Equal '"version":"0.0.0"' $match.Value 'compact JSON is found too'
+        Assert-Equal '"version":"0.0.0"' (Find-VersionPlaceholder -Text '{"version":"0.0.0"}' -Path 'inline').Value 'compact JSON is found too'
     }
 
     # ======================================================================
     #  Outline row: the skill source check fails
     # ======================================================================
-    Invoke-Case 'fault: the skill source check fails' {
-        $emptyRepo = New-TempDir
-        Assert-FailsWith { Assert-SkillSources -RepoRoot $emptyRepo } @('Test-SkillSources.ps1', 'FAIL', 'teststand-rules skill')
+    Invoke-Case 'fault: the skill source check fails because a moved heading is back in CLAUDE.md' {
+        $root = New-RepoFixture -Mutate { param($r) [IO.File]::AppendAllText((Join-Path $r 'CLAUDE.md'), "`n## Sequence Design Rules`n") }
+        Assert-FailsWith { Assert-SkillSources -RepoRoot $root } @('Test-SkillSources.ps1', 'FAIL', 'moved heading still present', 'Sequence Design Rules') -Fix @('Test-SkillSources.ps1', 'package again')
     }
 
     Invoke-Case 'skill sources: the real repository passes the check' {
@@ -177,11 +377,12 @@ try {
         $classes = Join-Path $dir 'tool-classes.json'
         Write-TextFile $registry "Register(`"get_a`", `"a`")`nRegister(`"set_new_tool`", `"b`")`n"
         Write-TextFile $classes '{ "allow": ["get_a"], "prompt": [] }'
-        Assert-FailsWith { Assert-AllToolsClassified -ClassesPath $classes -RegistryPath $registry } @('E_UNCLASSIFIED', 'set_new_tool', $classes)
+        Assert-FailsWith { Assert-AllToolsClassified -ClassesPath $classes -RegistryPath $registry } @('E_UNCLASSIFIED', 'set_new_tool', $classes) -Fix @('allow and prompt lists')
     }
 
     Invoke-Case 'classification: the real registry and the committed classification agree' {
-        Assert-AllToolsClassified -ClassesPath (Join-Path $RepoRoot 'plugin\hooks\tool-classes.json') -RegistryPath (Join-Path $RepoRoot 'src\Tools\TestStandToolRegistry.cs')
+        $tools = Get-ToolSourcePath -RepoRoot $RepoRoot
+        Assert-AllToolsClassified -ClassesPath $tools.Classes -RegistryPath $tools.Registry
     }
 
     # ======================================================================
@@ -189,31 +390,29 @@ try {
     # ======================================================================
     Invoke-Case 'fault: the published exe does not report the requested version' {
         Assert-FailsWith { Assert-PublishedVersion -ExePath $ForeignExe -Version $SampleVersion -Commit $SampleCommit } `
-            @('ProductVersion', $SampleVersion, $SampleCommit, 'Directory.Build.props')
+            @('ProductVersion', $SampleVersion, $SampleCommit) -Fix @('Directory.Build.props')
     }
 
-    # ======================================================================
-    #  Publish
-    # ======================================================================
     Invoke-Case 'publish: a failing dotnet publish is reported with its output and the command to reproduce it' {
         $emptyRepo = New-TempDir
         $publishDir = Join-Path (New-TempDir) 'publish'
         Assert-FailsWith { Publish-PluginExe -RepoRoot $emptyRepo -Layout 'folder' -Version $SampleVersion -Commit $SampleCommit -PublishDir $publishDir } `
-            @('dotnet publish failed', 'exit code', 'dotnet publish TestStandMCP.csproj')
+            @('dotnet publish failed', 'exit code') -Fix @('dotnet publish TestStandMCP.csproj')
     }
 
     # ======================================================================
     #  Staging: a tiny fake publish output, the real repository sources
     # ======================================================================
     $Release = @{ tag = "v$SampleVersion"; version = $SampleVersion; commit = $SampleCommit; built = '2026-10-24T12:00:00Z'; run = 'local' }
+    $FolderLayout = Get-ArchiveLayout 'folder'
 
     # What dotnet publish leaves: the exe and runtime files, plus the files the csproj copies into every
     # output (CLAUDE.md, README.md, scripts, .claude) that the archive must take from the repository instead.
     function New-FakePublishDir {
         param([string[]]$Without = @(), [string[]]$Extra = @())
         $dir = New-TempDir
-        $files = @('TestStandMCP.exe', 'appsettings.json', 'TestStandMCP.runtimeconfig.json', 'coreclr.dll', 'Other.dll',
-            'CLAUDE.md', 'README.md', 'scripts/Test-LoadPrototype.ps1', '.claude/agents/stale-publish-agent.md') + $Extra
+        $files = @('TestStandMCP.exe', 'appsettings.json', 'TestStandMCP.runtimeconfig.json', 'coreclr.dll', 'Other.dll', 'TestStandMCP.pdb',
+            'CLAUDE.md', 'README.md', 'scripts/Test-LoadPrototype.ps1', '.claude/agents/stale-publish-agent.md', 'cs/Resource.dll') + $Extra
         foreach ($name in $files) {
             if ($Without -contains $name) { continue }
             Write-TextFile (Join-Path $dir $name) "fake $name"
@@ -222,43 +421,58 @@ try {
     }
 
     function New-StageFrom {
-        param([string]$PublishDir, [string]$Layout = 'folder', [hashtable]$ReleaseRecord = $Release)
+        param([string]$PublishDir, $Layout = $FolderLayout, [string]$Root = $RepoRoot)
         $stage = Join-Path (New-TempDir) 'stage'
-        New-StagedPlugin -RepoRoot $RepoRoot -PublishDir $PublishDir -StageDir $stage -Layout $Layout -Release $ReleaseRecord
+        New-StagedPlugin -RepoRoot $Root -PublishDir $PublishDir -StageDir $stage -Layout $Layout -Release $Release
         return $stage
     }
 
     # One staged tree is built once; every fault case works on its own copy.
-    $script:StagedTemplate = $null
+    $script:TemplateStage = $null
+    $script:TemplatePublish = $null
     function New-StagedCopy {
-        if ($null -eq $script:StagedTemplate) { $script:StagedTemplate = New-StageFrom -PublishDir (New-FakePublishDir) }
+        if ($null -eq $script:TemplateStage) {
+            $script:TemplatePublish = New-FakePublishDir
+            $script:TemplateStage = New-StageFrom -PublishDir $script:TemplatePublish
+        }
         $copy = Join-Path (New-TempDir) 'stage'
-        Copy-Item -LiteralPath $script:StagedTemplate -Destination $copy -Recurse
+        Copy-Item -LiteralPath $script:TemplateStage -Destination $copy -Recurse
         return $copy
     }
 
     function Assert-StageFault {
-        param([scriptblock]$Plant, [string[]]$Needles, [string]$Layout = 'folder')
+        param([scriptblock]$Plant, [string[]]$Needles, [string[]]$Fix = @(), $Layout = $FolderLayout)
         $stage = New-StagedCopy
         & $Plant $stage
-        Assert-FailsWith { Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -Layout $Layout -Release $Release } $Needles
+        Assert-FailsWith { Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -PublishDir $script:TemplatePublish -Layout $Layout -Release $Release } $Needles -Fix $Fix
     }
 
     Invoke-Case 'staging: the staged tree matches the layout of spec AC-4 and passes every assertion' {
         $stage = New-StagedCopy
-        Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -Layout 'folder' -Release $Release
-        $files = Get-FileSet $stage
+        Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -PublishDir $script:TemplatePublish -Layout $FolderLayout -Release $Release
+        $files = Get-RelativeFileList $stage
         foreach ($required in @('.claude-plugin/plugin.json', '.mcp.json', 'VERSION.txt', 'skills/teststand-rules/SKILL.md', 'hooks/hooks.json',
-                'bin/TestStandMCP.exe', 'bin/appsettings.json', 'bin/TestStandMCP.runtimeconfig.json', 'bin/CLAUDE.md')) {
+                'bin/TestStandMCP.exe', 'bin/appsettings.json', 'bin/TestStandMCP.runtimeconfig.json', 'bin/CLAUDE.md', 'bin/cs/Resource.dll')) {
             Assert-True ($files -ccontains $required) "the staged tree has no $required"
         }
         Assert-Equal 0 @($files | Where-Object { $_ -like 'build/*' -or $_ -like '*/build/*' }).Count 'files from build/'
         Assert-True ($files -cnotcontains 'bin/README.md') 'the publish output''s README.md must not be staged'
+        Assert-True ($files -cnotcontains 'bin/TestStandMCP.pdb') 'debug symbols are not staged'
         Assert-True ($files -cnotcontains 'bin/.claude/agents/stale-publish-agent.md') 'bin/.claude/agents comes from the repository, not the publish output'
     }
 
+    Invoke-Case 'staging: only git-tracked plugin files are staged' {
+        $tracked = @((Invoke-ChildProcess -FilePath 'git' -ArgumentList @('-C', $RepoRoot, 'ls-files', '-z', '--', 'plugin') -TimeoutSeconds 30).Stdout -split "`0" | Where-Object { $_ })
+        $files = Get-RelativeFileList (New-StagedCopy)
+        foreach ($name in $tracked) {
+            $relative = $name.Substring('plugin/'.Length)
+            if ($relative -ceq '.claude-plugin/plugin.json') { continue }
+            Assert-True ($files -ccontains $relative) "tracked plugin file $relative was not staged"
+        }
+    }
+
     Invoke-Case 'staging: bin/scripts holds exactly the two generators and the template, hooks exactly the runtime hook files' {
-        $files = Get-FileSet (New-StagedCopy)
+        $files = Get-RelativeFileList (New-StagedCopy)
         Assert-Equal 'generate_teststand_doc.py,generate_teststand_presentation.py,presentation_template.html' ((@($files | Where-Object { $_ -like 'bin/scripts/*' } | ForEach-Object { $_.Substring('bin/scripts/'.Length) })) -join ',') 'bin/scripts'
         Assert-Equal 'allow-readonly.ps1,hook-common.ps1,hooks.json,platform-guard.ps1,tool-classes.json,update-notify.ps1' ((@($files | Where-Object { $_ -like 'hooks/*' } | ForEach-Object { $_.Substring('hooks/'.Length) })) -join ',') 'hooks'
     }
@@ -267,7 +481,7 @@ try {
         $stage = New-StagedCopy
         $sources = @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot '.claude\agents') -File -Filter '*.md')
         Assert-True ($sources.Count -ge 3) 'the repository should have its agents'
-        Assert-Equal $sources.Count (Get-FileSet (Join-Path $stage 'agents')).Count 'plugin agent count'
+        Assert-Equal $sources.Count (Get-RelativeFileList (Join-Path $stage 'agents')).Count 'plugin agent count'
         foreach ($source in $sources) {
             $plugin = [IO.File]::ReadAllText((Join-Path $stage "agents\$($source.Name)"))
             Assert-NotContains $plugin 'mcp__teststand__' "plugin agent $($source.Name)"
@@ -310,45 +524,99 @@ try {
         Assert-Equal "tag: v1.9.0`nversion: 1.9.0`ncommit: $SampleCommit`nbuilt: 2026-10-24T12:00:00Z`nrun: local`n" $text 'VERSION.txt'
     }
 
-    Invoke-Case 'staging: bin/CLAUDE.md inlines the skill without its frontmatter and keeps the developer sections' {
+    Invoke-Case 'staging: bin/CLAUDE.md is the user rules only: a header, then the skill files in the import order, no developer section' {
         $text = [IO.File]::ReadAllText((Join-Path (New-StagedCopy) 'bin\CLAUDE.md'))
-        Assert-Contains $text '# TestStand rules' 'the skill heading'
-        Assert-Contains $text '## Never do' 'the skill body'
-        Assert-Contains $text '# Rebuilding, migrating and cloning sequence files' 'a references file'
-        Assert-Contains $text '## Developer notes behind the imported rules' 'the developer sections stay'
-        Assert-NotContains $text 'skill-imports' 'the swapped markers'
+        Assert-Equal $text (New-ClaudeMdText -RepoRoot $RepoRoot) 'bin/CLAUDE.md equals a fresh generation'
+        Assert-True ($text.StartsWith('# TestStand MCP rules', [StringComparison]::Ordinal)) 'the header line comes first'
+        $positions = @('# TestStand rules', '# Rebuilding, migrating and cloning sequence files', '# Sequence design rules', '# The TestStand agents', '# Headless behaviour and tool rules', '# Tool contracts') | ForEach-Object { $text.IndexOf($_, [StringComparison]::Ordinal) }
+        Assert-True (@($positions | Where-Object { $_ -lt 0 }).Count -eq 0) "a skill file is missing: $($positions -join ',')"
+        Assert-Equal ((@($positions | Sort-Object)) -join ',') ($positions -join ',') 'the skill files follow the CLAUDE.md import order'
+        Assert-NotContains $text 'skill-imports' 'the import markers'
         Assert-NotContains $text 'name: teststand-rules' 'the skill frontmatter'
-        Assert-True ($text -cnotmatch '(?m)^@plugin/') 'an import is left'
+        # No heading that CLAUDE.md keeps outside its import block (the developer sections) may be in it.
+        $claudeLines = [IO.File]::ReadAllText((Join-Path $RepoRoot 'CLAUDE.md')) -split '\r?\n'
+        $endLine = [Array]::IndexOf($claudeLines, $ImportsEndMarker)
+        $developerHeadings = @($claudeLines[($endLine + 1)..($claudeLines.Count - 1)] | Where-Object { $_ -cmatch '^#{1,3} \S' })
+        Assert-True ($developerHeadings.Count -gt 5) 'CLAUDE.md should still have its developer sections'
+        $textLines = $text -split '\r?\n'
+        foreach ($heading in $developerHeadings) { Assert-True ($textLines -cnotcontains $heading) "developer heading in bin/CLAUDE.md: $heading" }
     }
 
     Invoke-Case 'staging: another exe layout is built and asserted with its own table row' {
-        $stage = New-StageFrom -PublishDir (New-FakePublishDir -Without @('coreclr.dll')) -Layout 'framework-dependent'
-        Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -Layout 'framework-dependent' -Release $Release
-        $single = New-StageFrom -PublishDir (New-FakePublishDir -Without @('coreclr.dll', 'TestStandMCP.runtimeconfig.json')) -Layout 'single-file'
-        Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $single -Layout 'single-file' -Release $Release
+        $framework = Get-ArchiveLayout 'framework-dependent'
+        $publish = New-FakePublishDir -Without @('coreclr.dll')
+        $stage = New-StageFrom -PublishDir $publish -Layout $framework
+        Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -PublishDir $publish -Layout $framework -Release $Release
+        $single = Get-ArchiveLayout 'single-file'
+        $singlePublish = New-FakePublishDir -Without @('coreclr.dll', 'TestStandMCP.runtimeconfig.json')
+        $singleStage = New-StageFrom -PublishDir $singlePublish -Layout $single
+        Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $singleStage -PublishDir $singlePublish -Layout $single -Release $Release
+    }
+
+    Invoke-Case 'staging: Select-StagedFile honours top-level excludes, wildcards and the only-list' {
+        $names = @('a.dll', 'x.pdb', 'sub/y.pdb', 'scripts/s.ps1', 'keep/k.txt')
+        Assert-Equal 'a.dll,keep/k.txt' ((Select-StagedFile -Names $names -Exclude @('scripts') -ExcludePattern @('*.pdb')) -join ',') 'excluded'
+        Assert-Equal 'a.dll' ((Select-StagedFile -Names $names -Only @('a.dll', 'missing.txt')) -join ',') 'only'
+    }
+
+    Invoke-Case 'drift: every top-level item the csproj copies to the output is excluded from bin/ or required in it' {
+        $bin = @(Get-StagingTable -RepoRoot $RepoRoot -Layout $FolderLayout -PublishDir $script:TemplatePublish | Where-Object { $_.Path -ceq 'bin' })[0]
+        $handled = @($bin.Exclude) + @($bin.Required)
+        function Get-UnhandledOutputItem {
+            param([string]$ProjectText)
+            $items = [regex]::Matches($ProjectText, '(?s)<(?:None|Content)\s+(?:Include|Update)="([^"]+)"[^>]*?CopyToOutputDirectory')
+            return @($items | ForEach-Object { ($_.Groups[1].Value -split '[\\/]')[0] } | Sort-Object -Unique | Where-Object { $handled -cnotcontains $_ })
+        }
+        $project = [IO.File]::ReadAllText((Join-Path $RepoRoot 'TestStandMCP.csproj'))
+        Assert-True ([regex]::Matches($project, 'CopyToOutputDirectory').Count -ge 4) 'the csproj should copy items to the output'
+        Assert-Equal 0 (Get-UnhandledOutputItem $project).Count "csproj output items the staging table does not handle: $((Get-UnhandledOutputItem $project) -join ', ')"
+        Assert-Equal 'extras' ((Get-UnhandledOutputItem '<None Include="extras\**\*" CopyToOutputDirectory="PreserveNewest" />') -join ',') 'the drift check sees a new item'
     }
 
     # ---- the Outline rows of slice 5.2, one fixture each ------------------
     Invoke-Case 'fault: a required staged file is missing' {
-        Assert-StageFault { param($stage) Remove-Item -LiteralPath (Join-Path $stage '.mcp.json') } @('missing .mcp.json', 'archive root', 'Fix:')
+        Assert-StageFault { param($stage) Remove-Item -LiteralPath (Join-Path $stage 'bin\appsettings.json') } @('missing appsettings.json', 'bin/') -Fix @('layout table', 'build\PluginArchive.psm1')
+        Assert-StageFault { param($stage) Remove-Item -LiteralPath (Join-Path $stage '.mcp.json') } @('top-level', '.mcp.json') -Fix @()
+    }
+
+    Invoke-Case 'fault: the generated plugin.json or VERSION.txt file is missing' {
+        Assert-StageFault { param($stage) Remove-Item -LiteralPath (Join-Path $stage 'VERSION.txt') } @('missing VERSION.txt') -Fix @('Write-VersionTxt')
+        Assert-StageFault { param($stage) Remove-Item -LiteralPath (Join-Path $stage '.claude-plugin\plugin.json') } @('missing .claude-plugin/plugin.json') -Fix @('Write-StampedManifest')
     }
 
     Invoke-Case 'fault: the exe layout needs a runtime file the publish did not produce' {
-        $stage = New-StageFrom -PublishDir (New-FakePublishDir -Without @('coreclr.dll'))
-        Assert-FailsWith { Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -Layout 'folder' -Release $Release } @('missing coreclr.dll', 'bin/', "'folder'")
+        $publish = New-FakePublishDir -Without @('coreclr.dll')
+        $stage = New-StageFrom -PublishDir $publish
+        Assert-FailsWith { Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -PublishDir $publish -Layout $FolderLayout -Release $Release } @('missing coreclr.dll', 'bin/') -Fix @('layout table')
     }
 
     Invoke-Case 'fault: a file of another exe layout is staged' {
-        $stage = New-StageFrom -PublishDir (New-FakePublishDir) -Layout 'framework-dependent'
-        Assert-FailsWith { Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -Layout 'framework-dependent' -Release $Release } @('coreclr.dll', 'another exe layout')
+        $framework = Get-ArchiveLayout 'framework-dependent'
+        $publish = New-FakePublishDir
+        $stage = New-StageFrom -PublishDir $publish -Layout $framework
+        Assert-FailsWith { Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -PublishDir $publish -Layout $framework -Release $Release } @('coreclr.dll', 'must not ship')
+    }
+
+    Invoke-Case 'fault: a build script, a README, debug symbols or an unlisted file sits in bin/' {
+        foreach ($case in @(
+            @{ Plant = { param($s) Write-TextFile (Join-Path $s 'bin\build\x.ps1') 'x' }; Needle = 'build/x.ps1' }
+            @{ Plant = { param($s) Write-TextFile (Join-Path $s 'bin\README.md') 'x' }; Needle = 'README.md' }
+            @{ Plant = { param($s) Write-TextFile (Join-Path $s 'bin\TestStandMCP.pdb') 'x' }; Needle = 'TestStandMCP.pdb' }
+            @{ Plant = { param($s) Write-TextFile (Join-Path $s 'bin\zzz-unlisted.dll') 'x' }; Needle = 'zzz-unlisted.dll' }
+        )) {
+            Assert-StageFault $case.Plant @($case.Needle) -Fix @('csproj')
+        }
+    }
+
+    Invoke-Case 'fault: an unexpected file at the archive root' {
+        Assert-StageFault { param($stage) Write-TextFile (Join-Path $stage 'stray.txt') 'x' } @('top-level entries that nothing stages', 'stray.txt') -Fix @('Get-StagingTable')
     }
 
     Invoke-Case 'fault: a converted agent still contains mcp__teststand__' {
         Assert-StageFault {
             param($stage)
-            $path = Join-Path $stage 'agents\teststand-doc-generator.md'
-            [IO.File]::AppendAllText($path, "`ncall mcp__teststand__connect_engine`n")
-        } @('agents/teststand-doc-generator.md', "'mcp__teststand__'", 'Get-AgentMappingTable')
+            [IO.File]::AppendAllText((Join-Path $stage 'agents\teststand-doc-generator.md'), "`ncall mcp__teststand__connect_engine`n")
+        } @('agents/teststand-doc-generator.md', "'mcp__teststand__'") -Fix @('Get-AgentMappingTable')
     }
 
     Invoke-Case 'fault: a converted agent names CLAUDE.md in any case' {
@@ -362,28 +630,38 @@ try {
         Assert-StageFault {
             param($stage)
             Remove-Item -LiteralPath (Join-Path $stage 'agents\teststand-doc-generator.md')
-        } @('agents/ holds 2 file(s) but exactly 3 are expected', 'missing: teststand-doc-generator.md', 'one converted agent per source agent')
+        } @('agents/ holds 2 file(s) but exactly 3 are expected', 'missing: teststand-doc-generator.md', 'one converted agent per source agent') -Fix @('.claude/agents', 'Write-PluginAgents')
     }
 
     Invoke-Case 'fault: bin/scripts holds a file outside its expected set' {
         Assert-StageFault {
             param($stage)
             Copy-Item -LiteralPath (Join-Path $RepoRoot 'scripts\Test-LoadPrototype.ps1') -Destination (Join-Path $stage 'bin\scripts')
-        } @('bin/scripts/ holds 4 file(s) but exactly 3 are expected', 'unexpected: Test-LoadPrototype.ps1', 'maintainer script')
+        } @('bin/scripts/ holds 4 file(s) but exactly 3 are expected', 'unexpected: Test-LoadPrototype.ps1', 'maintainer script') -Fix @('DocScriptFiles')
     }
 
     Invoke-Case 'fault: hooks/ holds a file that is not a runtime hook' {
         Assert-StageFault {
             param($stage)
             Write-TextFile (Join-Path $stage 'hooks\AllowHook.Tests.ps1') 'test'
-        } @('hooks/ holds 7 file(s)', 'unexpected: AllowHook.Tests.ps1')
+        } @('hooks/ holds 7 file(s)', 'unexpected: AllowHook.Tests.ps1') -Fix @('HookFiles', 'plugin/hooks')
     }
 
     Invoke-Case 'fault: bin/CLAUDE.md still contains an unresolved import' {
         Assert-StageFault {
             param($stage)
             [IO.File]::AppendAllText((Join-Path $stage 'bin\CLAUDE.md'), "`n@plugin/skills/teststand-rules/references/gone.md`n")
-        } @('unresolved import', '@plugin/skills/teststand-rules/references/gone.md')
+        } @('unresolved import', '@plugin/skills/teststand-rules/references/gone.md') -Fix @('New-ClaudeMdText')
+    }
+
+    Invoke-Case 'fault: bin/CLAUDE.md differs from a fresh generation by one extra line, one edit or one dropped file' {
+        Assert-StageFault { param($stage) [IO.File]::AppendAllText((Join-Path $stage 'bin\CLAUDE.md'), "`n## Developer notes`n") } @('not what the skill files generate', 'line') -Fix @('Never edit bin/CLAUDE.md')
+        Assert-StageFault {
+            param($stage)
+            $path = Join-Path $stage 'bin\CLAUDE.md'
+            [IO.File]::WriteAllText($path, ([IO.File]::ReadAllText($path).Replace('## Never do', '## Never do (edited)')))
+        } @('expected', 'edited')
+        Assert-StageFault { param($stage) [IO.File]::WriteAllText((Join-Path $stage 'bin\CLAUDE.md'), "# TestStand MCP rules`n") } @('not what the skill files generate')
     }
 
     Invoke-Case 'fault: VERSION.txt lacks one of tag, version, commit, built, run' {
@@ -393,7 +671,7 @@ try {
                 $path = Join-Path $stage 'VERSION.txt'
                 $kept = @([IO.File]::ReadAllLines($path) | Where-Object { -not $_.StartsWith("${key}:") })
                 [IO.File]::WriteAllText($path, (($kept -join "`n") + "`n"))
-            } @("VERSION.txt lacks $key")
+            } @("VERSION.txt lacks $key") -Fix @('Write-VersionTxt', 'Never edit VERSION.txt')
         }
     }
 
@@ -406,51 +684,73 @@ try {
             param($stage)
             $path = Join-Path $stage '.claude-plugin\plugin.json'
             [IO.File]::WriteAllText($path, ([IO.File]::ReadAllText($path).Replace('"license": "MIT"', '"license": "GPL"')))
-        } @('not the source with only', 'unreviewed change')
+        } @('not the source with only', 'unreviewed change') -Fix @('plugin/.claude-plugin/plugin.json')
     }
 
     Invoke-Case 'fault: a direct agent was changed after copying' {
         Assert-StageFault {
             param($stage)
             [IO.File]::AppendAllText((Join-Path $stage 'bin\.claude\agents\teststand-doc-generator.md'), 'x')
-        } @('bin/.claude/agents/teststand-doc-generator.md', 'differs from')
+        } @('bin/.claude/agents/teststand-doc-generator.md', 'differs from') -Fix @('git checkout -- .claude/agents')
     }
 
-    Invoke-Case 'fault: CLAUDE.md without its import markers cannot be resolved' {
-        $fixtureRepo = New-TempDir
-        Write-TextFile (Join-Path $fixtureRepo 'CLAUDE.md') "# rules`n@plugin/skills/teststand-rules/SKILL.md`n"
-        Assert-FailsWith { ConvertTo-ResolvedClaudeMd -RepoRoot $fixtureRepo } @('skill-imports:begin', 'Test-SkillSources.ps1')
+    Invoke-Case 'fault: link-agents.bat is missing next to the direct agents' {
+        Assert-StageFault { param($stage) Remove-Item -LiteralPath (Join-Path $stage 'bin\.claude\agents\link-agents.bat') } @('missing link-agents.bat', 'bin/.claude/agents/')
     }
 
-    Invoke-Case 'fault: CLAUDE.md imports a file that does not exist' {
-        $fixtureRepo = New-TempDir
-        Write-TextFile (Join-Path $fixtureRepo 'CLAUDE.md') "# rules`n<!-- skill-imports:begin -->`n@plugin/missing.md`n<!-- skill-imports:end -->`n"
-        Assert-FailsWith { ConvertTo-ResolvedClaudeMd -RepoRoot $fixtureRepo } @('@plugin/missing.md', 'does not exist')
+    Invoke-Case 'fault: a junction inside the staged tree is refused' {
+        $stage = New-StagedCopy
+        $target = New-TempDir
+        Write-TextFile (Join-Path $target 'outside.txt') 'x'
+        $link = Join-Path $stage 'hooks\link'
+        $made = Invoke-ChildProcess -FilePath (Join-Path $env:SystemRoot 'System32\cmd.exe') -ArgumentList @('/c', 'mklink', '/J', $link, $target) -TimeoutSeconds 30
+        Assert-Equal 0 $made.ExitCode 'mklink'
+        try {
+            Assert-FailsWith { Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -PublishDir $script:TemplatePublish -Layout $FolderLayout -Release $Release } @('junction or symbolic link')
+        } finally { [IO.Directory]::Delete($link) }
+    }
+
+    Invoke-Case 'fault: an untracked or an ignored file below plugin/ stops the staging' {
+        $untracked = New-RepoFixture
+        Write-TextFile (Join-Path $untracked 'plugin\hooks\scratch.ps1') 'x'
+        Assert-FailsWith { New-StageFrom -PublishDir (New-FakePublishDir) -Root $untracked } @('plugin holds 1 file(s) git does not track', 'scratch.ps1') -Fix @('git add plugin')
+        $ignored = New-RepoFixture -Mutate { param($r) Write-TextFile (Join-Path $r '.gitignore') "*.log`n" }
+        Write-TextFile (Join-Path $ignored 'plugin\debug.log') 'x'
+        Assert-FailsWith { New-StageFrom -PublishDir (New-FakePublishDir) -Root $ignored } @('debug.log')
+    }
+
+    Invoke-Case 'staging: a tracked fixture repository stages cleanly and ignores nothing tracked' {
+        $root = New-RepoFixture
+        $publish = New-FakePublishDir
+        $stage = New-StageFrom -PublishDir $publish -Root $root
+        Assert-StagedPlugin -RepoRoot $root -StageDir $stage -PublishDir $publish -Layout $FolderLayout -Release $Release
+    }
+
+    Invoke-Case 'fault: CLAUDE.md without its import markers cannot generate bin/CLAUDE.md' {
+        $root = New-SkillFixture "# rules`n@plugin/skills/teststand-rules/SKILL.md`n"
+        Assert-FailsWith { New-ClaudeMdText -RepoRoot $root } @('skill-imports:begin') -Fix @('Test-SkillSources.ps1')
     }
 
     Invoke-Case 'staging: an agent that does not convert is reported with its file name' {
-        $fixtureRepo = New-TempDir
-        Copy-Item -LiteralPath (Join-Path $RepoRoot 'plugin') -Destination (Join-Path $fixtureRepo 'plugin') -Recurse
-        Write-TextFile (Join-Path $fixtureRepo '.claude\agents\broken.md') "---`nname: broken`n---`nno tools line`n"
-        Copy-Item -LiteralPath (Join-Path $RepoRoot 'CLAUDE.md') -Destination $fixtureRepo
-        Copy-Item -LiteralPath (Join-Path $RepoRoot 'scripts') -Destination (Join-Path $fixtureRepo 'scripts') -Recurse
-        Assert-FailsWith { New-StagedPlugin -RepoRoot $fixtureRepo -PublishDir (New-FakePublishDir) -StageDir (Join-Path (New-TempDir) 'stage') -Layout 'folder' -Release $Release } `
-            @('broken.md', "no 'tools:' line", 'build/PluginIdentity.psm1')
+        $root = New-RepoFixture -Mutate { param($r) Write-TextFile (Join-Path $r '.claude\agents\broken.md') "---`nname: broken`n---`nno tools line`n" }
+        Assert-FailsWith { New-StageFrom -PublishDir (New-FakePublishDir) -Root $root } @('broken.md', "no 'tools:' line") -Fix @('build\PluginIdentity.psm1')
+    }
+
+    # ---- the staged tree is frozen between its assertion and the zip --------
+    Invoke-Case 'snapshot: an unchanged stage passes, an added, a changed or a removed file fails naming it' {
+        $stage = New-StagedCopy
+        $snapshot = Get-StageSnapshot -StageDir $stage
+        Assert-StageUnchanged -StageDir $stage -Snapshot $snapshot
+        Write-TextFile (Join-Path $stage 'bin\written-by-the-smoke-run.log') 'x'
+        Assert-FailsWith { Assert-StageUnchanged -StageDir $stage -Snapshot $snapshot } @('changed after it was asserted', 'written-by-the-smoke-run.log') -Fix @('stage folder')
+        Remove-Item -LiteralPath (Join-Path $stage 'bin\written-by-the-smoke-run.log')
+        [IO.File]::AppendAllText((Join-Path $stage 'hooks\hooks.json'), ' ')
+        Assert-FailsWith { Assert-StageUnchanged -StageDir $stage -Snapshot $snapshot } @('hooks/hooks.json')
     }
 
     # ======================================================================
     #  Smoke tests of the staged exe (PluginSmoke): fake exes are .cmd files
     # ======================================================================
-    Import-Module (Join-Path $BuildDir 'PluginSmoke.psm1') -Force
-
-    # A .cmd standing in for the exe; $Lines are its batch lines.
-    function New-FakeExe {
-        param([string[]]$Lines)
-        $path = Join-Path (New-TempDir) 'TestStandMCP.cmd'
-        [IO.File]::WriteAllText($path, ((@('@echo off') + $Lines) -join "`r`n") + "`r`n", $Utf8NoBom)
-        return $path
-    }
-
     $VersionLines = @('echo TestStand MCP Server 1.9.0', 'echo   tag:     v1.9.0', "echo   commit:  $SampleCommit", 'echo   built:   2026-10-24T12:00:00Z', 'echo   run:     local')
 
     Invoke-Case 'smoke --version: the version, the tag and the commit on stdout with exit 0 pass' {
@@ -459,7 +759,7 @@ try {
 
     Invoke-Case 'fault: --version names another version' {
         $exe = New-FakeExe (@('echo TestStand MCP Server 1.8.0') + $VersionLines[1..4])
-        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @("its first line ends with '1.8.0', not '1.9.0'", '--version output is wrong', 'VERSION.txt')
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @("its first line ends with '1.8.0', not '1.9.0'", '--version output is wrong') -Fix @('VERSION.txt')
     }
 
     Invoke-Case 'fault: --version lacks the tag (an untagged or unreadable VERSION.txt)' {
@@ -474,7 +774,7 @@ try {
 
     Invoke-Case 'fault: --version exits non-zero' {
         $exe = New-FakeExe @('echo broken', 'exit /b 3')
-        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @('exited with code 3', 'broken', 'Run it by hand')
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @('failed (exit code 3)', 'broken') -Fix @('Run it by hand')
     }
 
     # tool list: a classification of get_a, get_b (allow) and set_c (prompt) over a three-tool registry
@@ -487,21 +787,24 @@ try {
 
     Invoke-Case 'smoke --list-tools: exactly the classified tools, in any order, pass' {
         $fixture = New-ToolListFixture
-        $exe = New-FakeExe @('echo ["set_c","get_a","get_b"]')
-        Assert-ToolList -ExePath $exe -ClassesPath $fixture.Classes -RegistryPath $fixture.Registry
+        Assert-ToolList -ExePath (New-FakeExe @('echo ["set_c","get_a","get_b"]')) -ClassesPath $fixture.Classes -RegistryPath $fixture.Registry
     }
 
     Invoke-Case 'fault: the exe lists a tool that is not classified, and a classified one is missing' {
         $fixture = New-ToolListFixture
-        $exe = New-FakeExe @('echo ["get_a","get_b","rogue_tool"]')
-        Assert-FailsWith { Assert-ToolList -ExePath $exe -ClassesPath $fixture.Classes -RegistryPath $fixture.Registry } `
-            @('listed by the exe but not classified: rogue_tool', 'classified but not listed by the exe: set_c', 'tool-classes.json')
+        Assert-FailsWith { Assert-ToolList -ExePath (New-FakeExe @('echo ["get_a","get_b","rogue_tool"]')) -ClassesPath $fixture.Classes -RegistryPath $fixture.Registry } `
+            @('listed by the exe but not classified: rogue_tool', 'classified but not listed by the exe: set_c', 'tool-classes.json') -Fix @('allow and prompt lists')
+    }
+
+    Invoke-Case 'fault: the exe lists a tool twice, so its count differs from the registry' {
+        $fixture = New-ToolListFixture
+        Assert-FailsWith { Assert-ToolList -ExePath (New-FakeExe @('echo ["get_a","get_a","get_b","set_c"]')) -ClassesPath $fixture.Classes -RegistryPath $fixture.Registry } `
+            @('the exe lists 4 tools, the registry has 3')
     }
 
     Invoke-Case 'fault: --list-tools --json prints text that is not JSON' {
         $fixture = New-ToolListFixture
-        $exe = New-FakeExe @('echo Available Tools:')
-        Assert-FailsWith { Assert-ToolList -ExePath $exe -ClassesPath $fixture.Classes -RegistryPath $fixture.Registry } @('did not print a JSON array', 'Available Tools:')
+        Assert-FailsWith { Assert-ToolList -ExePath (New-FakeExe @('echo Available Tools:')) -ClassesPath $fixture.Classes -RegistryPath $fixture.Registry } @('did not print a JSON array', 'Available Tools:') -Fix @('Program.cs')
     }
 
     # initialize: the fake reads one line from stdin, then answers like the server would
@@ -517,33 +820,55 @@ try {
 
     Invoke-Case 'fault: initialize answers another version' {
         Assert-FailsWith { Assert-InitializeRoundTrip -ExePath (New-InitializeFake '1.8.0') -Version $SampleVersion -ProgramSourcePath $RealProgramPath } `
-            @("serverInfo.version '1.8.0'", 'version 1.9.0 was built')
+            @("serverInfo.version '1.8.0'", 'version 1.9.0 was built') -Fix @('VersionInfo.Current.ToServerInfo()')
     }
 
-    Invoke-Case 'fault: initialize is never answered, and the stuck process is stopped' {
-        $exe = New-FakeExe @('set /p line=', 'ping -n 15 127.0.0.1 >nul')
+    Invoke-Case 'fault: initialize is never answered: the exe and what it started are stopped at once, without waiting for it to exit' {
+        $marker = Get-Random -Minimum 800000 -Maximum 899999
+        $exe = New-FakeExe @('set /p line=', "ping -n $marker 127.0.0.1 >nul")
         $clock = [Diagnostics.Stopwatch]::StartNew()
-        Assert-FailsWith { Assert-InitializeRoundTrip -ExePath $exe -Version $SampleVersion -ProgramSourcePath $RealProgramPath -TimeoutSeconds 2 } @('did not answer an MCP initialize request within 2 s')
-        Assert-True ($clock.Elapsed.TotalSeconds -lt 40) "the check took $($clock.Elapsed.TotalSeconds) s"
+        try {
+            Assert-FailsWith { Assert-InitializeRoundTrip -ExePath $exe -Version $SampleVersion -ProgramSourcePath $RealProgramPath -TimeoutSeconds 2 } @('did not answer an MCP initialize request within 2 s') -Fix @('bin\TestStandMCP.exe')
+            Assert-True ($clock.Elapsed.TotalSeconds -lt (2 + $ProcessSettleSeconds)) "the check took $($clock.Elapsed.TotalSeconds) s; it must not wait for the post-EOF exit"
+            Assert-NoProcessWithCommandLine 'PING.EXE' "-n $marker "
+        } finally { Assert-NoProcessWithCommandLine 'PING.EXE' "-n $marker " }
     }
 
-    Invoke-Case 'startup log: a version on stderr passes; a stderr without it fails' {
-        Assert-StartupLogVersion -StderrText "info: TestStand MCP Server v1.9.0 starting..." -Version $SampleVersion -ProgramSourcePath $RealProgramPath
+    Invoke-Case 'startup log: a version on a startup line of stderr passes; another version fails' {
+        Assert-StartupLogVersion -StderrText 'info: TestStand MCP Server v1.9.0 starting...' -Version $SampleVersion -ProgramSourcePath $RealProgramPath
         Assert-FailsWith { Assert-StartupLogVersion -StderrText 'info: TestStand MCP Server v1.8.0 starting...' -Version $SampleVersion -ProgramSourcePath $RealProgramPath } `
             @('does not name version 1.9.0', 'v1.8.0')
     }
 
-    Invoke-Case 'startup log: with nothing on stderr the source must log VersionInfo.Current.Version' {
+    Invoke-Case 'startup log: the version is matched as a whole number, so 1.9.0 is not found inside 11.9.0 or 1.9.0.1' {
+        Assert-True (Test-ContainsVersion 'v1.9.0 starting' '1.9.0') 'plain'
+        Assert-True (Test-ContainsVersion 'v0.0.0-ci starting' '0.0.0-ci') 'pre-release'
+        foreach ($other in @('v11.9.0 starting', 'v1.9.01 starting', 'v1.9.0.1 starting', 'v1.9.0-rc1 starting', 'v21.9.0 starting')) {
+            Assert-True (-not (Test-ContainsVersion $other '1.9.0')) "[$other] must not count as 1.9.0"
+        }
+        Assert-FailsWith { Assert-StartupLogVersion -StderrText 'info: TestStand MCP Server v11.9.0 starting...' -Version $SampleVersion -ProgramSourcePath $RealProgramPath } @('v11.9.0')
+    }
+
+    Invoke-Case 'startup log: stderr text without a startup line falls back to the source check' {
+        Assert-StartupLogVersion -StderrText "warn: something else happened`nanother line" -Version $SampleVersion -ProgramSourcePath $RealProgramPath
         Assert-StartupLogVersion -StderrText '' -Version $SampleVersion -ProgramSourcePath $RealProgramPath
+    }
+
+    Invoke-Case 'startup log: the source must log VersionInfo.Current.Version in a LogInformation call' {
         $dir = New-TempDir
-        $program = Join-Path $dir 'Program.cs'
-        Write-TextFile $program 'logger.LogInformation("{Product} v{Version} starting...", VersionInfo.ProductName, "1.0.0");'
-        Assert-FailsWith { Assert-StartupLogVersion -StderrText '' -Version $SampleVersion -ProgramSourcePath $program } @('Nothing reached stderr', 'VersionInfo.Current.Version')
+        $wrongVersion = Join-Path $dir 'Program.cs'
+        Write-TextFile $wrongVersion 'logger.LogInformation("{Product} v{Version} starting...", VersionInfo.ProductName, "1.0.0");'
+        Assert-FailsWith { Assert-StartupLogVersion -StderrText '' -Version $SampleVersion -ProgramSourcePath $wrongVersion } @('No startup line reached stderr', 'VersionInfo.Current.Version') -Fix @('logger.LogInformation')
+        $onlyAComment = Join-Path $dir 'Program2.cs'
+        Write-TextFile $onlyAComment '// starting: VersionInfo.Current.Version is what the log should print'
+        Assert-FailsWith { Assert-StartupLogVersion -StderrText '' -Version $SampleVersion -ProgramSourcePath $onlyAComment } @('LogInformation call')
     }
 
     # ======================================================================
     #  Zip, release assets, local verification
     # ======================================================================
+    $FixedTimestamp = [DateTimeOffset]::new(2026, 10, 24, 12, 0, 0, [TimeSpan]::FromHours(2))
+
     function New-SmallStage {
         $dir = Join-Path (New-TempDir) 'stage'
         Write-TextFile (Join-Path $dir 'VERSION.txt') 'tag: v1.9.0'
@@ -555,11 +880,25 @@ try {
     Invoke-Case 'zip: every file is an entry with forward slashes, hidden folders included, no directory entries' {
         $stage = New-SmallStage
         $zipPath = Join-Path (New-TempDir) 'a.zip'
-        New-PluginZip -StageDir $stage -ZipPath $zipPath
+        New-PluginZip -StageDir $stage -ZipPath $zipPath -Timestamp $FixedTimestamp
         Assert-PluginZip -ZipPath $zipPath -StageDir $stage
         $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
         try { $names = @($zip.Entries | ForEach-Object { $_.FullName }) } finally { $zip.Dispose() }
         Assert-Equal '.claude-plugin/plugin.json,VERSION.txt,bin/scripts/a.py' ($names -join ',') 'entry names'
+    }
+
+    Invoke-Case 'zip: two packagings of the same stage are the same bytes, whatever the files'' own times are, and every entry carries the commit time' {
+        $stage = New-SmallStage
+        $first = Join-Path (New-TempDir) 'a.zip'
+        $second = Join-Path (New-TempDir) 'b.zip'
+        New-PluginZip -StageDir $stage -ZipPath $first -Timestamp $FixedTimestamp
+        (Get-Item -LiteralPath (Join-Path $stage 'VERSION.txt')).LastWriteTime = [DateTime]::new(2020, 1, 2, 3, 4, 6)
+        Start-Sleep -Milliseconds 2100
+        New-PluginZip -StageDir $stage -ZipPath $second -Timestamp $FixedTimestamp
+        Assert-Equal (Get-FileSha256 $first) (Get-FileSha256 $second) 'the two archives'
+        $zip = [IO.Compression.ZipFile]::OpenRead($first)
+        try { $times = @($zip.Entries | ForEach-Object { $_.LastWriteTime.DateTime.ToString('yyyy-MM-dd HH:mm:ss') } | Sort-Object -Unique) } finally { $zip.Dispose() }
+        Assert-Equal '2026-10-24 12:00:00' ($times -join ',') 'entry times'
     }
 
     Invoke-Case 'fault: a zip entry contains a backslash' {
@@ -569,52 +908,102 @@ try {
         $zip = New-Object System.IO.Compression.ZipArchive($stream, [IO.Compression.ZipArchiveMode]::Create)
         foreach ($name in @('VERSION.txt', '.claude-plugin\plugin.json', 'bin/scripts/a.py')) { $zip.CreateEntry($name).Open().Dispose() }
         $zip.Dispose(); $stream.Dispose()
-        Assert-FailsWith { Assert-PluginZip -ZipPath $zipPath -StageDir $stage } @("backslash, for example '.claude-plugin\plugin.json'", 'New-PluginZip', 'ZipFile.CreateFromDirectory')
+        Assert-FailsWith { Assert-PluginZip -ZipPath $zipPath -StageDir $stage } @("backslash, for example '.claude-plugin\plugin.json'") -Fix @('New-PluginZip', 'ZipFile.CreateFromDirectory')
     }
 
     Invoke-Case 'fault: the zip holds a file the staged tree does not, or lacks one it has' {
         $stage = New-SmallStage
         $zipPath = Join-Path (New-TempDir) 'a.zip'
-        New-PluginZip -StageDir $stage -ZipPath $zipPath
+        New-PluginZip -StageDir $stage -ZipPath $zipPath -Timestamp $FixedTimestamp
         Write-TextFile (Join-Path $stage 'bin\scripts\late.py') 'x'
-        Assert-FailsWith { Assert-PluginZip -ZipPath $zipPath -StageDir $stage } @('3 entries but the staged tree has 4 files', 'missing: bin/scripts/late.py')
+        Assert-FailsWith { Assert-PluginZip -ZipPath $zipPath -StageDir $stage } @('3 entries but the staged tree has 4 files', 'missing: bin/scripts/late.py') -Fix @('New-PluginZip')
     }
 
-    Invoke-Case 'assets: the versioned copy, digest and manifest are written under the ReleaseAssets names; sha256sum -c accepts them' {
+    # sha256sum -c on the digest; without sha256sum an independent Get-FileHash comparison instead
+    function Assert-DigestAccepted {
+        param([string]$OutDir)
+        $sha256sum = Get-Command sha256sum -ErrorAction SilentlyContinue
+        if ($null -ne $sha256sum) {
+            $check = Invoke-ChildProcess -FilePath $sha256sum.Source -ArgumentList @('-c', $ReleaseDigestName) -WorkingDirectory $OutDir -TimeoutSeconds 120
+            Assert-Equal 0 $check.ExitCode "sha256sum -c said: $($check.Stdout) $($check.Stderr)"
+            Assert-Contains $check.Stdout 'OK' 'sha256sum output'
+            return
+        }
+        Write-Host '      SKIP  sha256sum was not found; comparing with Get-FileHash instead'
+        $line = ([IO.File]::ReadAllText((Join-Path $OutDir $ReleaseDigestName))).TrimEnd("`n")
+        $expected = (Get-FileHash -LiteralPath (Join-Path $OutDir $ReleaseArchiveName) -Algorithm SHA256).Hash.ToLowerInvariant() + '  ' + $ReleaseArchiveName
+        Assert-Equal $expected $line 'the digest line'
+    }
+
+    Invoke-Case 'assets: the versioned copy, digest and manifest are written under the ReleaseAssets names and the digest is accepted' {
         $stage = New-SmallStage
         $outDir = New-TempDir
-        New-PluginZip -StageDir $stage -ZipPath (Join-Path $outDir $ReleaseArchiveName)
-        Write-ReleaseAssets -StageDir $stage -OutDir $outDir -Version '0.0.0-ci'
+        $zipPath = Join-Path $outDir $ReleaseArchiveName
+        New-PluginZip -StageDir $stage -ZipPath $zipPath -Timestamp $FixedTimestamp
+        Write-ReleaseAssets -ZipPath $zipPath -ManifestText (Get-StageSnapshot -StageDir $stage) -Version '0.0.0-ci'
         foreach ($name in @($ReleaseArchiveName, $ReleaseDigestName, $ReleaseManifestName, (Get-VersionedArchiveName -Version '0.0.0'))) {
             Assert-True (Test-Path -LiteralPath (Join-Path $outDir $name)) "$name was not written"
         }
-        Assert-Equal (Get-FileSha256 (Join-Path $outDir $ReleaseArchiveName)) (Get-FileSha256 (Join-Path $outDir (Get-VersionedArchiveName -Version '0.0.0'))) 'versioned copy'
+        Assert-Equal (Get-FileSha256 $zipPath) (Get-FileSha256 (Join-Path $outDir (Get-VersionedArchiveName -Version '0.0.0'))) 'versioned copy'
         $manifest = [IO.File]::ReadAllText((Join-Path $outDir $ReleaseManifestName))
         Assert-Equal 3 @($manifest.TrimEnd("`n") -split "`n").Count 'manifest lines'
         Assert-Contains $manifest '  bin/scripts/a.py' 'manifest'
-        $sha256sum = Get-Command sha256sum -ErrorAction SilentlyContinue
-        if ($null -ne $sha256sum) {
-            $check = Invoke-ChildProcess -FilePath $sha256sum.Source -ArgumentList @('-c', $ReleaseDigestName) -WorkingDirectory $outDir -TimeoutSeconds 60
-            Assert-Equal 0 $check.ExitCode "sha256sum -c said: $($check.Stdout) $($check.Stderr)"
-            Assert-Contains $check.Stdout 'OK' 'sha256sum output'
-        }
+        Assert-DigestAccepted $outDir
     }
 
     Invoke-Case 'verify: the release verifier accepts the assets in local mode' {
         $stage = New-SmallStage
         $outDir = New-TempDir
-        New-PluginZip -StageDir $stage -ZipPath (Join-Path $outDir $ReleaseArchiveName)
-        Write-ReleaseAssets -StageDir $stage -OutDir $outDir -Version '1.9.0'
+        $zipPath = Join-Path $outDir $ReleaseArchiveName
+        New-PluginZip -StageDir $stage -ZipPath $zipPath -Timestamp $FixedTimestamp
+        Write-ReleaseAssets -ZipPath $zipPath -ManifestText (Get-StageSnapshot -StageDir $stage) -Version '1.9.0'
         Assert-LocalRelease -OutDir $outDir -Version '1.9.0'
     }
 
     Invoke-Case 'fault: the verifier rejects a digest that does not match the archive' {
         $stage = New-SmallStage
         $outDir = New-TempDir
-        New-PluginZip -StageDir $stage -ZipPath (Join-Path $outDir $ReleaseArchiveName)
-        Write-ReleaseAssets -StageDir $stage -OutDir $outDir -Version '1.9.0'
+        $zipPath = Join-Path $outDir $ReleaseArchiveName
+        New-PluginZip -StageDir $stage -ZipPath $zipPath -Timestamp $FixedTimestamp
+        Write-ReleaseAssets -ZipPath $zipPath -ManifestText (Get-StageSnapshot -StageDir $stage) -Version '1.9.0'
         Write-TextFile (Join-Path $outDir $ReleaseDigestName) (('0' * 64) + "  $ReleaseArchiveName`n")
-        Assert-FailsWith { Assert-LocalRelease -OutDir $outDir -Version '1.9.0' } @('release verifier', $ReleaseDigestName, 'Fix what the verifier reports')
+        Assert-FailsWith { Assert-LocalRelease -OutDir $outDir -Version '1.9.0' } @('release verifier', $ReleaseDigestName) -Fix @('Fix what the verifier reports')
+    }
+
+    # ======================================================================
+    #  The script itself
+    # ======================================================================
+    Invoke-Case 'script: a malformed version stops it with exit code 1 and the three parts, before anything is built' {
+        $outDir = Join-Path (New-TempDir) 'out'
+        $result = Invoke-BuildScript -ScriptPath $ScriptPath -TimeoutSeconds 120 -ArgumentList @('-Version', 'one.nine', '-OutDir', $outDir)
+        Assert-Equal 1 $result.ExitCode 'exit code'
+        foreach ($label in @('What', 'Why', 'Fix')) { Assert-True ($result.Stdout -cmatch "(?m)^${label}: +\S") "no '${label}:' line in:`n$($result.Stdout)" }
+        Assert-Contains $result.Stdout "'one.nine'" 'output'
+        Assert-True (-not (Test-Path -LiteralPath $outDir)) 'nothing may be created for a refused input'
+    }
+
+    Invoke-Case 'script: an unknown layout is refused before the source checks run' {
+        $result = Invoke-BuildScript -ScriptPath $ScriptPath -TimeoutSeconds 120 `
+            -ArgumentList @('-Version', '0.0.0-ci', '-Commit', $SampleCommit, '-Layout', 'nope', '-OutDir', (Join-Path (New-TempDir) 'out'))
+        Assert-Equal 1 $result.ExitCode 'exit code'
+        Assert-Contains $result.Stdout "Unknown exe layout 'nope'" 'output'
+        Assert-NotContains $result.Stdout '[1/' 'no step may have started'
+    }
+
+    Invoke-Case 'script: a fault in the sources stops it at step 1 with the three parts and writes no archive' {
+        $root = New-RepoFixture -WithBuild -Mutate {
+            param($r)
+            $manifest = Join-Path $r 'plugin\.claude-plugin\plugin.json'
+            [IO.File]::WriteAllText($manifest, ([IO.File]::ReadAllText($manifest).Replace('"version": "0.0.0"', '"version": "1.2.3"')))
+        }
+        $outDir = Join-Path (New-TempDir) 'out'
+        $result = Invoke-BuildScript -ScriptPath (Join-Path $root 'build\Build-PluginArchive.ps1') -TimeoutSeconds 300 -ArgumentList @('-Version', '0.0.0-ci', '-Commit', $SampleCommit, '-OutDir', $outDir)
+        Assert-Equal 1 $result.ExitCode "exit code; output was:`n$($result.Stdout)"
+        foreach ($label in @('What', 'Why', 'Fix')) { Assert-True ($result.Stdout -cmatch "(?m)^${label}: +\S") "no '${label}:' line in:`n$($result.Stdout)" }
+        Assert-Contains $result.Stdout '[1/8]' 'step 1 started'
+        Assert-Contains $result.Stdout 'plugin.json' 'the fault names the manifest'
+        Assert-NotContains $result.Stdout '[2/8]' 'step 2 must not start'
+        Assert-Equal 0 @(Get-ChildItem -LiteralPath $outDir -Filter '*.zip' -Recurse -ErrorAction SilentlyContinue).Count 'zip files written'
     }
 
     # ======================================================================
@@ -628,46 +1017,20 @@ try {
         Invoke-Case "e2e ($layoutName): the script packages the real exe and the verifier accepts the output" {
             $outDir = Join-Path (New-TempDir) 'out'
             $clock = [Diagnostics.Stopwatch]::StartNew()
-            $result = Invoke-ChildProcess -FilePath $HostPath -TimeoutSeconds 1200 `
-                -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath, '-Version', '0.0.0-ci', '-Layout', $layoutName, '-OutDir', $outDir)
+            $result = Invoke-BuildScript -ScriptPath $ScriptPath -TimeoutSeconds 1200 -ArgumentList @('-Version', '0.0.0-ci', '-Layout', $layoutName, '-OutDir', $outDir)
             Assert-Equal 0 $result.ExitCode "the script failed:`n$($result.Stdout)"
-            Assert-Contains $result.Stdout '[8/8]' 'the last step ran'
+            Assert-True ($result.Stdout -cmatch '\[(\d+)/\1\]') 'the last step ran'
             $zipPath = Join-Path $outDir $ReleaseArchiveName
             $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
             try { $names = @($zip.Entries | ForEach-Object { $_.FullName }) } finally { $zip.Dispose() }
             Assert-Equal 0 @($names | Where-Object { $_.Contains('\') }).Count 'entry names with a backslash'
-            Assert-Equal (Get-FileSet (Join-Path $outDir 'stage')).Count $names.Count 'entries against staged files'
-            $version = Invoke-ChildProcess -FilePath (Join-Path $outDir 'stage\bin\TestStandMCP.exe') -ArgumentList @('--version') -TimeoutSeconds 60
+            Assert-Equal (Get-RelativeFileList (Join-Path $outDir 'stage')).Count $names.Count 'entries against staged files'
+            $version = Invoke-ChildProcess -FilePath (Get-StagedExePath -StageDir (Join-Path $outDir 'stage')) -ArgumentList @('--version') -TimeoutSeconds 60
             Assert-Contains $version.Stdout '0.0.0-ci' 'staged --version'
-            $sha256sum = Get-Command sha256sum -ErrorAction SilentlyContinue
-            if ($null -ne $sha256sum) {
-                $check = Invoke-ChildProcess -FilePath $sha256sum.Source -ArgumentList @('-c', $ReleaseDigestName) -WorkingDirectory $outDir -TimeoutSeconds 120
-                Assert-Equal 0 $check.ExitCode "sha256sum -c said: $($check.Stdout) $($check.Stderr)"
-            }
+            Assert-DigestAccepted $outDir
             Write-Host ("      e2e {0}: {1:N1} MB, {2} entries, {3:N1} s" -f $layoutName, ((Get-Item -LiteralPath $zipPath).Length / 1MB), $names.Count, $clock.Elapsed.TotalSeconds)
-            Write-Host ($result.Stdout -split "`n" | Where-Object { $_ -match '^\[\d/8\]' } | ForEach-Object { "      $_" }) -Separator "`n"
+            Write-Host ($result.Stdout -split "`n" | Where-Object { $_ -match '^\[\d+/\d+\]' } | ForEach-Object { "      $_" }) -Separator "`n"
         }
-    }
-
-    # ======================================================================
-    #  The script itself
-    # ======================================================================
-    Invoke-Case 'script: a malformed version stops it with exit code 1 and the three parts, before anything is built' {
-        $outDir = Join-Path (New-TempDir) 'out'
-        $result = Invoke-ChildProcess -FilePath $HostPath -TimeoutSeconds 120 `
-            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath, '-Version', 'one.nine', '-OutDir', $outDir)
-        Assert-Equal 1 $result.ExitCode 'exit code'
-        foreach ($label in @('What', 'Why', 'Fix')) { Assert-True ($result.Stdout -cmatch "(?m)^${label}: +\S") "no '${label}:' line in:`n$($result.Stdout)" }
-        Assert-Contains $result.Stdout "'one.nine'" 'output'
-        Assert-True (-not (Test-Path -LiteralPath $outDir)) 'nothing may be created for a refused input'
-    }
-
-    Invoke-Case 'script: an unknown layout is refused before the source checks run' {
-        $result = Invoke-ChildProcess -FilePath $HostPath -TimeoutSeconds 120 `
-            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath, '-Version', '0.0.0-ci', '-Commit', $SampleCommit, '-Layout', 'nope', '-OutDir', (Join-Path (New-TempDir) 'out'))
-        Assert-Equal 1 $result.ExitCode 'exit code'
-        Assert-Contains $result.Stdout "Unknown exe layout 'nope'" 'output'
-        Assert-NotContains $result.Stdout '[1/' 'no step may have started'
     }
 } finally {
     Remove-TestTempDirs

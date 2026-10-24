@@ -53,7 +53,7 @@ bin/TestStandMCP.exe            self-contained, single-file, win-x86
 bin/appsettings.json
 bin/scripts/                    doc/presentation generators + template (AppContext.BaseDirectory\scripts)
 bin/.claude/agents/             direct-registration flavour (mcp__teststand__*) + link-agents.bat
-bin/README.md, bin/CLAUDE.md
+bin/CLAUDE.md                   the user rules of the skill, generated; no README in bin/
 ```
 
 ### Constraints
@@ -131,7 +131,10 @@ bin/README.md, bin/CLAUDE.md
   - `TestStandMCP.exe --version` prints `X.Y.Z`, the tag and the commit SHA to **stdout**, and never
     `-dev`;
   - the MCP `initialize` response's `serverInfo.version` is `X.Y.Z`;
-  - the startup log line shows the same version;
+  - the startup log line shows the same version. The runtime startup log is not observable under
+    redirected stdio (with stdin redirected the exe logs to its own console window, not to stderr), so
+    this item is checked statically: the startup `LogInformation` call prints `VersionInfo.Current.Version`,
+    the value the runtime `serverInfo.version` check above proves;
   - the staged `plugin.json` has `"version": "X.Y.Z"` and is otherwise byte-identical to the source;
   - `VERSION.txt` at the archive root lists tag, version, commit, build time and run URL.
 
@@ -141,8 +144,15 @@ bin/README.md, bin/CLAUDE.md
   `skills/teststand-rules/SKILL.md`, and `bin/` contains `TestStandMCP.exe` and `appsettings.json`.
   `bin/scripts/` contains **exactly** `generate_teststand_doc.py`,
   `generate_teststand_presentation.py` and `presentation_template.html`. No maintainer script (for
-  example `Test-LoadPrototype.ps1`) is in it. The staged `bin/CLAUDE.md` is self-contained: the skill text is inlined,
-  and no `@` import in it points at a path that is missing from the archive.
+  example `Test-LoadPrototype.ps1`) is in it. `bin/` holds no `README.md`, no `build/` folder and no
+  debug symbols (`*.pdb`), and nothing at its top level that `dotnet publish` did not produce, apart
+  from `CLAUDE.md`, `scripts/` and `.claude/`. The staged `bin/CLAUDE.md` holds **the user rules and
+  nothing else**: a header line, then the `teststand-rules` skill text and each of its reference files,
+  inlined with their frontmatter removed, in the order of the import block of the repository's
+  `CLAUDE.md`. None of the repository's developer sections is in it. The check is exact: the staged file
+  must equal a fresh generation from the skill files, so a leftover import, an edit or an extra line
+  fails the build. The `@` imports of the import block must be whole-line imports and must resolve to
+  files below `plugin/skills`.
 - **AC-5 Agent flavours.** The plugin-flavour agents are **generated while staging** from
   `.claude/agents/`. No second copy is committed. The workflow fails if either check below does not
   hold:
@@ -420,6 +430,8 @@ bin/README.md, bin/CLAUDE.md
 | Error-handling sweep | `inferable` | inference | Every workflow step fails loudly with a diagnosis (AC-1 to AC-8). The hooks fail silent and non-blocking (AC-13 to AC-15). |
 | LOW_VALUE: unit tests for `hooks.json` wiring | `inferable` | inference | Skipped. No branching logic, and the install smoke check (AC-10) covers it. |
 | Build AC gate (2026-10-24) | `inferable` | spec-compliance-review + human | 12 criteria were tightened for verifiability, with no design change. The changes: AC-2's budget source, flow 3's definition and layout order; AC-4's exact `bin/scripts` set; AC-5's case-insensitive match; AC-6's outside-observable form; AC-8's retry trigger; AC-9's script set; AC-10's version and profile; AC-12's two-session bound; AC-13's timeouts; AC-15's detection rule and command; AC-16's structure and deny-list; AC-17's unverified outcome; AC-18's draft rule. The user chose "apply and build". |
+| Pre-release build asset name (slice 5, 2026-10-24) | `inferable` | inference | A local or pull-request build uses version `0.0.0-ci`. The release tag format and the release verifier know only `X.Y.Z`, so the versioned copy of such a build is named after its numeric core: `teststand-mcp-v0.0.0.zip`. A real release (`vX.Y.Z`) is unaffected. |
+| `bin/CLAUDE.md` content (slice 5 review, 2026-10-24) | `requires-stakeholder-input` | human | The direct route's `bin/CLAUDE.md` holds the user rules only (the skill and its reference files), not the repository's developer sections; `bin/README.md` is not shipped. |
 | Plan-review revision (2026-10-24) | `inferable` | inference (plan reviewers) | Five plan reviewers found defects in the original ACs. **AC-1**: the trigger was case-sensitive, so the gate was unreachable. **AC-2**: the spike now runs first, tests three layouts, and needs evidence that no installed runtime was loaded. **AC-3/6**: the `serverInfo` version was missing, and `--list-tools` wrote to a reallocated console. **AC-4/5**: the `bin/CLAUDE.md` import dangled, and the generated agents are now staged rather than committed. **AC-7/8**: draft, then verify, then publish, plus a rollback. **AC-13**: failures are now cached, there is an opt-out, the run is startup-only, and the redirect replaces the API. **AC-14**: literal names only, a consistent no-child-process rule, and a classification test. **AC-15/16**: startup-only, plus `additionalContext`, and an edited skill split into references. **AC-18**: the download count contract and accessibility. **AC-19**: the README lands in a second PR after the first release. None of these changes a stakeholder decision. |
 
 ## Consistency Gate

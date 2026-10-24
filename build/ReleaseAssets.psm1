@@ -249,22 +249,13 @@ function New-ArchiveManifest {
         Write-BuildFailure -What "Cannot build the manifest: $StagedDir is not a directory." `
             -Why 'The manifest lists every file of the staged tree that becomes the archive.' -Fix 'Stage the plugin first, then pass the staging directory.'
     }
-    $root = [IO.Path]::GetFullPath($resolved).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
-    $paths = New-Object System.Collections.Generic.List[string]
-    $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($file in (Get-ChildItem -LiteralPath $resolved -Recurse -File -Force)) {
-        $relative = $file.FullName.Substring($root.Length).Replace('\', '/')
-        $paths.Add($relative)
-        $lines.Add((Format-HashLine -Hash (Get-FileSha256 $file.FullName) -Path $relative))
-    }
-    if ($lines.Count -eq 0) {
+    $names = Get-RelativeFileList -Dir $resolved
+    if ($names.Count -eq 0) {
         Write-BuildFailure -What "Cannot build the manifest: $StagedDir holds no files." `
             -Why 'An empty manifest would pass any archive.' -Fix 'Check that the staging step copied the plugin files.'
     }
-    $pathArray = $paths.ToArray()
-    $lineArray = $lines.ToArray()
-    [Array]::Sort($pathArray, $lineArray, [StringComparer]::Ordinal)
-    return (($lineArray -join "`n") + "`n")
+    $lines = @($names | ForEach-Object { Format-HashLine -Hash (Get-FileSha256 (Join-Path $resolved $_)) -Path $_ })
+    return (($lines -join "`n") + "`n")
 }
 
 # ----------------------------------------------------------------------------

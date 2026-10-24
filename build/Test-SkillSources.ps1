@@ -104,9 +104,9 @@ $TsenvUserHalfMarkers = @(
 $TsenvDeveloperHeadingPrefix = '## TestStand ENVIRONMENTS'
 $TsenvDeveloperMarker = 'SetEnvironmentPath'
 
-# CLAUDE.md wraps its skill imports in these markers so a packaging step can swap the block.
-$ImportsBeginMarker = '<!-- skill-imports:begin -->'
-$ImportsEndMarker = '<!-- skill-imports:end -->'
+# CLAUDE.md wraps its skill imports in markers (and an import is a whole line "@path"): the rules for
+# both live in SkillSources.psm1, which exports $ImportsBeginMarker, $ImportsEndMarker and $ImportLinePattern.
+Import-Module (Join-Path $PSScriptRoot 'SkillSources.psm1')
 
 # Markdown outside these roots (relative, forward slashes) is searched for moved headings.
 $UniquenessExcludedRoots = @('plugin/skills/', 'docs/specs/', 'plans/')
@@ -118,10 +118,10 @@ $HeadingLinePattern = '^#{1,6}\s+(.*?)\s*$'
 $SectionHeadingPattern = '^##\s'
 $ListItemPattern = '^[-*]\s+(.*)$'
 $ContinuationPattern = '^\s+\S'
-$ImportLinePattern = '^@(\S+)\s*$'
 $FrontmatterNamePattern = '(?m)^name:\s*teststand-rules\s*$'
 $FrontmatterDescriptionPattern = '(?m)^description:\s*\S'
 $MaxDetailLines = 8
+$GitTimeoutSeconds = 60
 
 if ($DefinitionsOnly) { return }
 
@@ -132,7 +132,6 @@ Import-Module (Join-Path $PSScriptRoot 'BuildCommon.psm1')   # Read-Utf8Text: st
 
 if (-not $SkillRoot) { $SkillRoot = Join-Path $RepoRoot 'plugin\skills\teststand-rules' }
 $ClaudeMdPath = Join-Path $RepoRoot 'CLAUDE.md'
-$FrontmatterPattern = '^' + [regex]::Escape($Bom) + '?---\r?\n(.*?)\r?\n---\r?\n'
 
 # ----------------------------------------------------------------------------
 $script:Failures = 0
@@ -190,21 +189,11 @@ function Get-RelativePath {
 
 # git's tracked paths (raw, NUL separated); $null when git is missing, fails or the repository is unreadable.
 function Get-GitTrackedPath {
-    $info = New-Object System.Diagnostics.ProcessStartInfo
-    $info.FileName = 'git'
-    $info.Arguments = '-c core.quotePath=off -C "' + $RepoRoot + '" ls-files -z'
-    $info.UseShellExecute = $false
-    $info.CreateNoWindow = $true
-    $info.RedirectStandardOutput = $true
-    $info.RedirectStandardError = $true
-    $info.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
-    try { $process = [System.Diagnostics.Process]::Start($info) } catch { return $null }
-    $errors = $process.StandardError.ReadToEndAsync()
-    $output = $process.StandardOutput.ReadToEnd()
-    $process.WaitForExit()
-    [void]$errors.Result
-    if ($process.ExitCode -ne 0) { return $null }
-    return , @($output -split "`0" | Where-Object { $_ })   # the comma keeps a one-element list an array
+    try {
+        $result = Invoke-ChildProcess -FilePath 'git' -ArgumentList @('-c', 'core.quotePath=off', '-C', $RepoRoot, 'ls-files', '-z') -TimeoutSeconds $GitTimeoutSeconds
+    } catch { return $null }
+    if ($result.TimedOut -or $result.ExitCode -ne 0) { return $null }
+    return , @($result.Stdout -split "`0" | Where-Object { $_ })   # the comma keeps a one-element list an array
 }
 
 function Get-MarkdownByWalk {
@@ -268,7 +257,7 @@ if (Test-Path -LiteralPath $skillMdPath) {
     $skillMd = Get-FileText $skillMdPath
     $skillLines = @($skillMd -split "\r?\n")
 
-    $frontmatter = [regex]::Match($skillMd, $FrontmatterPattern, 'Singleline')
+    $frontmatter = Get-FrontmatterMatch $skillMd
     $frontOk = $frontmatter.Success -and
         ($frontmatter.Groups[1].Value -match $FrontmatterNamePattern) -and
         ($frontmatter.Groups[1].Value -match $FrontmatterDescriptionPattern)
@@ -373,14 +362,12 @@ Write-Result 'imports: CLAUDE.md has one begin and one end marker around the ski
 $dangling = @()
 $imported = @()
 $outsideMarkers = @()
-foreach ($line in $claudeProse) {
-    $import = [regex]::Match($line.Text, $ImportLinePattern)
-    if (-not $import.Success) { continue }
-    $resolved = [IO.Path]::GetFullPath((Join-Path $RepoRoot $import.Groups[1].Value))
+foreach ($import in (Get-ImportLine @($claudeText -split '\r?\n'))) {
+    $resolved = [IO.Path]::GetFullPath((Join-Path $RepoRoot $import.Path))
     $imported += $resolved
-    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) { $dangling += "CLAUDE.md:$($line.Number): import @$($import.Groups[1].Value) does not exist" }
-    if ($markersOk -and ($line.Number -lt $beginLines[0].Number -or $line.Number -gt $endLines[0].Number)) {
-        $outsideMarkers += "CLAUDE.md:$($line.Number): import @$($import.Groups[1].Value) is outside the markers"
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) { $dangling += "CLAUDE.md:$($import.Number): import @$($import.Path) does not exist" }
+    if ($markersOk -and ($import.Number -lt $beginLines[0].Number -or $import.Number -gt $endLines[0].Number)) {
+        $outsideMarkers += "CLAUDE.md:$($import.Number): import @$($import.Path) is outside the markers"
     }
 }
 Write-Result 'imports: every @path import in CLAUDE.md resolves' ($dangling.Count -eq 0) $dangling

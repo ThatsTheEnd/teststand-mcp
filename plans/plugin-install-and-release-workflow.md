@@ -658,7 +658,7 @@ All other registered tools go to `prompt`, including `diff_sequence_files`, `com
 ### Slice 5: Packaging script
 
 **Depends-on:** 0, 1, 2, 3, 4, 6
-**Files:** `build/Build-PluginArchive.ps1`, `build/PluginArchive.psm1`, `build/PluginSmoke.psm1`, `build/BuildCommon.psm1`, `build/tests/BuildPluginArchive.Tests.ps1`, `.gitignore` (already ignores `artifacts/`)
+**Files:** `build/Build-PluginArchive.ps1`, `build/PluginArchive.psm1`, `build/PluginStaging.psm1`, `build/PluginSmoke.psm1`, `build/SkillSources.psm1`, `build/BuildCommon.psm1`, `build/tests/BuildPluginArchive.Tests.ps1`, `.gitignore` (already ignores `artifacts/`)
 
 **Behavior:**
 
@@ -670,10 +670,10 @@ Feature: One script produces the plugin archive
     When the maintainer runs the packaging script with the default layout
     Then teststand-mcp.zip has plugin.json, .mcp.json, VERSION.txt, agents, hooks and the skill at its root
     And bin holds the exe in the layout chosen by the spike, appsettings.json and the doc scripts,
-      and no file from build/
+      and no file from build/, no README.md and no debug symbols
     And bin/.claude/agents holds the source agents unchanged and link-agents.bat
     And agents holds the converted plugin agents
-    And bin/CLAUDE.md contains the skill text inline and no import that is missing from the archive
+    And bin/CLAUDE.md holds the user rules only: the skill text and its reference files inline, no developer section, no import
     And the staged plugin.json reads 1.9.0 and is otherwise byte-identical to the source
     And --version from the staged exe names 1.9.0, v1.9.0 and the commit
     And --list-tools --json from the staged exe equals the tools classified in tool-classes.json
@@ -729,12 +729,12 @@ Feature: One script produces the plugin archive
 **IMPLEMENT**:
 - Stage the tree.
 - Convert the agents (slice 2 module).
-- Write `bin/CLAUDE.md` with every `@` import resolved inline and the YAML frontmatter stripped. `bin/CLAUDE.md` keeps the developer sections deliberately, as the direct route always has.
-- `bin/` is the publish output minus what the csproj copies into every output (`CLAUDE.md`, `README.md`, `scripts/`, `.claude/`); those come from the repository. `bin/.claude/agents` holds the source agents unchanged (including `link-agents.bat`, which lives in that folder).
+- Write `bin/CLAUDE.md` as the USER RULES only: a header line, then the skill text and each reference file with its frontmatter stripped, in the order of the import block of `CLAUDE.md` (which stays the source of that order and is not modified). No developer section is in it. The assertion is exact: the staged file equals a fresh generation. Inside the import block every `@` line must be a whole-line import resolving below `plugin/skills`.
+- `bin/` is the publish output minus what the csproj copies into every output (`CLAUDE.md`, `README.md`, `scripts/`, `.claude/`) and minus `*.pdb`; those come from the repository, or are not shipped (no `bin/README.md`). Its top-level set is derived from the publish output, and a `build/` folder, a README or a symbol file in it fails the build. `bin/.claude/agents` holds the source agents unchanged (including `link-agents.bat`, which lives in that folder).
 - `bin/scripts/` is staged from an explicit list (the two generators and the template). `scripts/Test-LoadPrototype.ps1` and any other maintainer script stay out. `hooks/` must hold exactly the runtime hook files (`hooks.json`, `tool-classes.json`, `hook-common.ps1` and the `.ps1` hooks).
 - Write `VERSION.txt` (`tag`, `version`, `commit`, `built`, `run`, the format `src/VersionInfo.cs` reads; `run` is `local` outside GitHub Actions).
 - Stamp `plugin.json` and check it byte for byte: the staged text with the version put back must equal the source.
-- Assert the layout (AC-4) and the agent flavours (AC-5) from one table that also drives the staging.
+- Assert the layout (AC-4) and the agent flavours (AC-5) from one table that also drives the staging, including the generated files (`PluginStaging.psm1`). `plugin/` is staged only from `git ls-files`, and an untracked or ignored file below it fails the build. Junctions and symbolic links are refused.
 **TEST**: Run locally. Every slice 5 Outline row has its own fixture in `build/tests/BuildPluginArchive.Tests.ps1`, built from a tiny fake publish directory and the real repository sources: delete a staged file, plant a stray `mcp__teststand__`, leave an unresolved import, drop one converted agent (count mismatch), copy `scripts/Test-LoadPrototype.ps1` into `bin/scripts`, and remove the `commit:` line from `VERSION.txt`. Each fault names itself.
 **REFACTOR**: One staging/assertion table.
 **Files**: `build/Build-PluginArchive.ps1`, `build/PluginArchive.psm1`, `build/tests/BuildPluginArchive.Tests.ps1`
@@ -747,6 +747,7 @@ Feature: One script produces the plugin archive
 - Smoke-test the staged exe (`build/PluginSmoke.psm1`, each process started with a timeout and stopped by its own process id): `--version` (version on its first line, tag and commit), `--list-tools --json` against `tool-classes.json` and the registry, and a stdio `initialize` round trip (`serverInfo.version`). `initialize` does not connect the engine (`HandleInitialize` only negotiates, logs and answers).
 - Zip entry by entry with `ZipArchive.CreateEntry` and explicit forward-slash names (not `ZipFile.CreateFromDirectory`, which writes backslashes on Windows PowerShell 5.1), then guard the finished archive: no entry name contains `\`, and the entries are exactly the staged files.
 - Write the version-named copy, the digest and the manifest through `ReleaseAssets.psm1`. A pre-release build (`0.0.0-ci`) names its versioned copy after its numeric core (`teststand-mcp-v0.0.0.zip`): the verifier and the tag format know only `X.Y.Z`.
+- The staged tree is snapshotted (its per-file hashes) after the assertions and compared again right before zipping, so nothing the smoke run writes can ship. Every zip entry carries the commit time (`git show -s --format=%cI`), so two packagings of one commit are the same bytes.
 - Finish with `Assert-PublishedRelease.ps1 -LocalDir`.
 **TEST**: `sha256sum -c` passes, the local verify passes, and no zip entry contains `\`. The unclassified-tool and backslash faults fail. The startup log cannot be read from a redirected stderr (with stdin redirected `Program.cs` allocates its own console window and logs there), so the smoke run asserts the version in the log when stderr carries it and otherwise checks that the startup log line prints `VersionInfo.Current.Version`, the same value `serverInfo` reports.
 **REFACTOR**: Asset names come only from `ReleaseAssets.psm1`.
@@ -1318,3 +1319,4 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
 - Slice 11 README: auto-allowed reads of a .seq inside the project still run its SequenceFileLoad callback; open only files you trust
 - Slice 7: `release.yml` uploads an artifact named exactly `own-downloads` holding `own-downloads.json` (AC-18 schema, at most 1 MiB) with `if: always()`; its `run_id` is `"${{ github.run_id }}"` as a string. Only runs of `.github/workflows/release.yml` in this repository, started by `push` or `workflow_dispatch`, are accepted by the collector.
 - Slice 7: `ci.yml` runs `python -m unittest discover -s .github/stats` from the repository root, and `actionlint` covers `pages.yml` too.
+- Slice 7: a pre-release build (`-Version 0.0.0-ci`) names its versioned copy after the numeric core: `teststand-mcp-v0.0.0.zip` (the verifier and the tag format know only `X.Y.Z`). The PR check must verify with that name; use a clean `-OutDir`, because assets of another version are not removed.

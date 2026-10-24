@@ -7,8 +7,9 @@
 #    - Read-Utf8Text, Read-JsonFile, Get-Utf8NoBomEncoding, Get-JsonProperty, Get-PropertyNames;
 #    - Add-GitHubOutput: a step output for later workflow steps;
 #    - Remove-BuildTempTree: temp cleanup that retries and warns;
-#    - Invoke-ChildProcess / New-ChildProcessStartInfo / Stop-ChildProcess: a child program with a
-#      timeout, array arguments and captured output (stopped by process id, never by image name).
+#    - Invoke-ChildProcess / Invoke-BuildScript / Assert-ChildOutcome / Stop-ChildProcess: a child program with a
+#      timeout, array arguments and captured output (its process tree is stopped by id, never by image name);
+#    - Get-RelativeFileList: the files of a tree, refusing junctions and symbolic links.
 #  Compatible with Windows PowerShell 5.1 and PowerShell 7.
 #  Text is written with explicit .NET UTF-8 (no BOM) APIs: never use
 #  Set-Content -Encoding UTF8 (5.1 writes a BOM).
@@ -186,13 +187,31 @@ function New-ChildProcessStartInfo {
     return $info
 }
 
-# Stops ONE process by its id (never by image name: another process of the same program may be
-# somebody else's) and waits briefly for it to go.
+# Stops ONE process AND the programs it started, by its id (never by image name: another process of
+# the same program may be somebody else's). taskkill /T walks only the tree below that id, so a
+# wrapper (cmd.exe, a build tool) cannot leave its child running behind a timeout.
 function Stop-ChildProcess {
     [CmdletBinding()]
     param([Parameter(Mandatory)][System.Diagnostics.Process]$Process)
     if ($Process.HasExited) { return }
-    Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+    $killer = New-Object System.Diagnostics.ProcessStartInfo
+    $killer.FileName = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    $killer.Arguments = "/T /F /PID $($Process.Id)"
+    $killer.UseShellExecute = $false
+    $killer.CreateNoWindow = $true
+    $killer.RedirectStandardOutput = $true
+    $killer.RedirectStandardError = $true
+    try {
+        $started = [Diagnostics.Process]::Start($killer)
+        try {
+            [void]$started.StandardOutput.ReadToEndAsync()
+            [void]$started.StandardError.ReadToEndAsync()
+            [void]$started.WaitForExit($script:ProcessSettleMilliseconds)
+        } finally { $started.Dispose() }
+    } catch {
+        # taskkill is unavailable: the single-process stop below still ends the process itself
+    }
+    if (-not $Process.HasExited) { Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue }
     [void]$Process.WaitForExit($script:ProcessSettleMilliseconds)
 }
 
@@ -229,6 +248,73 @@ function Invoke-ChildProcess {
     }
 }
 
+# The non-blank lines of a text: the first or the last $Count of them, or "(no output)".
+function Get-OutputExcerpt {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Text, [ValidateSet('First', 'Last')][string]$Mode = 'First', [int]$Count = 8)
+    $lines = @(($Text -split '\r?\n') | Where-Object { $_.Trim().Length -gt 0 })
+    if ($lines.Count -eq 0) { return '(no output)' }
+    $picked = if ($Mode -eq 'First') { @($lines | Select-Object -First $Count) } else { @($lines | Select-Object -Last $Count) }
+    return ($picked -join "`n")
+}
+
+# Turns a finished child process into a build failure: a timeout, or a non-zero exit code, with the
+# program's own output attached. Returns quietly when it exited 0 in time.
+function Assert-ChildOutcome {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Result, [Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][int]$TimeoutSeconds,
+        [Parameter(Mandatory)][string]$Why, [Parameter(Mandatory)][string]$Fix,
+        [ValidateSet('First', 'Last')][string]$Mode = 'First', [int]$Count = 8
+    )
+    $excerpt = Get-OutputExcerpt -Text ($Result.Stdout + "`n" + $Result.Stderr) -Mode $Mode -Count $Count
+    if ($Result.TimedOut) {
+        Write-BuildFailure -What "$Name did not finish within $TimeoutSeconds s and was stopped.`n$excerpt" -Why $Why -Fix $Fix
+    }
+    if ($Result.ExitCode -ne 0) {
+        Write-BuildFailure -What "$Name failed (exit code $($Result.ExitCode)):`n$excerpt" -Why $Why -Fix $Fix
+    }
+}
+
+# A PowerShell script run under the SAME host that runs the caller (powershell.exe or pwsh), with the
+# argument prefix every build script is started with.
+function Invoke-BuildScript {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath, [string[]]$ArgumentList = @(),
+        [int]$TimeoutSeconds = 120, [string]$WorkingDirectory
+    )
+    $hostPath = (Get-Process -Id $PID).Path
+    return Invoke-ChildProcess -FilePath $hostPath -TimeoutSeconds $TimeoutSeconds -WorkingDirectory $WorkingDirectory `
+        -ArgumentList (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath) + $ArgumentList)
+}
+
+# ----------------------------------------------------------------------------
+#  Files
+# ----------------------------------------------------------------------------
+# The names (relative to $Dir, forward slashes, ordinal order) of every file below a directory, empty
+# for a missing directory. A junction or symbolic link anywhere below is refused: it would stage or
+# hash files that live outside the tree, and what is outside is not what was reviewed.
+function Get-RelativeFileList {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Dir)
+    $resolved = Resolve-BuildPath $Dir
+    if (-not (Test-Path -LiteralPath $resolved -PathType Container)) { return , [string[]]@() }
+    $root = [IO.Path]::GetFullPath($resolved).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($item in (Get-ChildItem -LiteralPath $resolved -Recurse -Force)) {
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Write-BuildFailure -What "$($item.FullName) is a junction or symbolic link inside $Dir." `
+                -Why 'A link makes the build read files from somewhere else than the reviewed tree, so the archive could contain content nobody checked in.' `
+                -Fix "Delete the link (for a junction: rmdir `"$($item.FullName)`") and put real files there."
+        }
+        if (-not $item.PSIsContainer) { $names.Add($item.FullName.Substring($root.Length).Replace('\', '/')) }
+    }
+    $sorted = $names.ToArray()
+    [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    return , $sorted
+}
+
 # ----------------------------------------------------------------------------
 #  Temp cleanup
 # ----------------------------------------------------------------------------
@@ -252,4 +338,5 @@ function Remove-BuildTempTree {
 
 Export-ModuleMember -Function Get-Utf8NoBomEncoding, Resolve-BuildPath, Write-BuildFailure, Get-ScriptFailureText,
     Read-Utf8Text, Read-JsonFile, Get-JsonProperty, Get-PropertyNames, Add-GitHubOutput, Remove-BuildTempTree,
-    ConvertTo-ArgumentElement, New-ChildProcessStartInfo, Stop-ChildProcess, Invoke-ChildProcess
+    ConvertTo-ArgumentElement, New-ChildProcessStartInfo, Stop-ChildProcess, Invoke-ChildProcess,
+    Get-OutputExcerpt, Assert-ChildOutcome, Invoke-BuildScript, Get-RelativeFileList

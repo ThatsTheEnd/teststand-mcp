@@ -14,10 +14,23 @@
 Set-StrictMode -Version 2.0
 
 Import-Module (Join-Path $PSScriptRoot 'BuildCommon.psm1')
+Import-Module (Join-Path $PSScriptRoot 'SkillSources.psm1')
 
 $script:RepoRoot = Split-Path -Parent $PSScriptRoot
-$script:DefaultPluginJsonPath = Join-Path $script:RepoRoot 'plugin\.claude-plugin\plugin.json'
-$script:DefaultMcpJsonPath = Join-Path $script:RepoRoot 'plugin\.mcp.json'
+$script:PluginJsonRelative = 'plugin\.claude-plugin\plugin.json'
+$script:McpJsonRelative = 'plugin\.mcp.json'
+$script:DefaultPluginJsonPath = Join-Path $script:RepoRoot $script:PluginJsonRelative
+$script:DefaultMcpJsonPath = Join-Path $script:RepoRoot $script:McpJsonRelative
+
+# The two source files the identity is read from, in a checkout rooted at $RepoRoot.
+function Get-PluginSourcePath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$RepoRoot)
+    return [pscustomobject]@{
+        PluginJson = (Join-Path $RepoRoot $script:PluginJsonRelative)
+        McpJson    = (Join-Path $RepoRoot $script:McpJsonRelative)
+    }
+}
 
 # Claude Code's naming rules for MCP tools (docs/validation/claude-code-plugin-facts.md, row 12).
 $script:PluginToolPrefixFormat = 'mcp__plugin_{0}_{1}__'
@@ -72,11 +85,7 @@ function Get-PluginIdentity {
 #  applied to the WHOLE file text - frontmatter, body and code blocks alike.
 # ----------------------------------------------------------------------------
 $script:RulesFileReference = 'CLAUDE.md'
-$script:RulesSkillName = 'teststand-rules'
-$script:RulesSkillReference = "the $($script:RulesSkillName) skill"   # exact, so the round trip is byte-identical
-
-# An optional BOM (U+FEFF) may precede the opening fence; it stays in the text untouched.
-$script:FrontmatterPattern = '(?s)\A' + [regex]::Escape([string][char]0xFEFF) + '?---\r?\n(.*?)\r?\n---'
+$script:RulesSkillReference = "the $SkillName skill"   # exact, so the round trip is byte-identical
 $script:ToolsLinePattern = '(?m)^tools:'
 
 function Get-AgentMappingTable {
@@ -89,7 +98,7 @@ function Get-AgentMappingTable {
 
 function Assert-HasToolsLine {
     param([string]$Text, [string]$Path)
-    $frontmatter = [regex]::Match($Text, $script:FrontmatterPattern)
+    $frontmatter = Get-FrontmatterMatch $Text
     if (-not $frontmatter.Success -or -not [regex]::IsMatch($frontmatter.Groups[1].Value, $script:ToolsLinePattern)) {
         throw "Agent has no 'tools:' line in its frontmatter: $Path"
     }
@@ -152,4 +161,4 @@ function ConvertFrom-PluginAgent {
     return Invoke-AgentConversion -Path $Path -Direction FromPlugin -Identity $Identity
 }
 
-Export-ModuleMember -Function Get-PluginIdentity, ConvertTo-PluginAgent, ConvertFrom-PluginAgent
+Export-ModuleMember -Function Get-PluginIdentity, Get-PluginSourcePath, ConvertTo-PluginAgent, ConvertFrom-PluginAgent
