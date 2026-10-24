@@ -18,17 +18,22 @@ Import-Module (Join-Path $PSScriptRoot 'ReleaseAssets.psm1')
 $script:MaxManifestProblemsShown = 5
 $script:UnknownUploader = '(unknown)'
 $script:NeverRetriesWhy = 'Running the verifier again will not help'
+$script:MayRetryWhy = 'Running the verifier again may help'
 
-# What the maintainer does after a fault, by where the assets came from. Local mode never talks about a draft.
+# What the maintainer does after a fault, by where the assets came from AND by release.draft: only a draft is
+# deleted first; a published release is rolled back or fixed forward. Local mode never talks about either.
 $script:RestartFix = @{
-    Api   = 'Start a new release run (delete the draft first).'
-    Local = ('Run the packaging script again so it produces all {0} assets.' -f (Get-RequiredAssetNames -Version '0.0.0').Count)
+    Api          = 'Start a new release run (delete the draft first).'
+    ApiPublished = 'The release is already published, so there is no draft to delete: delete the release so releases/latest falls back to the previous release (safe only once an earlier workflow-built release exists), or fix forward by releasing the next patch version (see CONTRIBUTING).'
+    Local        = ('Run the packaging script again so it produces all {0} assets.' -f (Get-RequiredAssetNames -Version '0.0.0').Count)
 }
 
 # ----------------------------------------------------------------------------
 #  The fault catalog: one entry per problem code. Fault is a format string over the problem's values;
 #  Fix is EXTRA advice after the common restart step (OwnFix: it replaces that step).
 #  Every Kind of Compare-ArchiveManifest has an entry (a test asserts it).
+#  Retryable marks a fault that is expected to heal by itself (a CDN still serving the previous
+#  release); the report then says running the verifier again MAY help instead of WILL NOT.
 # ----------------------------------------------------------------------------
 $script:Faults = @{
     'asset-missing'                = @{ Fault = '{0} is missing from the release'
@@ -83,6 +88,11 @@ $script:Faults = @{
                                         Why = 'users would install a different file than the one the release was verified for'
                                         OwnFix = $true
                                         Fix = 'Check what releases/latest points at. If a bad release is live, delete it so latest falls back to the previous release, or release the next patch version (see CONTRIBUTING).' }
+    'latest-not-verified'          = @{ Fault = "the plugin archive users download from releases/latest (hash {0}) is not the archive of the release that was just verified (hash {1})"
+                                        Why = 'releases/latest still serves another release, or the download has not propagated yet, so users would not get the release that was just published'
+                                        OwnFix = $true
+                                        Retryable = $true
+                                        Fix = 'Wait a minute and run the check again. If it keeps failing, open the Releases page and check which release is marked Latest, and that the publish step marked this one as the latest release.' }
 }
 
 function Get-ReleaseFaultCodes {
@@ -97,7 +107,10 @@ function New-Problem {
     param([Parameter(Mandatory)][string]$Code, [object[]]$Values = @())
     if (-not $script:Faults.ContainsKey($Code)) { throw "Unknown release fault code '$Code'" }
     $entry = $script:Faults[$Code]
-    return [pscustomobject]@{ Code = $Code; Fault = ([string]::Format($entry.Fault, $Values)); Why = $entry.Why; Fix = $entry.Fix; OwnFix = $entry.ContainsKey('OwnFix') }
+    return [pscustomobject]@{
+        Code = $Code; Fault = ([string]::Format($entry.Fault, $Values)); Why = $entry.Why; Fix = $entry.Fix
+        OwnFix = $entry.ContainsKey('OwnFix'); Retryable = $entry.ContainsKey('Retryable')
+    }
 }
 
 # ----------------------------------------------------------------------------
@@ -209,18 +222,20 @@ function Get-ReleaseProblems {
 # ----------------------------------------------------------------------------
 #  Report
 # ----------------------------------------------------------------------------
-# -Mode Api (a release on GitHub) or Local (staged assets): the fix differs, the faults do not.
+# -Mode Api (a draft on GitHub), ApiPublished (a release that is already public) or Local (staged assets):
+# the fix differs, the faults do not.
 function Format-ReleaseFailure {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Subject, [Parameter(Mandatory)][object[]]$Problems, [ValidateSet('Api', 'Local')][string]$Mode = 'Api')
+    param([Parameter(Mandatory)][string]$Subject, [Parameter(Mandatory)][object[]]$Problems, [ValidateSet('Api', 'ApiPublished', 'Local')][string]$Mode = 'Api')
     $reasons = @($Problems | ForEach-Object { $_.Why } | Select-Object -Unique)
     # The common step (start over) once, then each fault's own extra advice; a fault with OwnFix needs no restart.
     $fixes = @()
     if (@($Problems | Where-Object { -not $_.OwnFix }).Count -gt 0) { $fixes += $script:RestartFix[$Mode] }
     $fixes += @($Problems | ForEach-Object { $_.Fix } | Where-Object { $_ } | Select-Object -Unique)
+    $whyPrefix = if (@($Problems | Where-Object { -not $_.Retryable }).Count -eq 0) { $script:MayRetryWhy } else { $script:NeverRetriesWhy }
     return @{
         What = "$Subject must not go live: " + ((@($Problems | ForEach-Object { $_.Fault })) -join '; ') + '.'
-        Why  = "$($script:NeverRetriesWhy): " + ($reasons -join '; ') + '.'
+        Why  = "${whyPrefix}: " + ($reasons -join '; ') + '.'
         Fix  = ($fixes -join "`n")
     }
 }

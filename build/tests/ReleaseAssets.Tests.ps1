@@ -1455,6 +1455,176 @@ try {
         Assert-Equal 1 $run.ExitCode 'exit code'
         Assert-Contains $run.Output $MayHelp 'advice'
     }
+
+    # ============================================================================================
+    #  Slice 7 additions: fix wording by release.draft, the expected digest of -Latest, archive_sha256
+    # ============================================================================================
+    Invoke-Case 'fix wording: a published release with a fault never tells the maintainer to delete the draft first' {
+        $fixture = New-ReleaseFixture
+        $published = @{ IsDraft = $false; UploaderByAsset = @{ 'teststand-mcp.zip' = 'alice' } }
+        $run = Invoke-ApiVerify $fixture (New-FakeApi $fixture -ReleaseOptions $published)
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-NotContains $run.Output 'delete the draft first' 'the fix of a published release'
+        Assert-Contains $run.Output 'already published' 'the fix says the release is public'
+        Assert-Contains $run.Output 'releases/latest falls back' 'the rollback advice'
+        Assert-Contains $run.Output 'next patch version' 'the fix-forward advice'
+    }
+
+    Invoke-Case 'fix wording: a draft with a fault still says to delete the draft first' {
+        $fixture = New-ReleaseFixture
+        $draft = @{ IsDraft = $true; UploaderByAsset = @{ 'teststand-mcp.zip' = 'alice' } }
+        $run = Invoke-ApiVerify $fixture (New-FakeApi $fixture -ReleaseOptions $draft)
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-Contains $run.Output 'delete the draft first' 'the fix of a draft'
+        Assert-NotContains $run.Output 'already published' 'the fix of a draft'
+    }
+
+    Invoke-Case 'fix wording: a published release whose content is faulty is worded as published too' {
+        $fixture = New-ReleaseFixture
+        Set-ZeroDigest $fixture
+        $run = Invoke-ApiVerify $fixture (New-FakeApi $fixture -ReleaseOptions @{ IsDraft = $false })
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-Contains $run.Output 'does not match the archive digest' 'the fault'
+        Assert-NotContains $run.Output 'delete the draft first' 'the fix of a published release'
+    }
+
+    Invoke-Case 'fix wording: the public latest download is always a published release, so its restart fix never mentions a draft' {
+        $fixture = New-ReleaseFixture
+        Write-TextFile (Join-Path $fixture.Dir 'teststand-mcp.sha256') ($ZeroHash + "  other.zip`n")
+        $run = Invoke-LatestVerify (New-FakeApi $fixture)
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-Contains $run.Output 'names ''other.zip''' 'the fault'
+        Assert-NotContains $run.Output 'delete the draft first' 'the fix of the latest download'
+        Assert-Contains $run.Output 'already published' 'the fix says the release is public'
+    }
+
+    Invoke-Case 'fix wording: Format-ReleaseFailure in local mode still never talks about a draft or a published release' {
+        $failure = Format-ReleaseFailure -Subject 'x' -Problems @(New-Problem 'asset-missing' @('the plugin archive teststand-mcp.zip')) -Mode Local
+        Assert-NotContains $failure.Fix 'draft' 'local fix'
+        Assert-NotContains $failure.Fix 'published' 'local fix'
+    }
+
+    Invoke-Case 'api: the verified archive hash is written as the step output archive_sha256, after release_id and asset_ids' {
+        $fixture = New-ReleaseFixture
+        $outFile = Join-Path (New-TempDir) 'github_output'
+        Use-EnvironmentVariable 'GITHUB_OUTPUT' $outFile { $script:HashRun = Invoke-ApiVerify $fixture (New-FakeApi $fixture) }
+        Assert-Equal 0 $script:HashRun.ExitCode "exit code. Output was:`n$($script:HashRun.Output)"
+        $lines = @([IO.File]::ReadAllText($outFile, $Utf8NoBom) -split "`n" | Where-Object { $_ })
+        $expected = (Get-FileHash -LiteralPath (Join-Path $fixture.Dir 'teststand-mcp.zip') -Algorithm SHA256).Hash.ToLowerInvariant()
+        Assert-Equal "archive_sha256=$expected" $lines[2] 'archive_sha256 line'
+    }
+
+    Invoke-Case 'own-downloads: run_id is a JSON string even when the run id is all digits (the collector compares strings)' {
+        $fixture = New-ReleaseFixture
+        $recordPath = Join-Path (New-TempDir) 'own-downloads.json'
+        [void](Invoke-ApiVerify $fixture (New-FakeApi $fixture) -OwnDownloadsPath $recordPath -Extra @{ RunId = '1234567890'; Date = '2026-08-20' })
+        $text = [IO.File]::ReadAllText($recordPath, $Utf8NoBom)
+        Assert-True ($text -cmatch '"run_id":\s*"1234567890"') "run_id is not written as a quoted string. File was:`n$text"
+    }
+
+    Invoke-Case 'fault catalog: a propagation fault may be retried, every other fault never helps' {
+        $propagation = New-Problem 'latest-not-verified' @('aaa', 'bbb')
+        Assert-True $propagation.Retryable 'latest-not-verified is retryable'
+        $alone = Format-ReleaseFailure -Subject 'The latest release' -Problems @($propagation) -Mode ApiPublished
+        Assert-Contains $alone.Why $MayHelp 'why of a lone propagation fault'
+        Assert-NotContains $alone.Why $NeverHelps 'why of a lone propagation fault'
+        $mixed = Format-ReleaseFailure -Subject 'x' -Problems @($propagation, (New-Problem 'digest-mismatch' @('a', 'b'))) -Mode ApiPublished
+        Assert-Contains $mixed.Why $NeverHelps 'one non-retryable fault decides'
+        foreach ($code in @(Get-ReleaseFaultCodes | Where-Object { $_ -cne 'latest-not-verified' })) {
+            Assert-True (-not (New-Problem $code @('a', 'b', 'c')).Retryable) "$code must not be marked retryable"
+        }
+    }
+
+    Invoke-Case 'latest: an expected digest equal to the served archive passes and says so' {
+        $fixture = New-ReleaseFixture
+        $expected = (Get-FileHash -LiteralPath (Join-Path $fixture.Dir 'teststand-mcp.zip') -Algorithm SHA256).Hash.ToLowerInvariant()
+        $api = New-FakeApi $fixture
+        $run = Invoke-LatestVerify $api -Extra @{ ExpectedArchiveSha256 = $expected }
+        Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-Equal 0 $run.Delays.Count 'no wait when the first attempt matches'
+        Assert-Contains $run.Output 'verified release' 'the success line names the check against the verified release'
+    }
+
+    Invoke-Case 'latest: releases/latest still serving the previous release fails after the bounded retries and records every download' {
+        $previous = New-ReleaseFixture -ExtraEntries @(@{ Name = 'previous-only.txt'; Bytes = [byte[]](1, 2, 3) })
+        $verified = New-ReleaseFixture
+        $expected = (Get-FileHash -LiteralPath (Join-Path $verified.Dir 'teststand-mcp.zip') -Algorithm SHA256).Hash.ToLowerInvariant()
+        $recordPath = Join-Path (New-TempDir) 'own-downloads.json'
+        $run = Invoke-LatestVerify (New-FakeApi $previous) -Extra @{ ExpectedArchiveSha256 = $expected; OwnDownloadsPath = $recordPath; RunId = '9'; Date = '2026-08-21'; PropagationAttempts = 4; PropagationDelaySeconds = 7 }
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-Contains $run.Output 'not the archive of the release that was just verified' 'the fault'
+        Assert-Contains $run.Output $MayHelp 'the advice: this may be propagation'
+        Assert-Equal 3 $run.Delays.Count 'three waits between four attempts'
+        Assert-Equal '7,7,7' ($run.Delays -join ',') 'the wait between attempts'
+        Assert-Equal 4 (Read-OwnDownloads -Path $recordPath).Counts['2026-08-21']['teststand-mcp.zip']['published'] 'every attempt is a recorded download'
+    }
+
+    Invoke-Case 'latest: the new release appearing on the third attempt passes (CDN propagation)' {
+        $previous = New-ReleaseFixture -ExtraEntries @(@{ Name = 'previous-only.txt'; Bytes = [byte[]](1, 2, 3) })
+        $verified = New-ReleaseFixture
+        $expected = (Get-FileHash -LiteralPath (Join-Path $verified.Dir 'teststand-mcp.zip') -Algorithm SHA256).Hash.ToLowerInvariant()
+        $served = $previous.Dir
+        $newDir = $verified.Dir
+        $plan = {
+            param($Name, $Count)
+            if ($Count -ge 3) { Get-ChildItem -LiteralPath $newDir -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $served $_.Name) -Force } }
+        }.GetNewClosure()
+        $run = Invoke-LatestVerify (New-FakeApi $previous -Plan $plan) -Extra @{ ExpectedArchiveSha256 = $expected }
+        Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-Equal 2 $run.Delays.Count 'two waits before the third attempt'
+    }
+
+    Invoke-Case 'latest: an asset missing from the previous latest release (the first workflow release) is waited out, not fatal' {
+        $fixture = New-ReleaseFixture
+        $expected = (Get-FileHash -LiteralPath (Join-Path $fixture.Dir 'teststand-mcp.zip') -Algorithm SHA256).Hash.ToLowerInvariant()
+        $plan = { param($Name, $Count) if ($Name -eq 'teststand-mcp.zip' -and $Count -le 2) { 'The remote server returned an error: (404) Not Found.' } }
+        $run = Invoke-LatestVerify (New-FakeApi $fixture -Plan $plan) -Extra @{ ExpectedArchiveSha256 = $expected }
+        Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-Equal 2 $run.Delays.Count 'two waits'
+    }
+
+    Invoke-Case 'latest: without an expected digest there is exactly one attempt and the old behaviour' {
+        $previous = New-ReleaseFixture
+        $run = Invoke-LatestVerify (New-FakeApi $previous)
+        Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-NotContains $run.Output 'verified release' 'no expected digest, no claim about the verified release'
+        Assert-Equal 0 $run.Delays.Count 'no wait'
+    }
+
+    Invoke-Case 'latest: a malformed expected digest, or one without -Latest, is a three-part failure' {
+        $fixture = New-ReleaseFixture
+        foreach ($bad in @('abc', ('g' * 64), (('a' * 63) + ' '))) {
+            $run = Invoke-LatestVerify (New-FakeApi $fixture) -Extra @{ ExpectedArchiveSha256 = $bad }
+            Assert-Equal 1 $run.ExitCode "exit code for [$bad]"
+            Assert-Contains $run.Output 'ExpectedArchiveSha256' 'the failure names the parameter'
+        }
+        $local = Invoke-Script $VerifierPath @{ Tag = $fixture.Tag; LocalDir = $fixture.Dir; ExpectedArchiveSha256 = ('a' * 64) }
+        Assert-Equal 1 $local.ExitCode 'exit code without -Latest'
+        Assert-Contains $local.Output 'only with -Latest' 'the failure says where it applies'
+    }
+
+    Invoke-Case 'latest: -Repo names the repository whose releases/latest is fetched, so a fork checks itself' {
+        $fixture = New-ReleaseFixture
+        $api = New-FakeApi $fixture
+        $run = Invoke-LatestVerify $api -Extra @{ Repo = 'someone/teststand-mcp-fork' }
+        Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-Equal 'https://github.com/someone/teststand-mcp-fork/releases/latest/download/teststand-mcp.zip' $api.State.Calls[0].Uri 'first url'
+        $none = New-FakeApi $fixture
+        [void](Invoke-LatestVerify $none)
+        Assert-Equal $ExpectedLatestUrl $none.State.Calls[0].Uri 'without -Repo the contract repository'
+    }
+
+    Invoke-Case 'latest: -Latest with -LocalDir, or a bad -Repo, is still refused' {
+        $fixture = New-ReleaseFixture
+        $both = Invoke-Script $VerifierPath @{ Latest = $true; LocalDir = $fixture.Dir; Version = '1.9.0' }
+        Assert-Equal 1 $both.ExitCode 'exit code for two sources'
+        $bad = Invoke-LatestVerify (New-FakeApi $fixture) -Extra @{ Repo = 'not a repo' }
+        Assert-Equal 1 $bad.ExitCode 'exit code for a bad repo'
+    }
+
+    Invoke-Case 'contract: Get-LatestDownloadUrl takes the repository of a fork' {
+        Assert-Equal 'https://github.com/a/b/releases/latest/download/teststand-mcp.sha256' (Get-LatestDownloadUrl -AssetName 'teststand-mcp.sha256' -Repo 'a/b') 'url'
+    }
 }
 finally {
     foreach ($name in $savedEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name]) }

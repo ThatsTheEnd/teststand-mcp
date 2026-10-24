@@ -30,14 +30,28 @@
 #                                              -ReleaseJson is a releases-list JSON giving the
 #                                              uploaders (needs -Tag); without it the uploader check
 #                                              is skipped.
-#    -Latest                                   what users get: the unauthenticated releases/latest
+#    -Latest [-Repo owner/name]                what users get: the unauthenticated releases/latest
 #                                              download of the plugin archive, hashed and compared
 #                                              with the published archive digest. Recorded as a
-#                                              published download.
+#                                              published download. -Repo names the repository whose
+#                                              latest release is fetched (default: the contract
+#                                              repository), so a fork checks itself.
+#                                              -ExpectedArchiveSha256 <hex> is the hash of the archive
+#                                              that was just verified: the check then fails while
+#                                              releases/latest still serves ANOTHER release (the
+#                                              previous one: its archive and digest agree with each
+#                                              other, so without this it would pass). That state is
+#                                              expected for a short while after publishing, so the
+#                                              check is tried up to -PropagationAttempts times,
+#                                              -PropagationDelaySeconds apart; every try is a
+#                                              recorded download.
 #  -Rehearsal accepts the dry-run tag v<X.Y.Z>-rehearsal.
 #  -OwnDownloadsPath records every download in own-downloads.json (see ReleaseAssets.psm1)
 #  immediately BEFORE its request. The phase comes from the release's own draft flag; -Draft
 #  forces draft. -Date and -RunId override the recorded date and run id (tests).
+#  Draft mode also writes the step output archive_sha256: the hash of the archive that was verified.
+#  A failure is worded by release.draft: a draft is deleted first, a published release is rolled back
+#  or fixed forward (a published release never gets "delete the draft first").
 #  Test seams: -HttpGet (the HTTP boundary), -Delay (the wait before the retry).
 #  Windows PowerShell 5.1 and PowerShell 7 compatible.
 # ============================================================================
@@ -49,6 +63,9 @@ param(
     [string]$LocalDir,
     [string]$ReleaseJson,
     [switch]$Latest,
+    [string]$ExpectedArchiveSha256,
+    [int]$PropagationAttempts = 6,
+    [int]$PropagationDelaySeconds = 15,
     [switch]$Rehearsal,
     [string]$OwnDownloadsPath,
     [switch]$Draft,
@@ -74,6 +91,7 @@ $BinaryAccept = 'application/octet-stream'
 $RepoPattern = '\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z'
 $DotsOnlyPattern = '\A\.+\z'
 $AssetIdPattern = '\A[0-9]+\z'
+$Sha256Pattern = '\A[0-9a-f]{64}\z'
 $UnknownUploader = '(unknown)'
 $DraftPhase = 'draft'
 $PublishedPhase = 'published'
@@ -308,11 +326,24 @@ function Resolve-ReleaseVersion {
 }
 
 function Assert-SourceChoice {
-    $sources = @([bool]$Latest, -not [string]::IsNullOrEmpty($Repo), -not [string]::IsNullOrEmpty($LocalDir)) | Where-Object { $_ }
+    # -Repo is a source of its own (the API) unless -Latest is given: then it only names the repository of the latest download.
+    $sources = @([bool]$Latest, (-not $Latest -and -not [string]::IsNullOrEmpty($Repo)), -not [string]::IsNullOrEmpty($LocalDir)) | Where-Object { $_ }
     if (@($sources).Count -ne 1) {
         Write-BuildFailure -What 'Give exactly one source: -Repo, -LocalDir or -Latest.' `
             -Why 'The verifier reads a release through the GitHub API, a directory of staged assets, or the public latest download; mixing them has no meaning.' `
-            -Fix 'Use -Repo owner/name -Tag vX.Y.Z [-Token t], or -LocalDir <dir> -Version X.Y.Z, or -Latest.'
+            -Fix 'Use -Repo owner/name -Tag vX.Y.Z [-Token t], or -LocalDir <dir> -Version X.Y.Z, or -Latest [-Repo owner/name].'
+    }
+    if ($ExpectedArchiveSha256) {
+        if (-not $Latest) {
+            Write-BuildFailure -What '-ExpectedArchiveSha256 was given without -Latest.' `
+                -Why 'It is the hash the public latest download must serve; the API and local modes verify the digest the release carries instead.' `
+                -Fix 'Use it only with -Latest, or drop it.'
+        }
+        if ($ExpectedArchiveSha256 -cnotmatch $Sha256Pattern) {
+            Write-BuildFailure -What "-ExpectedArchiveSha256 '$ExpectedArchiveSha256' is not 64 lower-case hex digits." `
+                -Why 'It is compared with the SHA-256 of the archive users download.' `
+                -Fix 'Pass the archive_sha256 output of the draft verification step.'
+        }
     }
     if ($Repo) {
         $segments = @($Repo -split '/')
@@ -336,7 +367,7 @@ function New-DownloadRecorder {
 }
 
 function Write-StepOutputs {
-    param($Release, [object[]]$Assets, [string[]]$RequiredNames)
+    param($Release, [object[]]$Assets, [string[]]$RequiredNames, [string]$ArchiveSha256)
     $releaseId = [string](Get-JsonProperty $Release 'id')
     if ($releaseId -cmatch $AssetIdPattern) { Add-GitHubOutput -Name 'release_id' -Value $releaseId }
     $ids = [ordered]@{}
@@ -345,38 +376,71 @@ function Write-StepOutputs {
         if ($null -ne $asset -and $asset.Id -cmatch $AssetIdPattern) { $ids[$name] = [int64]$asset.Id }
     }
     Add-GitHubOutput -Name 'asset_ids' -Value (ConvertTo-Json -InputObject $ids -Compress)
+    Add-GitHubOutput -Name 'archive_sha256' -Value $ArchiveSha256
 }
 
-function Test-LatestDownload {
-    param($Connection, [string]$TempRoot)
+# ONE fetch of the public latest download and its judgement. Throws a build failure; $Totals counts the requests.
+function Test-LatestOnce {
+    param($Connection, [string]$DestDir, [string]$ExpectedHash, [int]$DownloadAttempts, $Totals)
     $transfer = [pscustomobject]@{ Requested = 0; Saved = @{} }
+    $latestRepo = if ($Repo) { $Repo } else { $ReleaseRepoSlug }
     $requests = @(foreach ($name in @($ReleaseArchiveName, $ReleaseDigestName)) {
-        New-DownloadRequest -Name $name -Uri (Get-LatestDownloadUrl -AssetName $name) -Accept $BinaryAccept -UseToken $false -Size $null
+        New-DownloadRequest -Name $name -Uri (Get-LatestDownloadUrl -AssetName $name -Repo $latestRepo) -Accept $BinaryAccept -UseToken $false -Size $null
     })
     $recorder = New-DownloadRecorder -Phase $PublishedPhase
-    $destDir = Join-Path $TempRoot 'latest'
-    [void](New-Item -ItemType Directory -Path $destDir -Force)
-    $outcome = Invoke-FetchWithRetry -Fetch { param($attempt) Save-Downloads $Connection $requests $destDir $transfer $recorder } `
-        -Delay $Delay -DelaySeconds $RetryDelaySeconds -MaxAttempts $MaxAttempts
+    [void](New-Item -ItemType Directory -Path $DestDir -Force)
+    try {
+        $outcome = Invoke-FetchWithRetry -Fetch { param($attempt) Save-Downloads $Connection $requests $DestDir $transfer $recorder } `
+            -Delay $Delay -DelaySeconds $RetryDelaySeconds -MaxAttempts $DownloadAttempts
+    } finally {
+        $Totals.Requested += $transfer.Requested
+    }
     Assert-DownloadsSucceeded $outcome 'The latest release'
 
     try {
         $digest = ConvertFrom-DigestText -Text (Read-Utf8Text $transfer.Saved[$ReleaseDigestName])
     } catch {
-        Assert-ReleaseFailure 'The latest release' @(New-Problem 'digest-malformed' @($_.Exception.Message)) 'Api'
+        Assert-ReleaseFailure 'The latest release' @(New-Problem 'digest-malformed' @($_.Exception.Message)) 'ApiPublished'
     }
     $archiveHash = Get-FileSha256 $transfer.Saved[$ReleaseArchiveName]
-    if ($digest.Name -cne $ReleaseArchiveName) { Assert-ReleaseFailure 'The latest release' @(New-Problem 'digest-name' @($digest.Name)) 'Api' }
-    if ($digest.Hash -cne $archiveHash) { Assert-ReleaseFailure 'The latest release' @(New-Problem 'latest-mismatch' @($archiveHash, $digest.Hash)) 'Api' }
-    Write-Host "The latest download of $ReleaseArchiveName matches the published archive digest ($archiveHash)."
-    Write-Host "Requested $($transfer.Requested) asset download(s) in $($outcome.Attempts) attempt(s)."
+    if ($digest.Name -cne $ReleaseArchiveName) { Assert-ReleaseFailure 'The latest release' @(New-Problem 'digest-name' @($digest.Name)) 'ApiPublished' }
+    if ($digest.Hash -cne $archiveHash) { Assert-ReleaseFailure 'The latest release' @(New-Problem 'latest-mismatch' @($archiveHash, $digest.Hash)) 'ApiPublished' }
+    if ($ExpectedHash -and $archiveHash -cne $ExpectedHash) {
+        Assert-ReleaseFailure 'The latest release' @(New-Problem 'latest-not-verified' @($archiveHash, $ExpectedHash)) 'ApiPublished'
+    }
+    $claim = if ($ExpectedHash) { 'matches the published archive digest and is the archive of the verified release' } else { 'matches the published archive digest' }
+    Write-Host "The latest download of $ReleaseArchiveName $claim ($archiveHash)."
+}
+
+# Without an expected hash: one try (a download error is retried once). With one, releases/latest may still serve the
+# previous release for a while (or lack the asset altogether, for the first workflow release), so every kind of failure
+# is tried again, -PropagationDelaySeconds apart, up to -PropagationAttempts times; the last failure is the report.
+function Test-LatestDownload {
+    param($Connection, [string]$TempRoot)
+    $tries = if ($ExpectedArchiveSha256) { [Math]::Max(1, $PropagationAttempts) } else { 1 }
+    $downloadAttempts = if ($ExpectedArchiveSha256) { 1 } else { $MaxAttempts }
+    $totals = [pscustomobject]@{ Requested = 0 }
+    for ($try = 1; $try -le $tries; $try++) {
+        try {
+            Test-LatestOnce -Connection $Connection -DestDir (Join-Path $TempRoot "latest-$try") -ExpectedHash $ExpectedArchiveSha256 -DownloadAttempts $downloadAttempts -Totals $totals
+            break
+        } catch {
+            if ($try -ge $tries) { throw }
+            $firstLine = @($_.Exception.Message -split '\r?\n')[0]
+            Write-Host "Try $try of ${tries}: $firstLine`nWaiting $PropagationDelaySeconds s for releases/latest to settle."
+            & $Delay $PropagationDelaySeconds
+        }
+    }
+    Write-Host "Requested $($totals.Requested) asset download(s) in $try try(ies)."
 }
 
 function Test-ApiRelease {
     param($Connection, [string]$Tag, [string]$ReleaseVersion, [string]$TempRoot)
     $release = Get-ReleaseFromApi $Connection $Repo $Tag
+    $isDraft = [bool]$Draft -or ((Get-JsonProperty $release 'draft') -eq $true)
+    $failureMode = if ($isDraft) { 'Api' } else { 'ApiPublished' }   # the fix differs: a draft is deleted, a published release is rolled back
     $listedAssets = @(ConvertTo-ListedAssets $release)
-    Assert-ReleaseFailure "Release $Tag" @(Get-ReleaseProblems -Assets $listedAssets -Version $ReleaseVersion -Scope Listing) 'Api'
+    Assert-ReleaseFailure "Release $Tag" @(Get-ReleaseProblems -Assets $listedAssets -Version $ReleaseVersion -Scope Listing) $failureMode
 
     $requiredNames = @(Get-RequiredAssetNames -Version $ReleaseVersion)
     $requests = @(foreach ($name in $requiredNames) {
@@ -388,7 +452,6 @@ function Test-ApiRelease {
         New-DownloadRequest -Name $name -Uri "$($Connection.ApiBaseUrl)/repos/$Repo/releases/assets/$($asset.Id)" -Accept $BinaryAccept -UseToken $true -Size $asset.Size
     })
 
-    $isDraft = [bool]$Draft -or ((Get-JsonProperty $release 'draft') -eq $true)
     $recorder = New-DownloadRecorder -Phase $(if ($isDraft) { $DraftPhase } else { $PublishedPhase })
     $transfer = [pscustomobject]@{ Requested = 0; Saved = @{} }
     $destDir = Join-Path $TempRoot 'release'
@@ -398,9 +461,9 @@ function Test-ApiRelease {
     Assert-DownloadsSucceeded $outcome "Release $Tag"
 
     foreach ($asset in $listedAssets) { if ($transfer.Saved.ContainsKey($asset.Name)) { $asset.Path = $transfer.Saved[$asset.Name] } }
-    Assert-ReleaseFailure "Release $Tag" @(Get-ReleaseProblems -Assets $listedAssets -Version $ReleaseVersion -Scope Content) 'Api'
+    Assert-ReleaseFailure "Release $Tag" @(Get-ReleaseProblems -Assets $listedAssets -Version $ReleaseVersion -Scope Content) $failureMode
 
-    Write-StepOutputs -Release $release -Assets $listedAssets -RequiredNames $requiredNames
+    Write-StepOutputs -Release $release -Assets $listedAssets -RequiredNames $requiredNames -ArchiveSha256 (Get-FileSha256 $transfer.Saved[$ReleaseArchiveName])
     Write-Host "Release $Tag verified: the $($requiredNames.Count) required assets match (digest, manifest, versioned archive), every asset uploaded by $ReleaseUploaderLogin."
     Write-Host "Requested $($transfer.Requested) asset download(s) in $($outcome.Attempts) attempt(s)."
 }

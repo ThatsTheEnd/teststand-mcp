@@ -43,10 +43,11 @@ function Get-RequiredAssetNames {
     return @($ReleaseArchiveName, $ReleaseDigestName, $ReleaseManifestName, (Get-VersionedArchiveName -Version $Version))
 }
 
+# -Repo names another repository (a fork rehearsing the release); the default is the contract repository.
 function Get-LatestDownloadUrl {
     [CmdletBinding()]
-    param([string]$AssetName = $ReleaseArchiveName)
-    return ($script:LatestDownloadUrlFormat -f $ReleaseRepoSlug, $AssetName)
+    param([string]$AssetName = $ReleaseArchiveName, [string]$Repo = $ReleaseRepoSlug)
+    return ($script:LatestDownloadUrlFormat -f $Repo, $AssetName)
 }
 
 # ----------------------------------------------------------------------------
