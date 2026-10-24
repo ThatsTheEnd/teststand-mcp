@@ -773,6 +773,7 @@ try {
 
     function Stop-StubReleaseServer {
         param($Server)
+        if ($Server.Stats.Stop) { return }
         $Server.Stats.Stop = $true
         try { [void]$Server.Shell.EndInvoke($Server.Handle) } catch { }
         $Server.Shell.Dispose()
@@ -1074,9 +1075,7 @@ try {
             Assert-True ($null -ne (Get-UpdateMessage -Installed (& $v '1.9.0') -Latest (& $v '1.10.0') -AnnouncedVersion '1.10.0' -AnnouncedEpoch ($now - $day) -NowEpoch $now)) 'announced exactly 24 h ago'
             Assert-True ($null -ne (Get-UpdateMessage -Installed (& $v '1.9.0') -Latest (& $v '1.11.0') -AnnouncedVersion '1.10.0' -AnnouncedEpoch ($now - 60) -NowEpoch $now)) 'a newer version than the announced one'
         }
-    } finally {
-        foreach ($server in $script:StubServers) { Stop-StubReleaseServer $server }
-    }
+    } finally { }
 
     Invoke-Case 'guard (windows): a repeated warning renews the throttle (silent one hour after the 24 h repeat)' {
         $fixture = New-GuardFixture -PyOut '1 0'
@@ -1084,8 +1083,209 @@ try {
         Assert-Contains (Invoke-Guard $fixture -Now $FixedNow.AddHours(24)).Message 'Pillow' 'repeat after 24 h'
         Assert-Equal $null (Invoke-Guard $fixture -Now $FixedNow.AddHours(25)).Message 'one hour after the repeat'
     }
+
+    # === Step 4.4: hooks.json wiring and build/New-HooksJson.ps1 ===================================
+    $HooksJsonPath = Join-Path $HooksDir 'hooks.json'
+    $NewHooksJsonPath = Join-Path $RepoRoot 'build\New-HooksJson.ps1'
+    $PluginRootToken = '${CLAUDE_PLUGIN_ROOT}'
+    $ExactMatcherPattern = '\A[A-Za-z0-9_|-]+\z'   # the "list of exact strings" character set of the hooks docs
+    $SessionStartTimeoutSeconds = 5
+
+    function Read-HooksJson { return ([IO.File]::ReadAllText($HooksJsonPath, $Utf8NoBom) | ConvertFrom-Json) }
+
+    # Runs New-HooksJson.ps1 in a child host; returns exit code and text.
+    function Invoke-NewHooksJson {
+        param([string[]]$ScriptArguments = @())
+        $quoted = ($ScriptArguments | ForEach-Object { '"' + $_ + '"' }) -join ' '
+        return Invoke-ProcessWithStdin -FileName $HostPath -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + $NewHooksJsonPath + '" ' + $quoted) -StdinText ''
+    }
+
+    # The `${CLAUDE_PLUGIN_ROOT}/hooks/<name>` path inside a hook command, with the root substituted.
+    function Get-CommandScriptPath {
+        param([string]$Command, [string]$PluginRoot)
+        $match = [regex]::Match($Command, '"(\$\{CLAUDE_PLUGIN_ROOT\}/hooks/[^"]+)"')
+        if (-not $match.Success) { throw "no quoted \${CLAUDE_PLUGIN_ROOT} script path in [$Command]" }
+        return $match.Groups[1].Value.Replace($PluginRootToken, $PluginRoot).Replace('/', '\')
+    }
+
+    # Runs a hooks.json command the way `"shell": "powershell"` does: as PowerShell text, with the
+    # placeholder substituted. -EncodedCommand carries the text without any command-line encoding loss.
+    function Invoke-HookCommand {
+        param([string]$Command, [string]$PluginRoot, [string]$StdinText, [hashtable]$EnvOverrides = @{})
+        $text = $Command.Replace($PluginRootToken, $PluginRoot)
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($text))
+        $envMap = @{ CLAUDE_PLUGIN_ROOT = $PluginRoot }
+        foreach ($key in $EnvOverrides.Keys) { $envMap[$key] = $EnvOverrides[$key] }
+        return Invoke-ProcessWithStdin -FileName $HostPath -Arguments ('-NoProfile -NonInteractive -EncodedCommand ' + $encoded) -StdinText $StdinText -EnvOverrides $envMap
+    }
+
+    Invoke-Case 'wiring: hooks.json has a description and exactly the PreToolUse and SessionStart events' {
+        $config = Read-HooksJson
+        Assert-True (-not [string]::IsNullOrWhiteSpace($config.description)) 'a top-level description'
+        Assert-AsciiOnly $config.description 'description'
+        Assert-Equal 'PreToolUse,SessionStart' (@($config.hooks.PSObject.Properties | ForEach-Object { $_.Name }) -join ',') 'events'
+    }
+
+    Invoke-Case 'wiring: the PreToolUse matcher is exactly the allow-listed names, each with the plugin tool prefix' {
+        $config = Read-HooksJson
+        $groups = @($config.hooks.PreToolUse)
+        Assert-Equal 1 $groups.Count 'PreToolUse groups'
+        $matcher = [string]$groups[0].matcher
+        Assert-True ($matcher -cmatch $ExactMatcherPattern) 'the matcher uses only exact-string characters, so it is no regular expression'
+        $expected = @((Read-ToolClasses -Path $ToolClassesPath).allow | ForEach-Object { $IdentityPrefix + $_ })
+        Assert-Equal 75 $expected.Count 'allow-listed tools'
+        Assert-Equal ($expected -join '|') $matcher 'matcher'
+    }
+
+    Invoke-Case 'wiring: no prompting tool and no named exclusion is in the PreToolUse matcher' {
+        $names = ([string](Read-HooksJson).hooks.PreToolUse[0].matcher).Split('|')
+        $classes = Read-ToolClasses -Path $ToolClassesPath
+        $leaks = @($classes.prompt | Where-Object { $names -ccontains ($IdentityPrefix + $_) })
+        Assert-Equal '' ($leaks -join ',') 'prompting tools that would start the hook'
+        Assert-True (@($names | Where-Object { -not $_.StartsWith($IdentityPrefix, [StringComparison]::Ordinal) }).Count -eq 0) 'every name has the prefix'
+    }
+
+    Invoke-Case 'wiring: every hook is a PowerShell-pinned command with a quoted script path that exists' {
+        $config = Read-HooksJson
+        $pluginRoot = Join-Path $RepoRoot 'plugin'
+        $hooks = @($config.hooks.PreToolUse.hooks) + @($config.hooks.SessionStart.hooks)
+        Assert-Equal 3 $hooks.Count 'hook entries (allow, guard, notify)'
+        foreach ($hook in $hooks) {
+            Assert-Equal 'command' $hook.type 'type'
+            Assert-Equal 'powershell' $hook.shell 'shell'
+            Assert-True ($hook.command -cmatch '\Apowershell -NoProfile -ExecutionPolicy Bypass -File "\$\{CLAUDE_PLUGIN_ROOT\}/hooks/[A-Za-z0-9._-]+\.ps1"\z') "command [$($hook.command)]"
+            $scriptPath = Get-CommandScriptPath $hook.command $pluginRoot
+            Assert-True (Test-Path -LiteralPath $scriptPath -PathType Leaf) "script missing: $scriptPath"
+        }
+        Assert-Equal 'allow-readonly.ps1' (Split-Path -Leaf (Get-CommandScriptPath $config.hooks.PreToolUse[0].hooks[0].command $pluginRoot)) 'PreToolUse script'
+    }
+
+    Invoke-Case 'wiring: the SessionStart entries match startup only and each carries a timeout of at most 5 seconds' {
+        $groups = @((Read-HooksJson).hooks.SessionStart)
+        Assert-True ($groups.Count -ge 1) 'a SessionStart group'
+        $scripts = @()
+        foreach ($group in $groups) {
+            Assert-Equal 'startup' $group.matcher 'matcher'
+            foreach ($hook in @($group.hooks)) {
+                Assert-True ($hook.timeout -is [int] -or $hook.timeout -is [long]) "timeout is a number in seconds: [$($hook.timeout)]"
+                Assert-True ($hook.timeout -gt 0 -and $hook.timeout -le $SessionStartTimeoutSeconds) "timeout [$($hook.timeout)]"
+                $scripts += (Split-Path -Leaf (Get-CommandScriptPath $hook.command (Join-Path $RepoRoot 'plugin')))
+            }
+        }
+        Assert-Equal 'platform-guard.ps1,update-notify.ps1' ($scripts -join ',') 'SessionStart scripts'
+    }
+
+    Invoke-Case 'wiring: the POSIX guard is not wired (no sh entry, no .sh path anywhere in hooks.json)' {
+        $text = [IO.File]::ReadAllText($HooksJsonPath, $Utf8NoBom)
+        Assert-NotContains $text '.sh' 'hooks.json'
+        Assert-NotContains $text '"bash"' 'hooks.json'
+    }
+
+    Invoke-Case 'wiring: New-HooksJson.ps1 reproduces the committed hooks.json byte for byte (line endings aside)' {
+        $out = Join-Path (New-TempDir) 'hooks.json'
+        $result = Invoke-NewHooksJson @('-OutputPath', $out)
+        Assert-Equal 0 $result.ExitCode "exit code (output: $($result.Stdout) $($result.Stderr))"
+        $generated = [IO.File]::ReadAllBytes($out)
+        Assert-True (-not ($generated.Length -ge 3 -and $generated[0] -eq 0xEF -and $generated[1] -eq 0xBB -and $generated[2] -eq 0xBF)) 'no BOM'
+        Assert-True ($generated -notcontains 13) 'LF line endings only'
+        Assert-Equal 10 $generated[$generated.Length - 1] 'a final newline'
+        $committed = [IO.File]::ReadAllText($HooksJsonPath, $Utf8NoBom).Replace("`r`n", "`n")
+        Assert-Equal $committed ($Utf8NoBom.GetString($generated)) 'generated text against committed text'
+    }
+
+    Invoke-Case 'wiring: the matcher follows the allow-list of whatever classification it is given' {
+        $dir = New-TempDir
+        $registry = Join-Path $dir 'Registry.cs'
+        [IO.File]::WriteAllText($registry, 'Register("get_a", x); Register("get_b", x); Register("set_c", x);', $Utf8NoBom)
+        $classes = Join-Path $dir 'classes.json'
+        [IO.File]::WriteAllText($classes, '{"allow":["get_a","get_b"],"prompt":["set_c"]}', $Utf8NoBom)
+        $out = Join-Path $dir 'hooks.json'
+        $result = Invoke-NewHooksJson @('-OutputPath', $out, '-ClassesPath', $classes, '-RegistryPath', $registry)
+        Assert-Equal 0 $result.ExitCode "exit code (output: $($result.Stdout))"
+        $config = [IO.File]::ReadAllText($out, $Utf8NoBom) | ConvertFrom-Json
+        Assert-Equal ($IdentityPrefix + 'get_a|' + $IdentityPrefix + 'get_b') $config.hooks.PreToolUse[0].matcher 'matcher'
+    }
+
+    $GeneratorFaults = @(
+        @{ Name = 'a wildcard in the allow-list';            Classes = '{"allow":["get_*"],"prompt":["get_a","get_b","set_c"]}'; Names = @('get_*', 'E_ALLOW_WILDCARD') }
+        @{ Name = 'a registered tool in neither list';       Classes = '{"allow":["get_a"],"prompt":["set_c"]}';                 Names = @('get_b', 'E_UNCLASSIFIED') }
+        @{ Name = 'an allow-list name that is not registered'; Classes = '{"allow":["get_a","get_b","get_ghost"],"prompt":["set_c"]}'; Names = @('get_ghost', 'E_ALLOW_NOT_REGISTERED') }
+        @{ Name = 'a tool in both lists';                    Classes = '{"allow":["get_a","get_b"],"prompt":["get_b","set_c"]}'; Names = @('get_b', 'E_IN_BOTH_LISTS') }
+    )
+    foreach ($fault in $GeneratorFaults) {
+        Invoke-Case "wiring: New-HooksJson.ps1 refuses $($fault.Name), names it, and writes nothing" {
+            $dir = New-TempDir
+            $registry = Join-Path $dir 'Registry.cs'
+            [IO.File]::WriteAllText($registry, 'Register("get_a", x); Register("get_b", x); Register("set_c", x);', $Utf8NoBom)
+            $classes = Join-Path $dir 'classes.json'
+            [IO.File]::WriteAllText($classes, $fault.Classes, $Utf8NoBom)
+            $out = Join-Path $dir 'hooks.json'
+            $result = Invoke-NewHooksJson @('-OutputPath', $out, '-ClassesPath', $classes, '-RegistryPath', $registry)
+            Assert-Equal 1 $result.ExitCode 'exit code'
+            foreach ($name in $fault.Names) { Assert-Contains $result.Stdout $name 'failure text' }
+            foreach ($label in 'What:', 'Why:', 'Fix:') { Assert-Contains $result.Stdout $label 'three-part failure' }
+            Assert-True (-not (Test-Path -LiteralPath $out)) 'no hooks.json is written for an invalid classification'
+        }
+    }
+
+    Invoke-Case 'wiring: New-HooksJson.ps1 fails with a three-part message for a missing classification file' {
+        $out = Join-Path (New-TempDir) 'hooks.json'
+        $result = Invoke-NewHooksJson @('-OutputPath', $out, '-ClassesPath', (Join-Path (New-TempDir) 'absent.json'))
+        Assert-Equal 1 $result.ExitCode 'exit code'
+        Assert-Contains $result.Stdout 'absent.json' 'names the file'
+        Assert-Contains $result.Stdout 'Fix:' 'three-part failure'
+    }
+
+    # --- the hook commands, run from a staging copy under a path with a space and a non-ASCII letter ---
+    $AwkwardSuffix = ' T' + [char]0x00E9 + 'st'
+    function New-StagedPlugin {
+        param([string]$Version = '1.9.0')
+        $staging = New-TempDir $AwkwardSuffix
+        $pluginRoot = Join-Path $staging 'plugin root'
+        Copy-Item -LiteralPath (Join-Path $RepoRoot 'plugin') -Destination $pluginRoot -Recurse
+        [IO.File]::WriteAllText((Join-Path $pluginRoot '.claude-plugin\plugin.json'), ('{"name":"' + $PluginName + '","version":"' + $Version + '"}'), $Utf8NoBom)
+        return $pluginRoot
+    }
+
+    Invoke-Case 'wiring: the awkward-path scenario - the PreToolUse command allows a read-only tool from a path with a space and a non-ASCII letter' {
+        $pluginRoot = New-StagedPlugin
+        Assert-True ($pluginRoot -match ' ') 'the staged path has a space'
+        Assert-True ($pluginRoot -match [string][char]0x00E9) 'the staged path has a non-ASCII letter'
+        $command = (Read-HooksJson).hooks.PreToolUse[0].hooks[0].command
+        $result = Invoke-HookCommand $command $pluginRoot (ConvertTo-HookInput ($IdentityPrefix + 'get_steps'))
+        Assert-Equal 0 $result.ExitCode "exit code (stderr: $($result.Stderr))"
+        Assert-AllowDecision $result
+        $prompting = Invoke-HookCommand $command $pluginRoot (ConvertTo-HookInput ($IdentityPrefix + 'insert_step'))
+        Assert-NoDecision $prompting
+    }
+
+    Invoke-Case 'wiring: the awkward-path scenario - the platform guard command starts and adds the rules pointer' {
+        $pluginRoot = New-StagedPlugin
+        $fixture = New-GuardFixture
+        $command = (Read-HooksJson).hooks.SessionStart[0].hooks | Where-Object { $_.command -like '*platform-guard.ps1*' } | Select-Object -First 1 -ExpandProperty command
+        $guardEnv = $fixture.Env.Clone()
+        $guardEnv['PATH'] = $fixture.Env['PATH'] + ';' + (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0')   # the command itself starts `powershell`
+        $result = Invoke-HookCommand $command $pluginRoot '{"source":"startup"}' $guardEnv
+        Assert-Equal 0 $result.ExitCode "exit code (stderr: $($result.Stderr))"
+        Assert-Equal '' $result.Stderr 'stderr'
+        Assert-Contains $result.Stdout 'teststand-rules' 'stdout'
+    }
+
+    Invoke-Case 'wiring: the awkward-path scenario - the update-notify command announces a newer release' {
+        $pluginRoot = New-StagedPlugin
+        $server = Start-StubReleaseServer -Mode redirect -Location 'https://github.com/Zuehlke/teststand-mcp/releases/tag/v1.10.0'
+        $state = Join-Path (Split-Path -Parent $pluginRoot) 'state'
+        $command = (Read-HooksJson).hooks.SessionStart[0].hooks | Where-Object { $_.command -like '*update-notify.ps1*' } | Select-Object -First 1 -ExpandProperty command
+        $envMap = @{ TESTSTAND_MCP_RELEASES_BASE_URL = $server.BaseUrl; TESTSTAND_MCP_STATE_DIR = $state; TESTSTAND_MCP_NOW = $FixedNow.ToString('o'); TESTSTAND_MCP_NO_UPDATE_CHECK = $null }
+        $result = Invoke-HookCommand $command $pluginRoot '{"source":"startup"}' $envMap
+        Assert-Equal 0 $result.ExitCode "exit code (stderr: $($result.Stderr))"
+        Assert-Equal '' $result.Stderr 'stderr'
+        Assert-Contains $result.Stdout '1.10.0' 'stdout'
+        Assert-AsciiOnly $result.Stdout 'stdout'
+    }
 }
 finally {
+    foreach ($server in $script:StubServers) { Stop-StubReleaseServer $server }
     Remove-Module PluginIdentity -ErrorAction SilentlyContinue
     Remove-Module ToolClassification -ErrorAction SilentlyContinue
     foreach ($dir in $script:TempDirs) {

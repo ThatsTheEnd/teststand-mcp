@@ -4,7 +4,8 @@
 #    Get-RegisteredToolNames : the tool names, read from the Register("...") calls
 #                              of src/Tools/TestStandToolRegistry.cs;
 #    Read-ToolClasses        : tool-classes.json as an object;
-#    Test-ToolClassification : the violations of one classification (empty = valid).
+#    Test-ToolClassification : the violations of one classification (empty = valid);
+#    Assert-ToolClassification : the same check as a three-part build failure.
 #  Compatible with Windows PowerShell 5.1 and PowerShell 7.
 # ============================================================================
 Set-StrictMode -Version 2.0
@@ -136,4 +137,20 @@ function Test-ToolClassification {
     return $violations
 }
 
-Export-ModuleMember -Function Read-ToolClasses, Get-RegisteredToolNames, Test-ToolClassification
+# Fails (What / Why / Fix) naming every violation; returns nothing when the classification is valid.
+function Assert-ToolClassification {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Classes,
+        [Parameter(Mandatory)][string[]]$RegisteredTools,
+        [Parameter(Mandatory)][string]$ClassesPath
+    )
+    $violations = @(Test-ToolClassification -Classes $Classes -RegisteredTools $RegisteredTools)
+    if ($violations.Count -eq 0) { return }
+    $lines = ($violations | ForEach-Object { $_.Message }) -join "`n"
+    Write-BuildFailure -What "$ClassesPath breaks the tool classification rules:`n$lines" `
+        -Why 'An unclassified or malformed entry would auto-allow a tool nobody reviewed, or leave one without a decision, so no hooks.json is written.' `
+        -Fix 'Put every registered tool in exactly one of the allow and prompt lists (literal names only), and keep the named exclusions out of allow.'
+}
+
+Export-ModuleMember -Function Read-ToolClasses, Get-RegisteredToolNames, Test-ToolClassification, Assert-ToolClassification
