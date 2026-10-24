@@ -35,6 +35,7 @@
     <Compile Include="..\..\src\Tools\StepCopyPolicy.cs" Link="Shared\StepCopyPolicy.cs" />
     <Compile Include="..\..\src\Tools\TypeConsistencyAuditor.cs" Link="Shared\TypeConsistencyAuditor.cs" />
     <Compile Include="..\..\src\Tools\TestStandToolRegistry.cs" Link="Shared\TestStandToolRegistry.cs" />
+    <Compile Include="..\..\src\VersionInfo.cs" Link="Shared\VersionInfo.cs" />
   </ItemGroup>
 
   <!-- ── Fixture assembly for the .NET adapter tests ───────────────────── -->

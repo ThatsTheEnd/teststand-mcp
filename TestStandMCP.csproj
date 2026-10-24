@@ -17,7 +17,7 @@
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
-    <Version>1.0.0</Version>
+    <Version>0.0.0-dev</Version>
     <Description>MCP Server for NI TestStand automation and integration</Description>
     <Authors>TestStandMCP</Authors>
     <Platforms>AnyCPU;x86</Platforms>
