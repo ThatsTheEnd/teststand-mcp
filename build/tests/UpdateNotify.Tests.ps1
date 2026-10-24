@@ -18,7 +18,7 @@ $NotifyScriptPath = Join-Path $HooksDir 'update-notify.ps1'
 $NotifyStateFile = 'update-notify.json'
 $MarketplaceName = (Get-Content -LiteralPath (Join-Path $RepoRoot '.claude-plugin\marketplace.json') -Raw | ConvertFrom-Json).name
 $PluginJsonPath = Join-Path $RepoRoot 'plugin\.claude-plugin\plugin.json'
-$NewerTag = 'https://github.com/Zuehlke/teststand-mcp/releases/tag/v1.10.0'
+$NewerTag = 'https://github.com/ThatsTheEnd/teststand-mcp/releases/tag/v1.10.0'
 $HttpTimeoutMilliseconds = 3000
 $WallTimeBoundMilliseconds = 5000   # HTTP budget plus the shell start, checked only when TESTSTAND_MCP_TIMING_CHECK=1
 
@@ -31,7 +31,7 @@ function New-NotifyFixture {
     $pluginRoot = Join-Path $root 'plugin-root'
     [void](New-Item -ItemType Directory -Path (Join-Path $pluginRoot '.claude-plugin'))
     $server = $null
-    $baseUrl = 'http://127.0.0.1:' + (Get-FreeLoopbackPort) + '/Zuehlke/teststand-mcp'   # nothing listens there
+    $baseUrl = 'http://127.0.0.1:' + (Get-FreeLoopbackPort) + '/ThatsTheEnd/teststand-mcp'   # nothing listens there
     if (-not $NoServer) { $server = Start-StubReleaseServer -Mode $Mode -Location $Location -StatusCode $StatusCode; $baseUrl = $server.BaseUrl }
     if (-not $NoPluginJson) {
         $repositoryUrl = if ($Repository) { $Repository } else { $baseUrl }
@@ -101,7 +101,7 @@ try {
         Assert-True ($result.Message.IndexOf($first, [StringComparison]::Ordinal) -lt $result.Message.IndexOf($second, [StringComparison]::Ordinal)) 'step 1 comes before step 2'
         Assert-Equal 1 $fixture.Server.Stats.RequestCount 'requests'
         Assert-Equal 'HEAD' $fixture.Server.Stats.RequestMethod 'request method'
-        Assert-Equal '/Zuehlke/teststand-mcp/releases/latest' $fixture.Server.Stats.RequestPath 'request path'
+        Assert-Equal '/ThatsTheEnd/teststand-mcp/releases/latest' $fixture.Server.Stats.RequestPath 'request path'
     }
 
     Invoke-ServerCase 'notify: the plugin name in the update command comes from plugin.json' {
@@ -129,11 +129,11 @@ try {
         @{ Name = 'the lookup answers 200 and no redirect';            Installed = '1.9.0';  Mode = 'status';   StatusCode = 200; Requests = 1 }
         @{ Name = 'the redirect has no Location header';               Installed = '1.9.0';  Mode = 'nolocation'; Requests = 1 }
         @{ Name = 'the redirect is an unparsable text';                Installed = '1.9.0';  Mode = 'redirect'; Location = '/banana'; Requests = 1 }
-        @{ Name = 'the redirect does not name a tag';                  Installed = '1.9.0';  Mode = 'redirect'; Location = 'https://github.com/Zuehlke/teststand-mcp/releases'; Requests = 1 }
-        @{ Name = 'the redirect names a malformed tag (v1.x)';         Installed = '1.9.0';  Mode = 'redirect'; Location = 'https://github.com/Zuehlke/teststand-mcp/releases/tag/v1.x'; Requests = 1 }
-        @{ Name = 'the redirect names a two-part tag (v2.0)';          Installed = '1.9.0';  Mode = 'redirect'; Location = 'https://github.com/Zuehlke/teststand-mcp/releases/tag/v2.0'; Requests = 1 }
-        @{ Name = 'the redirect names a pre-release tag (v2.0.0-rc1)'; Installed = '1.9.0';  Mode = 'redirect'; Location = 'https://github.com/Zuehlke/teststand-mcp/releases/tag/v2.0.0-rc1'; Requests = 1 }
-        @{ Name = 'the redirect names an overflowing tag';             Installed = '1.9.0';  Mode = 'redirect'; Location = 'https://github.com/Zuehlke/teststand-mcp/releases/tag/v99999999999.0.0'; Requests = 1 }
+        @{ Name = 'the redirect does not name a tag';                  Installed = '1.9.0';  Mode = 'redirect'; Location = 'https://github.com/ThatsTheEnd/teststand-mcp/releases'; Requests = 1 }
+        @{ Name = 'the redirect names a malformed tag (v1.x)';         Installed = '1.9.0';  Mode = 'redirect'; Location = 'https://github.com/ThatsTheEnd/teststand-mcp/releases/tag/v1.x'; Requests = 1 }
+        @{ Name = 'the redirect names a two-part tag (v2.0)';          Installed = '1.9.0';  Mode = 'redirect'; Location = 'https://github.com/ThatsTheEnd/teststand-mcp/releases/tag/v2.0'; Requests = 1 }
+        @{ Name = 'the redirect names a pre-release tag (v2.0.0-rc1)'; Installed = '1.9.0';  Mode = 'redirect'; Location = 'https://github.com/ThatsTheEnd/teststand-mcp/releases/tag/v2.0.0-rc1'; Requests = 1 }
+        @{ Name = 'the redirect names an overflowing tag';             Installed = '1.9.0';  Mode = 'redirect'; Location = 'https://github.com/ThatsTheEnd/teststand-mcp/releases/tag/v99999999999.0.0'; Requests = 1 }
     )
     foreach ($row in $SilentRows) {
         Invoke-ServerCase "notify: silent when $($row.Name)" {
@@ -174,7 +174,7 @@ try {
 
     Invoke-ServerCase 'notify: an override URL outside https://github.com/ and loopback is ignored, the plugin.json repository is used' {
         $fixture = New-NotifyFixture
-        $result = Invoke-Notify $fixture -Extra @{ TESTSTAND_MCP_RELEASES_BASE_URL = 'https://evil.example.com/Zuehlke/teststand-mcp' }
+        $result = Invoke-Notify $fixture -Extra @{ TESTSTAND_MCP_RELEASES_BASE_URL = 'https://evil.example.com/ThatsTheEnd/teststand-mcp' }
         Assert-Contains $result.Message '1.10.0' 'message'
         Assert-Equal 1 $fixture.Server.Stats.RequestCount 'requests to the plugin.json repository'
     }
@@ -185,7 +185,7 @@ try {
     }
 
     Invoke-ServerCase 'notify: an allowed loopback override beats the plugin.json repository' {
-        $fixture = New-NotifyFixture -Repository 'https://github.com/Zuehlke/teststand-mcp'
+        $fixture = New-NotifyFixture -Repository 'https://github.com/ThatsTheEnd/teststand-mcp'
         $result = Invoke-Notify $fixture -Extra @{ TESTSTAND_MCP_RELEASES_BASE_URL = $fixture.BaseUrl }
         Assert-Contains $result.Message '1.10.0' 'message'
         Assert-Equal 1 $fixture.Server.Stats.RequestCount 'requests to the override'
@@ -193,7 +193,7 @@ try {
 
     Invoke-Case 'notify (pure): Test-AllowedBaseUrl accepts https://github.com/ and loopback http only' {
         . $NotifyScriptPath
-        foreach ($good in 'https://github.com/Zuehlke/teststand-mcp', 'HTTPS://GITHUB.COM/x', 'http://127.0.0.1:8080/x', 'http://localhost:8080/x') {
+        foreach ($good in 'https://github.com/ThatsTheEnd/teststand-mcp', 'HTTPS://GITHUB.COM/x', 'http://127.0.0.1:8080/x', 'http://localhost:8080/x') {
             Assert-Equal $true (Test-AllowedBaseUrl $good) "[$good]"
         }
         foreach ($bad in 'http://github.com/x', 'https://github.com.evil.io/x', 'https://evil.example.com/x', 'http://127.0.0.1/x', 'http://example.com:80/x', 'ftp://github.com/x', '', ' ') {
@@ -231,19 +231,19 @@ try {
     }
 
     Invoke-ServerCase 'notify: an upper-case tag in the redirect (V1.8.6) is read as 1.8.6' {
-        $fixture = New-NotifyFixture -Installed '1.8.0' -Location 'https://github.com/Zuehlke/teststand-mcp/releases/tag/V1.8.6'
+        $fixture = New-NotifyFixture -Installed '1.8.0' -Location 'https://github.com/ThatsTheEnd/teststand-mcp/releases/tag/V1.8.6'
         $result = Invoke-Notify $fixture
         Assert-Contains $result.Message '1.8.6' 'message'
         Assert-NotContains $result.Message 'V1.8.6' 'the V is stripped'
     }
 
     Invoke-ServerCase 'notify: a relative Location (path only) is understood' {
-        Assert-Contains (Invoke-Notify (New-NotifyFixture -Location '/Zuehlke/teststand-mcp/releases/tag/v1.10.0')).Message '1.10.0' 'message'
+        Assert-Contains (Invoke-Notify (New-NotifyFixture -Location '/ThatsTheEnd/teststand-mcp/releases/tag/v1.10.0')).Message '1.10.0' 'message'
     }
 
     Invoke-ServerCase 'notify: versions compare numerically (1.10.0 is newer than 1.9.0)' {
         Assert-True ($null -ne (Invoke-Notify (New-NotifyFixture -Installed '1.9.0')).Message) '1.10.0 > 1.9.0'
-        Assert-Equal $null (Invoke-Notify (New-NotifyFixture -Installed '1.10.0' -Location 'https://github.com/Zuehlke/teststand-mcp/releases/tag/v1.9.0')).Message '1.9.0 < 1.10.0'
+        Assert-Equal $null (Invoke-Notify (New-NotifyFixture -Installed '1.10.0' -Location 'https://github.com/ThatsTheEnd/teststand-mcp/releases/tag/v1.9.0')).Message '1.9.0 < 1.10.0'
     }
 
     # --- cache boundaries (the state is written directly: no run sequence reaches "stale lookup, fresh announcement") ---
@@ -305,7 +305,7 @@ try {
     }
 
     Invoke-ServerCase 'notify cache: 1.10.0 announced 3 hours ago and 1.11.0 now the latest announces 1.11.0' {
-        $fixture = New-NotifyFixture -Location 'https://github.com/Zuehlke/teststand-mcp/releases/tag/v1.11.0'
+        $fixture = New-NotifyFixture -Location 'https://github.com/ThatsTheEnd/teststand-mcp/releases/tag/v1.11.0'
         Set-NotifyState $fixture -LookupAgeSeconds (25 * $Hours) -Latest '1.10.0' -Announced '1.10.0' -AnnouncedAgeSeconds (3 * $Hours)
         $result = Invoke-Notify $fixture
         Assert-Contains $result.Message '1.11.0' 'message'

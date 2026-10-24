@@ -2,7 +2,7 @@
   "name": "zuehlke-teststand",
   "owner": {
     "name": "Zühlke Engineering AG",
-    "url": "https://github.com/Zuehlke/teststand-mcp"
+    "url": "https://github.com/ThatsTheEnd/teststand-mcp"
   },
   "description": "NI TestStand tooling for AI assistants, published by Zühlke Engineering AG.",
   "plugins": [
@@ -10,14 +10,14 @@
       "name": "teststand-mcp",
       "source": {
         "source": "archive",
-        "url": "https://github.com/Zuehlke/teststand-mcp/releases/latest/download/teststand-mcp.zip"
+        "url": "https://github.com/ThatsTheEnd/teststand-mcp/releases/latest/download/teststand-mcp.zip"
       },
       "description": "TestStand MCP: build, edit, run and document NI TestStand sequence files from an AI assistant, with bundled TestStand agents and usage rules. Windows x86, NI TestStand required.",
       "author": {
         "name": "Zühlke Engineering AG"
       },
-      "homepage": "https://github.com/Zuehlke/teststand-mcp",
-      "repository": "https://github.com/Zuehlke/teststand-mcp",
+      "homepage": "https://github.com/ThatsTheEnd/teststand-mcp",
+      "repository": "https://github.com/ThatsTheEnd/teststand-mcp",
       "license": "MIT",
       "keywords": [
         "teststand",

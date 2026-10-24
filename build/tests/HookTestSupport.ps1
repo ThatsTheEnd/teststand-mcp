@@ -263,7 +263,7 @@ function Start-StubReleaseServer {
         $handle = $shell.BeginInvoke()
         $deadline = [DateTime]::UtcNow.AddSeconds(10)
         while (-not $stats.Ready -and -not $stats.Failed -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 20 }
-        $server = [pscustomobject]@{ BaseUrl = "http://127.0.0.1:$port/Zuehlke/teststand-mcp"; Stats = $stats; Shell = $shell; Handle = $handle }
+        $server = [pscustomobject]@{ BaseUrl = "http://127.0.0.1:$port/ThatsTheEnd/teststand-mcp"; Stats = $stats; Shell = $shell; Handle = $handle }
         if ($stats.Ready) {
             $script:StubServers += $server
             return $server

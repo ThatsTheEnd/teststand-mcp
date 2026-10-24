@@ -20,7 +20,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 # ----------------------------------------------------------------------------
 #  Asset contract (exported, read-only)
 # ----------------------------------------------------------------------------
-Set-Variable -Name ReleaseRepoSlug -Value 'Zuehlke/teststand-mcp' -Option ReadOnly -Scope Script
+Set-Variable -Name ReleaseRepoSlug -Value 'ThatsTheEnd/teststand-mcp' -Option ReadOnly -Scope Script
 Set-Variable -Name ReleaseArchiveName -Value 'teststand-mcp.zip' -Option ReadOnly -Scope Script
 Set-Variable -Name ReleaseDigestName -Value 'teststand-mcp.sha256' -Option ReadOnly -Scope Script
 Set-Variable -Name ReleaseManifestName -Value 'teststand-mcp.manifest.sha256' -Option ReadOnly -Scope Script

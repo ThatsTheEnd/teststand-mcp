@@ -348,7 +348,7 @@ function Assert-SourceChoice {
     if ($Repo) {
         $segments = @($Repo -split '/')
         if ($Repo -cnotmatch $RepoPattern -or @($segments | Where-Object { $_ -cmatch $DotsOnlyPattern }).Count -gt 0) {
-            Write-BuildFailure -What "The repository '$Repo' is not owner/name." -Why 'It becomes part of the API URL, so it is restricted to letters, digits, dot, dash and underscore.' -Fix 'Pass -Repo Zuehlke/teststand-mcp.'
+            Write-BuildFailure -What "The repository '$Repo' is not owner/name." -Why 'It becomes part of the API URL, so it is restricted to letters, digits, dot, dash and underscore.' -Fix 'Pass -Repo ThatsTheEnd/teststand-mcp.'
         }
     }
     if ($LocalDir -and -not (Test-Path -LiteralPath (Resolve-BuildPath $LocalDir) -PathType Container)) {

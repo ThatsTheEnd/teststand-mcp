@@ -54,7 +54,7 @@ function Invoke-HookEntry {
 # A copy of plugin/ under <guid> T<e-acute>st\plugin root, with a plugin.json that names the stub release server.
 $AwkwardSuffix = ' T' + [char]0x00E9 + 'st'
 function New-StagedPlugin {
-    param([string]$Version = '1.9.0', [string]$Repository = 'https://github.com/Zuehlke/teststand-mcp')
+    param([string]$Version = '1.9.0', [string]$Repository = 'https://github.com/ThatsTheEnd/teststand-mcp')
     $staging = New-TempDir $AwkwardSuffix
     $pluginRoot = Join-Path $staging 'plugin root'
     Copy-Item -LiteralPath (Join-Path $RepoRoot 'plugin') -Destination $pluginRoot -Recurse
@@ -236,7 +236,7 @@ try {
     }
 
     Invoke-ServerCase 'awkward path: the update-notify command announces a newer release' {
-        $server = Start-StubReleaseServer -Mode redirect -Location 'https://github.com/Zuehlke/teststand-mcp/releases/tag/v1.10.0'
+        $server = Start-StubReleaseServer -Mode redirect -Location 'https://github.com/ThatsTheEnd/teststand-mcp/releases/tag/v1.10.0'
         $pluginRoot = New-StagedPlugin -Repository $server.BaseUrl
         $state = Join-Path (Split-Path -Parent $pluginRoot) 'state'
         $envMap = @{ TESTSTAND_MCP_STATE_DIR = $state; TESTSTAND_MCP_NOW = $FixedNow.ToString('o'); TESTSTAND_MCP_NO_UPDATE_CHECK = $null; TESTSTAND_MCP_RELEASES_BASE_URL = $null }
