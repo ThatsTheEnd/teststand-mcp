@@ -80,12 +80,21 @@ function New-HooksCopy {
     return $dir
 }
 
+# A plugin root whose plugin.json carries the given name (or the given raw text).
+function New-PluginRootFixture {
+    param([string]$Name, [string]$RawJson = $null)
+    $root = New-TempDir
+    $text = if ($RawJson) { $RawJson } else { '{"name": "' + $Name + '", "version": "0.0.0"}' }
+    Write-TextFile (Join-Path $root '.claude-plugin\plugin.json') $text
+    return $root
+}
+
 # ---- the platform-guard station ------------------------------------------------------------------
 # A synthetic station: temp Program Files roots and stub py / python launchers on a private PATH. Each
 # stub appends its arguments to a log, prints the text in its *_OUT variable and exits with *_EXIT.
 function New-GuardFixture {
     param(
-        [switch]$NoTestStand, [switch]$NoBrowser,
+        [switch]$NoTestStand, [switch]$NoBrowser, [switch]$TestStand64,
         [AllowNull()][string]$PyOut = '1 1', [int]$PyExit = 0,
         [AllowNull()][string]$PythonOut = $null, [int]$PythonExit = 0,
         [string]$StubBody = ''
@@ -96,7 +105,9 @@ function New-GuardFixture {
     $bin = Join-Path $root 'bin'
     $state = Join-Path $root 'state'
     foreach ($dir in $programFiles, $programFilesX86, $bin) { [void](New-Item -ItemType Directory -Path $dir) }
+    # The default station has 32-bit TestStand only; -TestStand64 adds the 64-bit install under the 64-bit root.
     if (-not $NoTestStand) { [void](New-Item -ItemType Directory -Path (Join-Path $programFilesX86 'National Instruments\TestStand 2024')) }
+    if ($TestStand64) { [void](New-Item -ItemType Directory -Path (Join-Path $programFiles 'National Instruments\TestStand 2024')) }
     if (-not $NoBrowser) {
         $edgeDir = Join-Path $programFiles 'Microsoft\Edge\Application'
         [void](New-Item -ItemType Directory -Path $edgeDir)
@@ -114,6 +125,8 @@ function New-GuardFixture {
         TESTSTAND_MCP_NOW                 = $FixedNow.ToString('o')
         TESTSTAND_MCP_NO_PLATFORM_WARNING = $null
         TestStand                         = $null
+        TestStand64                       = $null
+        CLAUDE_PLUGIN_ROOT                = $null
         CLAUDE_PLUGIN_DATA                = $null
         ProgramFiles                      = $programFiles
         ProgramW6432                      = $programFiles

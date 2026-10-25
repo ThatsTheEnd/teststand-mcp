@@ -81,6 +81,54 @@ try {
         Assert-Equal $null (Invoke-Guard (New-GuardFixture)).Message 'systemMessage'   # the default fixture installs it under pf86 only
     }
 
+    # --- one TestStand bitness per plugin ----------------------------------------------------------------
+    Invoke-Case 'guard: the bitness table names the two plugins of the identity table, 32-bit and 64-bit' {
+        . $GuardPath
+        Import-Module (Join-Path $RepoRoot 'build\PluginIdentity.psm1') -Force
+        foreach ($architecture in (Get-PluginArchitectures)) {
+            $identity = Get-PluginIdentity -Architecture $architecture
+            Assert-True $script:PluginBitness.Contains($identity.name) "the guard has no row for $($identity.name)"
+            Assert-Equal $identity.bits $script:PluginBitness[$identity.name].Bits "$($identity.name) bits"
+        }
+        Assert-Equal 2 $script:PluginBitness.Count 'rows'
+    }
+
+    Invoke-Case 'guard: the x64 plugin with a 64-bit TestStand reports no TestStand problem' {
+        $fixture = New-GuardFixture -NoTestStand -TestStand64
+        Assert-Equal $null (Invoke-Guard $fixture @{ CLAUDE_PLUGIN_ROOT = (New-PluginRootFixture 'teststand-mcp-x64') }).Message 'systemMessage'
+    }
+
+    Invoke-Case 'guard: the x64 plugin with only a 32-bit TestStand warns and names teststand-mcp as the plugin to install' {
+        $result = Invoke-Guard (New-GuardFixture) @{ CLAUDE_PLUGIN_ROOT = (New-PluginRootFixture 'teststand-mcp-x64') }
+        Assert-GuardClean $result
+        foreach ($named in @('NI TestStand 64-bit was not detected', '32-bit TestStand is installed', 'claude plugin install teststand-mcp@zuehlke-teststand')) {
+            Assert-Contains $result.Message $named 'warning'
+        }
+        Assert-Equal 1 (Get-ItemLines $result.Message).Count 'item lines'
+    }
+
+    Invoke-Case 'guard: the x86 plugin with only a 64-bit TestStand warns and names teststand-mcp-x64' {
+        $result = Invoke-Guard (New-GuardFixture -NoTestStand -TestStand64)
+        Assert-GuardClean $result
+        Assert-Contains $result.Message 'NI TestStand 32-bit was not detected' 'warning'
+        Assert-Contains $result.Message 'claude plugin install teststand-mcp-x64@zuehlke-teststand' 'warning'
+    }
+
+    Invoke-Case 'guard: the TestStand64 variable counts for the x64 plugin only' {
+        $x64Root = New-PluginRootFixture 'teststand-mcp-x64'
+        Assert-Equal $null (Invoke-Guard (New-GuardFixture -NoTestStand) @{ CLAUDE_PLUGIN_ROOT = $x64Root; TestStand64 = 'C:\somewhere\TestStand' }).Message 'x64 plugin'
+        Assert-Contains (Invoke-Guard (New-GuardFixture -NoTestStand) @{ TestStand64 = 'C:\somewhere\TestStand' }).Message 'NI TestStand 32-bit was not detected' 'x86 plugin'
+        Assert-Contains (Invoke-Guard (New-GuardFixture -NoTestStand) @{ CLAUDE_PLUGIN_ROOT = $x64Root; TestStand = 'C:\somewhere\TestStand' }).Message 'NI TestStand 64-bit was not detected' 'TestStand does not count for x64'
+    }
+
+    Invoke-Case 'guard: no TestStand at all warns as before, for either plugin' {
+        foreach ($root in @($null, (New-PluginRootFixture 'teststand-mcp-x64'))) {
+            $message = (Invoke-Guard (New-GuardFixture -NoTestStand) @{ CLAUDE_PLUGIN_ROOT = $root }).Message
+            Assert-Contains $message 'NI TestStand was not detected. Fix: install NI TestStand 2019 or later' 'warning'
+            Assert-NotContains $message 'claude plugin install' 'no other plugin to point at'
+        }
+    }
+
     Invoke-Case 'guard: a National Instruments folder without a TestStand folder is not detected' {
         $fixture = New-GuardFixture -NoTestStand
         [void](New-Item -ItemType Directory -Path (Join-Path $fixture.ProgramFiles 'National Instruments\LabVIEW 2024'))

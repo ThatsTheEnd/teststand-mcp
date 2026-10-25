@@ -25,15 +25,6 @@ function Invoke-AllowHookProcess {
     return Invoke-HookScript -ScriptPath $ScriptPath -StdinText $Stdin -EnvOverrides @{ TESTSTAND_MCP_STATE_DIR = (New-TempDir); CLAUDE_PLUGIN_ROOT = $PluginRoot }
 }
 
-# A plugin root whose plugin.json carries the given name (or the given raw text).
-function New-PluginRootFixture {
-    param([string]$Name, [string]$RawJson = $null)
-    $root = New-TempDir
-    $text = if ($RawJson) { $RawJson } else { '{"name": "' + $Name + '", "version": "0.0.0"}' }
-    Write-TextFile (Join-Path $root '.claude-plugin\plugin.json') $text
-    return $root
-}
-
 function Assert-AllowDecision {
     param($Result)
     Assert-Equal 0 $Result.ExitCode "exit code (stderr: $($Result.Stderr))"
