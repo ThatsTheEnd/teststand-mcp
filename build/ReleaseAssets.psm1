@@ -21,12 +21,14 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 #  Asset contract (exported, read-only)
 # ----------------------------------------------------------------------------
 Set-Variable -Name ReleaseRepoSlug -Value 'Zuehlke/teststand-mcp' -Option ReadOnly -Scope Script
-Set-Variable -Name ReleaseArchiveName -Value 'teststand-mcp.zip' -Option ReadOnly -Scope Script
-Set-Variable -Name ReleaseDigestName -Value 'teststand-mcp.sha256' -Option ReadOnly -Scope Script
-Set-Variable -Name ReleaseManifestName -Value 'teststand-mcp.manifest.sha256' -Option ReadOnly -Scope Script
+# Every asset name starts with this prefix, so a workflow can pick the assets up with one glob ($ReleaseAssetPrefix*).
+Set-Variable -Name ReleaseAssetPrefix -Value 'teststand-mcp' -Option ReadOnly -Scope Script
+Set-Variable -Name ReleaseArchiveName -Value "$ReleaseAssetPrefix.zip" -Option ReadOnly -Scope Script
+Set-Variable -Name ReleaseDigestName -Value "$ReleaseAssetPrefix.sha256" -Option ReadOnly -Scope Script
+Set-Variable -Name ReleaseManifestName -Value "$ReleaseAssetPrefix.manifest.sha256" -Option ReadOnly -Scope Script
 Set-Variable -Name ReleaseUploaderLogin -Value 'github-actions[bot]' -Option ReadOnly -Scope Script
 
-$script:VersionedArchiveFormat = 'teststand-mcp-v{0}.zip'
+$script:VersionedArchiveFormat = "$ReleaseAssetPrefix-v{0}.zip"
 $script:LatestDownloadUrlFormat = 'https://github.com/{0}/releases/latest/download/{1}'
 
 function Get-VersionedArchiveName {
@@ -41,6 +43,36 @@ function Get-RequiredAssetNames {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Version)
     return @($ReleaseArchiveName, $ReleaseDigestName, $ReleaseManifestName, (Get-VersionedArchiveName -Version $Version))
+}
+
+# A folder of release assets holds exactly the required files of the version: no missing one, no extra one
+# (an extra file would be uploaded as a release asset nobody verifies). Subfolders are not assets.
+function Assert-ReleaseAssetFiles {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][string]$Version)
+    $resolved = Resolve-BuildPath $Directory
+    $expected = @(Get-RequiredAssetNames -Version $Version)
+    $present = @()
+    if (Test-Path -LiteralPath $resolved -PathType Container) { $present = @(Get-ChildItem -LiteralPath $resolved -File | ForEach-Object { $_.Name }) }
+    $missing = @($expected | Where-Object { $present -cnotcontains $_ })
+    $unexpected = @($present | Where-Object { $expected -cnotcontains $_ })
+    if ($missing.Count -eq 0 -and $unexpected.Count -eq 0) { return }
+    $detail = @()
+    if ($missing.Count -gt 0) { $detail += "missing: $($missing -join ', ')" }
+    if ($unexpected.Count -gt 0) { $detail += "unexpected: $($unexpected -join ', ')" }
+    Write-BuildFailure -What "The asset folder $Directory does not hold exactly the $($expected.Count) release assets of version $Version ($($detail -join '; '))." `
+        -Why 'Every file of the folder would be uploaded to the release, so a missing asset makes an incomplete release and an extra one ships a file nobody verified. Running it again will not help.' `
+        -Fix "Check what the package job uploaded (the release-assets artifact): it must hold exactly $($expected -join ', ')."
+}
+
+# owner/name, as the GitHub API and gh take it; it becomes part of a URL, so only letters, digits, dot, dash and underscore.
+function Assert-RepoSlug {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Repo)
+    $segments = @($Repo -split '/')
+    if ($Repo -cnotmatch '\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z' -or @($segments | Where-Object { $_ -cmatch '\A\.+\z' }).Count -gt 0) {
+        Write-BuildFailure -What "The repository '$Repo' is not owner/name." -Why 'It becomes part of the API URL, so it is restricted to letters, digits, dot, dash and underscore.' -Fix 'Pass -Repo Zuehlke/teststand-mcp.'
+    }
 }
 
 # -Repo names another repository (a fork rehearsing the release); the default is the contract repository.
@@ -544,9 +576,9 @@ function Assert-ReleaseAssetSet {
         -Fix $fix
 }
 
-Export-ModuleMember -Variable ReleaseRepoSlug, ReleaseArchiveName, ReleaseDigestName, ReleaseManifestName, ReleaseUploaderLogin, ArchiveProblemKinds
-Export-ModuleMember -Function Get-VersionedArchiveName, Get-RequiredAssetNames, Get-LatestDownloadUrl,
+Export-ModuleMember -Variable ReleaseRepoSlug, ReleaseAssetPrefix, ReleaseArchiveName, ReleaseDigestName, ReleaseManifestName, ReleaseUploaderLogin, ArchiveProblemKinds
+Export-ModuleMember -Function Get-VersionedArchiveName, Get-RequiredAssetNames, Assert-ReleaseAssetFiles, Assert-RepoSlug, Get-LatestDownloadUrl,
     Get-FileSha256, Get-StreamSha256, Format-HashLine, ConvertFrom-HashLines,
-    ConvertFrom-ReleaseTag, Get-TagRejection,
+    ConvertFrom-ReleaseTag, Get-TagRejection, Get-PrintableTag,
     New-ArchiveDigest, ConvertFrom-DigestText, New-ArchiveManifest, Compare-ArchiveManifest,
     Read-OwnDownloads, Add-OwnDownload, Assert-ReleaseAssetSet

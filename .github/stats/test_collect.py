@@ -861,10 +861,11 @@ def contrast(foreground: str, background: str) -> float:
 class SiteSeries(unittest.TestCase):
     def test_the_asset_names_match_the_release_asset_module(self):
         module = (REPO_ROOT / "build" / "ReleaseAssets.psm1").read_text(encoding="utf-8")
-        archive = re.search(r"-Name ReleaseArchiveName -Value '([^']+)'", module).group(1)
-        versioned = re.search(r"\$script:VersionedArchiveFormat = '([^']+)'", module).group(1)
-        self.assertEqual(site.INSTALL_ASSET_NAME, archive)
-        self.assertEqual(site.VERSIONED_ARCHIVE_FORMAT.replace("{}", "{0}"), versioned)
+        prefix = re.search(r"-Name ReleaseAssetPrefix -Value '([^']+)'", module).group(1)
+        archive = re.search(r'-Name ReleaseArchiveName -Value "\$ReleaseAssetPrefix([^"]+)"', module).group(1)
+        versioned = re.search(r'\$script:VersionedArchiveFormat = "\$ReleaseAssetPrefix([^"]+)"', module).group(1)
+        self.assertEqual(site.INSTALL_ASSET_NAME, prefix + archive)
+        self.assertEqual(site.VERSIONED_ARCHIVE_FORMAT.replace("{}", "{0}"), prefix + versioned)
 
     def test_only_a_versioned_archive_name_joins_the_versioned_series(self):
         pattern = site.VERSIONED_ARCHIVE_PATTERN

@@ -30,23 +30,34 @@ Two things to know about the push itself:
 - The `pre-push` hook runs on a tag push too. It stops every `TestStandMCP.exe` and `SeqEdit.exe` and runs
   the integration suite, so save open Sequence Editor work first. See [.githooks/README.md](.githooks/README.md).
   On the real repository, let the hook run.
-- Push release tags one at a time. All tag pushes share one queue; GitHub keeps one running and one pending
-  run, and a third tag replaces the pending one.
+- Every tag has its own run, and a running release is never cancelled. Two tags pushed close together may
+  overlap. The workflow then never lets the older one take the label "latest" from the newer one: before it
+  publishes, it compares the version with the current latest release, and a lower version is published with
+  `make_latest=false`. The log of the publish step says which value it chose.
 
 What the workflow does, in order:
 
 1. Job `package` (read-only token): the tag gate, then `build\Build-PluginArchive.ps1`, which builds the exe,
    stages the plugin, smoke-tests it and zips it. The four assets are kept as a workflow artifact. If this
    job fails, nothing is created, not even a draft.
-2. Job `release` (write token): creates a DRAFT release with the four assets.
+2. Job `release` (write token): checks that the artifact holds exactly the four assets, deletes every
+   leftover DRAFT of the same tag (from an earlier failed run), and creates a DRAFT release with them
+   (`build\New-ReleaseDraft.ps1`). A published release that already carries the tag stops the run.
 3. Verifies the draft through the API, downloading the assets the way a user would
    (`build\Assert-PublishedRelease.ps1`).
 4. Re-checks that the draft still holds exactly the verified asset ids (`build\Assert-ReleaseAssetSet.ps1`).
-5. Publishes by the release id the verifier returned, never by tag name, and marks it the latest release.
+5. Publishes by the release id the verifier returned, never by tag name (`build\Publish-Release.ps1`), and marks
+   it the latest release unless a higher version already is.
 6. Re-checks the asset ids of the live release, then fetches `releases/latest` like a user and compares it
    with the verified archive.
 
-A failed verification leaves a draft. `releases/latest` never moves until the whole check has passed.
+A failed verification leaves a draft. `releases/latest` never moves until the whole check has passed. To run it
+again, use Re-run failed jobs on the run: the leftover draft of the tag is deleted first, so the second run
+does not collide with the first. If a PUBLISHED release already carries the tag, the run stops with:
+
+> A published release of <...> already carries the tag <...> (id <...>).
+
+That tag is spent. Fix forward with the next patch version.
 
 The four assets are `teststand-mcp.zip` (the file users get from `releases/latest/download/`),
 `teststand-mcp-vX.Y.Z.zip` (the same bytes), `teststand-mcp.sha256` and `teststand-mcp.manifest.sha256`.
@@ -91,8 +102,9 @@ a release holds, cut a new release.
 
 ## Rolling back a bad release
 
-If the verification failed, there is nothing to roll back: only a draft exists. Delete the draft (Releases
-page, or `gh release delete vX.Y.Z`) and start a new run.
+If the verification failed, there is nothing to roll back: only a draft exists. A re-run deletes it itself
+(Re-run failed jobs). To get rid of it without a re-run, delete the draft (Releases page, or
+`gh release delete vX.Y.Z`).
 
 If a bad release went live, there are two ways out. The scripts say the same:
 
@@ -109,9 +121,9 @@ If a bad release went live, there are two ways out. The scripts say the same:
 ## Rehearsing a release
 
 A manual run of the release workflow is a DRY RUN. It packages the plugin, creates a draft under the
-rehearsal tag `vX.Y.Z-rehearsal`, verifies it through the API, then deletes the draft and its tag. It never
-publishes: a manual run with `dry_run` unticked is refused before anything is built, and a ticked one
-deletes its draft.
+rehearsal tag `vX.Y.Z-rehearsal`, verifies it through the API, then deletes the draft it created (by its id,
+so a draft of another run is never touched) and the rehearsal tag. It never publishes: a manual run with
+`dry_run` unticked is refused before anything is built, and a ticked one deletes its draft.
 
 ```powershell
 gh workflow run release.yml --ref main -f tag=v1.9.2-rehearsal -f dry_run=true -f inject_fault=none
@@ -172,7 +184,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File build\Invoke-ScriptTests
 
 | Script | Parameters | What it does |
 |---|---|---|
-| `build\Invoke-ScriptTests.ps1` | `-Only`, `-List`, `-PwshPath`, `-TimeoutSeconds` | Runs every `build\tests\*.Tests.ps1` and `build\Test-SkillSources.ps1`, once per PowerShell host. `-Only` runs the named scripts, `-List` prints what would run, `-PwshPath` names the PowerShell 7 executable, `-TimeoutSeconds` limits one script under one host (default 1200). |
+| `build\Invoke-ScriptTests.ps1` | `-Only`, `-List`, `-PwshPath`, `-TimeoutSeconds`, `-TotalSeconds` | Runs every `build\tests\*.Tests.ps1` and `build\Test-SkillSources.ps1`, once per PowerShell host. `-Only` runs the named scripts, `-List` prints what would run, `-PwshPath` names the PowerShell 7 executable, `-TimeoutSeconds` limits one script under one host (default 1200). `-TotalSeconds` is a budget for the whole run (default 0, none): no script starts once less than `-TimeoutSeconds` of it is left, and the scripts left out count as failed. A script that prints no `PASS` line ran no case and fails too. |
 | `build\Build-PluginArchive.ps1` | `-Version`, `-Tag`, `-Commit`, `-OutDir`, `-Layout` | Builds the plugin archive. `-Version` is required: `X.Y.Z`, or `0.0.0-ci` for a local build. `-Tag` defaults to `v<Version>`, `-Commit` to `git rev-parse HEAD`, `-OutDir` to `artifacts` (git ignores it). `-Layout` is `folder` (default), `single-file` or `framework-dependent`. |
 
 A local build, the same way the pull-request check does it:
@@ -257,8 +269,9 @@ The part after it names the fault. The common ones:
 > archive entry '<...>' differs from the manifest
 
 A missing or hand-uploaded asset, a versioned archive of another size, a corrupt zip or an entry that
-differs from the manifest. None of them heals by itself. Delete the draft (Releases page, or
-`gh release delete vX.Y.Z`), fix the cause, and start a new run with Re-run all jobs on the failed run.
+differs from the manifest. None of them heals by itself. Fix the cause, then run again: Re-run failed jobs
+deletes the leftover draft of the tag first. If the cause is in the code, push the next patch version
+instead.
 
 **Two releases carry one tag.** A stale draft is still there:
 
@@ -275,7 +288,7 @@ means the tag is spelled differently from the release, or the draft was deleted.
 
 > <...> could not be downloaded for verification after <...> attempts: could not download <...>: <...>
 
-Delete the draft and start a new run.
+Re-run failed jobs.
 
 **The draft changed after it was verified.** Someone added, replaced or removed an asset:
 

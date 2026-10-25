@@ -461,8 +461,16 @@ try {
         Assert-Equal 'teststand-mcp.zip|teststand-mcp.sha256|teststand-mcp.manifest.sha256|teststand-mcp-v1.9.0.zip' ((Get-RequiredAssetNames -Version '1.9.0') -join '|') 'required assets in download order'
     }
 
+    Invoke-Case 'contract: every required asset name starts with the asset prefix, so one glob picks the assets up (and nothing else)' {
+        Assert-Equal 'teststand-mcp' $ReleaseAssetPrefix 'prefix'
+        foreach ($version in @('1.9.0', '0.0.0')) {
+            foreach ($name in (Get-RequiredAssetNames -Version $version)) { Assert-True ($name.StartsWith($ReleaseAssetPrefix, [StringComparison]::Ordinal)) "$name does not start with $ReleaseAssetPrefix" }
+        }
+        Assert-Equal 4 @(Get-RequiredAssetNames -Version '1.9.0' | Select-Object -Unique).Count 'distinct required assets'
+    }
+
     Invoke-Case 'contract: the exported constants are read-only' {
-        foreach ($name in @('ReleaseRepoSlug', 'ReleaseArchiveName', 'ReleaseDigestName', 'ReleaseManifestName', 'ReleaseUploaderLogin', 'ArchiveProblemKinds')) {
+        foreach ($name in @('ReleaseRepoSlug', 'ReleaseAssetPrefix', 'ReleaseArchiveName', 'ReleaseDigestName', 'ReleaseManifestName', 'ReleaseUploaderLogin', 'ArchiveProblemKinds')) {
             $before = (Get-Variable -Name $name -ValueOnly) -join ','
             $thrown = $false
             try { Set-Variable -Name $name -Value 'changed' -Scope Script } catch { $thrown = $true }
@@ -1609,6 +1617,18 @@ try {
         $local = Invoke-Script $VerifierPath @{ Tag = $fixture.Tag; LocalDir = $fixture.Dir; ExpectedArchiveSha256 = ('a' * 64) }
         Assert-Equal 1 $local.ExitCode 'exit code without -Latest'
         Assert-Contains $local.Output 'only with -Latest' 'the failure says where it applies'
+    }
+
+    Invoke-Case 'latest: an expected digest that is bound but EMPTY (an unset workflow output) is refused, never read as "not given"' {
+        $fixture = New-ReleaseFixture
+        foreach ($empty in @('', $null)) {
+            $api = New-FakeApi $fixture
+            $run = Invoke-LatestVerify $api -Extra @{ ExpectedArchiveSha256 = $empty }
+            Assert-Equal 1 $run.ExitCode "exit code for [$empty]"
+            Assert-Contains $run.Output 'ExpectedArchiveSha256' 'the failure names the parameter'
+            Assert-Contains $run.Output 'omit the parameter' 'the fix says how to ask for the weaker check on purpose'
+            Assert-Equal 0 $api.State.Calls.Count 'nothing is downloaded when the expected digest is unusable'
+        }
     }
 
     Invoke-Case 'latest: -Repo names the repository whose releases/latest is fetched, so a fork checks itself' {

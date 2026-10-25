@@ -79,6 +79,8 @@ param(
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+# A bound but empty -ExpectedArchiveSha256 (an unset workflow output) is refused, never read as "not given".
+$ExpectedHashGiven = $PSBoundParameters.ContainsKey('ExpectedArchiveSha256')
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell 5.1 downloads crawl with the progress bar on
 
 $MaxAttempts = 2                           # the first try and one retry
@@ -88,8 +90,6 @@ $MinTransferBytesPerSecond = 1MB           # the slowest link a download is stil
 $UserAgent = 'teststand-mcp-release-verifier'
 $JsonAccept = 'application/vnd.github+json'
 $BinaryAccept = 'application/octet-stream'
-$RepoPattern = '\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z'
-$DotsOnlyPattern = '\A\.+\z'
 $AssetIdPattern = '\A[0-9]+\z'
 $Sha256Pattern = '\A[0-9a-f]{64}\z'
 $UnknownUploader = '(unknown)'
@@ -334,7 +334,7 @@ function Assert-SourceChoice {
             -Why 'The verifier reads a release through the GitHub API, a directory of staged assets, or the public latest download; mixing them has no meaning.' `
             -Fix 'Use -Repo owner/name -Tag vX.Y.Z [-Token t], or -LocalDir <dir> -Version X.Y.Z, or -Latest [-Repo owner/name].'
     }
-    if ($ExpectedArchiveSha256) {
+    if ($ExpectedHashGiven) {
         if (-not $Latest) {
             Write-BuildFailure -What '-ExpectedArchiveSha256 was given without -Latest.' `
                 -Why 'It is the hash the public latest download must serve; the API and local modes verify the digest the release carries instead.' `
@@ -342,16 +342,11 @@ function Assert-SourceChoice {
         }
         if ($ExpectedArchiveSha256 -cnotmatch $Sha256Pattern) {
             Write-BuildFailure -What "-ExpectedArchiveSha256 '$ExpectedArchiveSha256' is not 64 lower-case hex digits." `
-                -Why 'It is compared with the SHA-256 of the archive users download.' `
-                -Fix 'Pass the archive_sha256 output of the draft verification step.'
+                -Why 'It is compared with the SHA-256 of the archive users download. An empty value would silently turn the check into the weaker one that accepts the previous release too, so it is refused.' `
+                -Fix 'Pass the archive_sha256 output of the draft verification step, or omit the parameter.'
         }
     }
-    if ($Repo) {
-        $segments = @($Repo -split '/')
-        if ($Repo -cnotmatch $RepoPattern -or @($segments | Where-Object { $_ -cmatch $DotsOnlyPattern }).Count -gt 0) {
-            Write-BuildFailure -What "The repository '$Repo' is not owner/name." -Why 'It becomes part of the API URL, so it is restricted to letters, digits, dot, dash and underscore.' -Fix 'Pass -Repo Zuehlke/teststand-mcp.'
-        }
-    }
+    if ($Repo) { Assert-RepoSlug $Repo }
     if ($LocalDir -and -not (Test-Path -LiteralPath (Resolve-BuildPath $LocalDir) -PathType Container)) {
         Write-BuildFailure -What "The directory $LocalDir does not exist." -Why 'It should hold the release assets.' -Fix 'Pass the directory the build wrote the assets to.'
     }
@@ -418,8 +413,8 @@ function Test-LatestOnce {
 # is tried again, -PropagationDelaySeconds apart, up to -PropagationAttempts times; the last failure is the report.
 function Test-LatestDownload {
     param($Connection, [string]$TempRoot)
-    $tries = if ($ExpectedArchiveSha256) { [Math]::Max(1, $PropagationAttempts) } else { 1 }
-    $downloadAttempts = if ($ExpectedArchiveSha256) { 1 } else { $MaxAttempts }
+    $tries = if ($ExpectedHashGiven) { [Math]::Max(1, $PropagationAttempts) } else { 1 }
+    $downloadAttempts = if ($ExpectedHashGiven) { 1 } else { $MaxAttempts }
     $totals = [pscustomobject]@{ Requested = 0 }
     for ($try = 1; $try -le $tries; $try++) {
         try {

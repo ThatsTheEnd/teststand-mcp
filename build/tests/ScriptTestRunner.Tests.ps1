@@ -32,15 +32,14 @@ function New-FixtureScript {
     return $path
 }
 
-# Runs the runner in a child of the current host, with the require-pwsh variable set as asked.
-function Invoke-Runner {
-    param([string[]]$Arguments, [string]$RequirePwsh = $null)
+# Runs a child of the current host with the require-pwsh variable set as asked.
+function Invoke-RunnerHost {
+    param([string[]]$HostArguments, [string]$RequirePwsh = $null)
     $old = [Environment]::GetEnvironmentVariable($RequirePwshVariable)
     try {
         [Environment]::SetEnvironmentVariable($RequirePwshVariable, $RequirePwsh)
         $hostPath = (Get-Process -Id $PID).Path
-        $result = Invoke-ChildProcess -FilePath $hostPath -TimeoutSeconds $RunnerTimeoutSeconds `
-            -ArgumentList (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $RunnerPath) + $Arguments)
+        $result = Invoke-ChildProcess -FilePath $hostPath -TimeoutSeconds $RunnerTimeoutSeconds -ArgumentList (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass') + $HostArguments)
     } finally {
         [Environment]::SetEnvironmentVariable($RequirePwshVariable, $old)
     }
@@ -48,11 +47,23 @@ function Invoke-Runner {
     return @{ ExitCode = $result.ExitCode; Output = ($result.Stdout + $result.Stderr) }
 }
 
-function Assert-ThreePartFailure {
+function Invoke-Runner {
+    param([string[]]$Arguments, [string]$RequirePwsh = $null)
+    return Invoke-RunnerHost (@('-File', $RunnerPath) + $Arguments) $RequirePwsh
+}
+
+# Several -Only scripts need a command string: a -File command line cannot bind a second value to a string[].
+# $Extra holds ready-made tokens, quoted with Format-PowerShellLiteral where they are text.
+function Format-PowerShellLiteral {
     param([string]$Text)
-    foreach ($label in @('What', 'Why', 'Fix')) {
-        Assert-True ($Text -cmatch "(?m)^${label}: +\S") "failure output has no '${label}:' line with content. Output was:`n$Text"
-    }
+    return "'" + $Text.Replace("'", "''") + "'"
+}
+
+function Invoke-RunnerOnly {
+    param([string[]]$Scripts, [string[]]$Extra = @(), [string]$RequirePwsh = $null)
+    $list = ($Scripts | ForEach-Object { Format-PowerShellLiteral $_ }) -join ','
+    $command = "& $(Format-PowerShellLiteral $RunnerPath) -Only @($list) $($Extra -join ' '); exit `$LASTEXITCODE"
+    return Invoke-RunnerHost @('-Command', $command) $RequirePwsh
 }
 
 $PwshCommand = Get-Command pwsh -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -105,6 +116,57 @@ try {
         $run = Invoke-Runner @('-Only', $script, '-PwshPath', $MissingPwsh)
         Assert-NotContains $run.Output 'under powershell.exe' 'the 5.1 run must not happen'
         Assert-Contains $run.Output 'SKIP  seven.Tests.ps1 under pwsh' 'only the pwsh host is considered'
+    }
+
+    Invoke-Case 'runner: a script that declares #Requires -Version 7 FAILS when pwsh is missing and TESTSTAND_MCP_REQUIRE_PWSH=1' {
+        $script = New-FixtureScript 'seven.Tests.ps1' @('PASS  one') -Header @('#Requires -Version 7')
+        $run = Invoke-Runner @('-Only', $script, '-PwshPath', $MissingPwsh) -RequirePwsh '1'
+        Assert-Equal 1 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-Contains $run.Output 'FAIL  seven.Tests.ps1 under pwsh' 'the pwsh-only script is not silently dropped'
+        Assert-NotContains $run.Output 'under powershell.exe' 'the 5.1 run must not happen'
+        Assert-ThreePartFailure $run.Output
+    }
+
+    Invoke-Case 'runner: two scripts, the first passes and the second fails: both are reported and the summary counts them' {
+        $first = New-FixtureScript 'first.Tests.ps1' @('PASS  one')
+        $second = New-FixtureScript 'second.Tests.ps1' @('FAIL  the broken case') -ExitCode 1
+        $run = Invoke-RunnerOnly @($first, $second) @('-PwshPath', (Format-PowerShellLiteral $MissingPwsh))
+        Assert-Equal 1 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-Contains $run.Output 'PASS  first.Tests.ps1 under powershell.exe' 'the passing script is reported'
+        Assert-Contains $run.Output 'FAIL  second.Tests.ps1 under powershell.exe' 'the failing script is reported'
+        Assert-Contains $run.Output '2 script run(s), 1 failed' 'the summary'
+        Assert-ThreePartFailure $run.Output
+    }
+
+    Invoke-Case 'runner: a script that exits 0 but printed no PASS line ran no case and FAILS' {
+        $script = New-FixtureScript 'empty.Tests.ps1' @('hello, but no case ran')
+        $run = Invoke-Runner @('-Only', $script, '-PwshPath', $MissingPwsh)
+        Assert-Equal 1 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-Contains $run.Output 'FAIL  empty.Tests.ps1 under powershell.exe' 'result line'
+        Assert-Contains $run.Output 'ran no case' 'the output says why'
+        Assert-ThreePartFailure $run.Output
+    }
+
+    Invoke-Case 'runner: no script starts once less than one per-script timeout is left of -TotalSeconds, and the skipped one FAILS (never dropped)' {
+        $slow = New-FixtureScript 'slow.Tests.ps1' @('PASS  one') -Header @('Start-Sleep -Seconds 3')
+        $late = New-FixtureScript 'late.Tests.ps1' @('PASS  two')
+        $run = Invoke-RunnerOnly @($slow, $late) @('-PwshPath', (Format-PowerShellLiteral $MissingPwsh), '-TimeoutSeconds', '5', '-TotalSeconds', '6')
+        Assert-Equal 1 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-Contains $run.Output 'PASS  slow.Tests.ps1 under powershell.exe' 'the script that started in time ran'
+        Assert-Contains $run.Output 'FAIL  late.Tests.ps1 under powershell.exe: not started' 'the late script is reported as not started'
+        Assert-Contains $run.Output '1 script run(s), 1 failed' 'only one script ran'
+        Assert-ThreePartFailure $run.Output
+        $enough = Invoke-RunnerOnly @($slow, $late) @('-PwshPath', (Format-PowerShellLiteral $MissingPwsh), '-TimeoutSeconds', '5', '-TotalSeconds', '600')
+        Assert-Equal 0 $enough.ExitCode "with a budget that is enough, both run. Output was:`n$($enough.Output)"
+        Assert-Contains $enough.Output '2 script run(s), 0 failed' 'both ran'
+    }
+
+    Invoke-Case 'runner: a budget smaller than one script timeout is a three-part failure, not a run that starts nothing' {
+        $script = New-FixtureScript 'ok.Tests.ps1' @('PASS  one')
+        $run = Invoke-Runner @('-Only', $script, '-TimeoutSeconds', '60', '-TotalSeconds', '30')
+        Assert-Equal 1 $run.ExitCode 'exit code'
+        Assert-ThreePartFailure $run.Output
+        Assert-NotContains $run.Output 'PASS  ok.Tests.ps1' 'nothing ran'
     }
 
     Invoke-Case 'runner: a script that outlives -TimeoutSeconds is stopped and fails the run' {
