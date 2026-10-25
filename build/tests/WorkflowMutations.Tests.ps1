@@ -108,7 +108,7 @@ Add-Mutation 'the verify step without a timeout' 'release.yml' 'has its own time
 Add-Mutation 'a typo in a run: block' 'release.yml' 'valid PowerShell' "if (`$env:ARCHIVE_SHA256 -cnotmatch '^[0-9a-f]{64}`$') {" "if (`$env:ARCHIVE_SHA256 -cnotmatch '^[0-9a-f]{64}`$' {"
 Add-Mutation 'a build script called with a parameter it does not have' 'release.yml' 'takes every parameter' '-ReleaseId $env:RELEASE_ID' '-ReleaseIdentifier $env:RELEASE_ID'
 Add-Mutation 'a build script that does not exist' 'release.yml' 'takes every parameter' '& .\build\Publish-Release.ps1' '& .\build\Publish-Everything.ps1'
-Add-Mutation 'the workflow bound to one repository' 'release.yml' 'nothing is bound to one repository' 'REPO: ${{ github.repository }}' 'REPO: Zuehlke/teststand-mcp'
+Add-Mutation 'the workflow bound to one repository' 'release.yml' 'nothing is bound to one repository' 'REPO: ${{ github.repository }}' 'REPO: ThatsTheEnd/teststand-mcp'
 Add-Mutation 'a rehearsal decided by the shape of the tag' 'release.yml' 'the tag is user input' "`$rehearsal = (`$env:DRY_RUN -eq 'true')`n          & .\build\Assert-ReleaseTag.ps1" "`$rehearsal = (`$env:TAG -like '*-rehearsal')`n          & .\build\Assert-ReleaseTag.ps1"
 Add-Mutation 'the token in workflow-level env' 'release.yml' 'verified with the token' "  DOTNET_NOLOGO: 'true'`n" "  DOTNET_NOLOGO: 'true'`n  GH_TOKEN: `${{ github.token }}`n"
 

@@ -193,7 +193,7 @@ try {
 
     Invoke-Case 'notify (pure): Test-AllowedBaseUrl accepts https on github.com and http on a loopback host, judged by the parsed host and not by a text prefix' {
         . $NotifyScriptPath
-        foreach ($good in 'https://github.com/Zuehlke/teststand-mcp', 'HTTPS://GITHUB.COM/x', 'http://127.0.0.1:8080/x', 'http://localhost:8080/x', 'http://127.0.0.1/x', 'http://[::1]:8080/x') {
+        foreach ($good in 'https://github.com/ThatsTheEnd/teststand-mcp', 'HTTPS://GITHUB.COM/x', 'http://127.0.0.1:8080/x', 'http://localhost:8080/x', 'http://127.0.0.1/x', 'http://[::1]:8080/x') {
             Assert-Equal $true (Test-AllowedBaseUrl $good) "[$good]"
         }
         foreach ($bad in 'http://github.com/x', 'https://github.com.evil.io/x', 'https://evil.example.com/x', 'http://example.com:80/x', 'ftp://github.com/x', '', ' ') {

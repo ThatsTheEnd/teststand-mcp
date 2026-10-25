@@ -16,8 +16,8 @@ $VerifierPath = Join-Path $BuildDir 'Assert-PublishedRelease.ps1'
 $MarketplacePath = Join-Path $RepoRoot '.claude-plugin\marketplace.json'
 $OwnDownloadsFixturePath = Join-Path $PSScriptRoot 'fixtures\own-downloads.json'
 
-$ExpectedRepoSlug = 'Zuehlke/teststand-mcp'
-$ExpectedLatestUrl = 'https://github.com/Zuehlke/teststand-mcp/releases/latest/download/teststand-mcp.zip'
+$ExpectedRepoSlug = 'ThatsTheEnd/teststand-mcp'
+$ExpectedLatestUrl = 'https://github.com/ThatsTheEnd/teststand-mcp/releases/latest/download/teststand-mcp.zip'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $ShaCrypto = [System.Security.Cryptography.SHA256]::Create()
 $SampleCommit = ('0123456789abcdef' * 2) + '01234567'   # 40 hex characters
@@ -25,7 +25,7 @@ $ArabicIndicOne = [string][char]0x0661                  # a digit that \d matche
 $Utf8Bom = [byte[]](0xEF, 0xBB, 0xBF)
 
 $BotLogin = 'github-actions[bot]'
-$ApiAssetUrlFormat = 'https://api.github.com/repos/Zuehlke/teststand-mcp/releases/assets/{0}'
+$ApiAssetUrlFormat = 'https://api.github.com/repos/ThatsTheEnd/teststand-mcp/releases/assets/{0}'
 $FirstAssetId = 1000
 $ReleaseId = 777
 $DefaultRetryDelay = 30

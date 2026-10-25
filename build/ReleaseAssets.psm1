@@ -20,7 +20,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 # ----------------------------------------------------------------------------
 #  Asset contract (exported, read-only)
 # ----------------------------------------------------------------------------
-Set-Variable -Name ReleaseRepoSlug -Value 'Zuehlke/teststand-mcp' -Option ReadOnly -Scope Script
+Set-Variable -Name ReleaseRepoSlug -Value 'ThatsTheEnd/teststand-mcp' -Option ReadOnly -Scope Script
 # Every asset name starts with this prefix, so a workflow can pick the assets up with one glob ($ReleaseAssetPrefix*).
 Set-Variable -Name ReleaseAssetPrefix -Value 'teststand-mcp' -Option ReadOnly -Scope Script
 Set-Variable -Name ReleaseArchiveName -Value "$ReleaseAssetPrefix.zip" -Option ReadOnly -Scope Script

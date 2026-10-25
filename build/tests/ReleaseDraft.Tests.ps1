@@ -18,7 +18,7 @@ $NewDraftPath = Join-Path $BuildDir 'New-ReleaseDraft.ps1'
 $PublishPath = Join-Path $BuildDir 'Publish-Release.ps1'
 $CleanupPath = Join-Path $BuildDir 'Remove-RehearsalRelease.ps1'
 $SetScriptPath = Join-Path $BuildDir 'Assert-ReleaseAssetSet.ps1'
-$Repo = 'Zuehlke/teststand-mcp'
+$Repo = 'ThatsTheEnd/teststand-mcp'
 $SampleCommit = ('0123456789abcdef' * 2) + '01234567'
 $BigId = 3000000001   # above 2^31: a release or asset id must never be squeezed into an int
 $NotFound = 'gh: Not Found (HTTP 404)'
@@ -231,7 +231,7 @@ try {
         $fake = New-FakeGh -Releases @((New-Release 31 'v1.9.0'), (New-Release 32 'v1.9.0' $false))
         $failure = Get-Failure { New-ReleaseDraft -Repo $Repo -Tag 'v1.9.0' -AssetDir (New-AssetFolder) -Gh $fake.Gh }
         Assert-ThreePartFailure $failure
-        Assert-Contains $failure 'A published release of Zuehlke/teststand-mcp already carries the tag v1.9.0 (id 32)' 'what'
+        Assert-Contains $failure 'A published release of ThatsTheEnd/teststand-mcp already carries the tag v1.9.0 (id 32)' 'what'
         Assert-Contains $failure 'next patch version' 'the fix'
         Assert-Equal 0 @(Get-DeleteCalls $fake).Count 'deleted releases (a draft must not be deleted on the way to a refusal)'
         Assert-Equal 0 $fake.State.Creates.Count 'created releases'

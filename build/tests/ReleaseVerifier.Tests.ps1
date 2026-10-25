@@ -314,7 +314,7 @@ try {
         Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
         Assert-Contains $run.Output 'Requested 4 asset download(s) in 1 attempt' 'download count'
         $listing = @($api.State.Calls | Where-Object { $_.Uri -match '/releases\?' })[0]
-        Assert-True ($listing.Uri.StartsWith('https://api.github.com/repos/Zuehlke/teststand-mcp/releases?')) "listing url was $($listing.Uri)"
+        Assert-True ($listing.Uri.StartsWith('https://api.github.com/repos/ThatsTheEnd/teststand-mcp/releases?')) "listing url was $($listing.Uri)"
         Assert-Equal "Bearer $FakeToken" $listing.Headers['Authorization'] 'listing authorization'
         Assert-True ($listing.TimeoutSeconds -gt 0) 'the listing call carries a timeout'
         $requests = Get-AssetRequests $api
@@ -483,7 +483,7 @@ try {
         $api = New-FakeApi $fixture -Pages @{ 1 = (ConvertTo-Json -InputObject @($first, $second) -Depth 4) }
         $run = Invoke-ApiVerify $fixture $api
         Assert-Equal 1 $run.ExitCode 'exit code'
-        Assert-Contains $run.Output '2 releases of Zuehlke/teststand-mcp carry the tag v1.9.0' 'fault'
+        Assert-Contains $run.Output '2 releases of ThatsTheEnd/teststand-mcp carry the tag v1.9.0' 'fault'
         Assert-Contains $run.Output '701, 702' 'ids'
         Assert-Equal 0 (Get-AssetRequests $api).Count 'asset requests'
     }
@@ -610,8 +610,8 @@ try {
         }
         $run = $script:LatestRun
         Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
-        Assert-Equal 'https://github.com/Zuehlke/teststand-mcp/releases/latest/download/teststand-mcp.zip' $api.State.Calls[0].Uri 'first url'
-        Assert-Equal 'https://github.com/Zuehlke/teststand-mcp/releases/latest/download/teststand-mcp.sha256' $api.State.Calls[1].Uri 'second url'
+        Assert-Equal 'https://github.com/ThatsTheEnd/teststand-mcp/releases/latest/download/teststand-mcp.zip' $api.State.Calls[0].Uri 'first url'
+        Assert-Equal 'https://github.com/ThatsTheEnd/teststand-mcp/releases/latest/download/teststand-mcp.sha256' $api.State.Calls[1].Uri 'second url'
         foreach ($call in $api.State.Calls) { Assert-True (-not $call.Headers.ContainsKey('Authorization')) "a credential was sent to $($call.Uri)" }
         $cells = (Read-OwnDownloads -Path $recordPath).Counts['2026-08-21']
         Assert-Equal 1 $cells['teststand-mcp.zip']['published'] 'zip published'
