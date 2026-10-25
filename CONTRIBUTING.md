@@ -71,6 +71,10 @@ the local tag, create the new tag, push it. Its shape:
 > 3. git tag <...> <...>
 > 4. git push origin <...>
 
+Run locally without `-Commit`, the gate prints one extra first step and writes `<commit>` where the SHA goes
+in step 3. The extra step is `git rev-list -n 1 refs/tags/<tag>`, which prints the commit the bad tag points
+at. In CI the SHA is filled in.
+
 For `V1.9.0` it names `v1.9.0` itself. For a tag it cannot repair, such as `v1.9.0-rc1` or `v1.9`, it
 does not guess a version:
 
@@ -94,23 +98,26 @@ If a bad release went live, there are two ways out. The scripts say the same:
 
 > so releases/latest falls back to the previous release (safe only once an earlier workflow-built release exists), or fix forward by releasing the next patch version (see CONTRIBUTING).
 
-- **Delete the release.** `releases/latest` falls back to the newest earlier release. Delete it on the
-  Releases page or with `gh release delete vX.Y.Z`. The git tag stays unless you also delete it
-  (`--cleanup-tag`). Do not reuse the tag.
-- **Fix forward.** Fix the cause on `main` and push `vX.Y.(Z+1)`.
-
-Deleting is only safe once an earlier workflow-built release exists to fall back to. The first one,
-`v1.9.0`, has none, so fix it forward with `v1.9.1`. From the second release on, deleting is available.
+- **Delete the release, only when an earlier release was built and verified by this workflow.**
+  Otherwise `releases/latest` falls back to files nobody verified. With such a release, `releases/latest`
+  falls back to the newest earlier one. Delete it on the Releases page or with `gh release delete vX.Y.Z`. The git
+  tag stays unless you also delete it (`--cleanup-tag`). Do not reuse the tag. `v1.9.0` is the first
+  workflow-built release in this repository, so it has no such release to fall back to.
+- **Fix forward.** Fix the cause on `main` and push `vX.Y.(Z+1)`. This is the only way out for `v1.9.0`:
+  fix it with `v1.9.1`. From the second workflow-built release on, deleting is available too.
 
 ## Rehearsing a release
 
 A manual run of the release workflow is a DRY RUN. It packages the plugin, creates a draft under the
 rehearsal tag `vX.Y.Z-rehearsal`, verifies it through the API, then deletes the draft and its tag. It never
-publishes, whatever you tick.
+publishes: a manual run with `dry_run` unticked is refused before anything is built, and a ticked one
+deletes its draft.
 
 ```powershell
 gh workflow run release.yml --ref main -f tag=v1.9.2-rehearsal -f dry_run=true -f inject_fault=none
 ```
+
+This command works as written (measured in the fork rehearsal with `v1.9.0-rehearsal`).
 
 To prove that a bad draft is never published, corrupt the uploaded zip. The run must FAIL at the
 verification, publish nothing and still clean up:
@@ -133,10 +140,22 @@ For that, use a throw-away PUBLIC fork. Do not do it in the real repository: a b
    matters: it is where the plugin is downloaded) and in `plugin/.claude-plugin/plugin.json`, and
    `$ReleaseRepoSlug` in `build\ReleaseAssets.psm1`. It also changes the tests that pin the slug; find them
    with `git grep -l Zuehlke/teststand-mcp -- build/tests`.
-3. Push to the fork with `git push --no-verify`. The pre-push hook would stop `TestStandMCP.exe` and run the
-   integration suite, which a fork push does not need. Use `--no-verify` ONLY for the fork, never for the
-   real repository.
-4. Run the dry runs above, then push `v1.9.0` and `v1.9.1` to the fork and check each run.
+3. Keep the fork-only commit on its own branch and push it to the fork only, never to `origin`. A bare
+   `git push --no-verify` goes to `origin`, which is the real repository in a normal clone, so name the
+   fork remote:
+
+   ```powershell
+   git remote add fork https://github.com/<you>/teststand-mcp.git
+   git remote -v
+   git push --no-verify fork <branch>:main
+   git push --no-verify fork refs/tags/vX.Y.Z
+   ```
+
+   Check that `git remote -v` shows `fork` pointing at your fork. The pre-push hook would stop
+   `TestStandMCP.exe` and run the integration suite, which a fork push does not need. Use `--no-verify`
+   ONLY for the fork, never for the real repository.
+4. Run the dry runs above, then push the tags `v1.9.0` and `v1.9.1` to the fork the same way and check each
+   run.
 5. Install from the fork in an isolated profile (`CLAUDE_CONFIG_DIR` set to a fresh, SHORT folder, see
    Troubleshooting) so your own Claude Code setup stays untouched.
 
@@ -154,7 +173,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File build\Invoke-ScriptTests
 | Script | Parameters | What it does |
 |---|---|---|
 | `build\Invoke-ScriptTests.ps1` | `-Only`, `-List`, `-PwshPath`, `-TimeoutSeconds` | Runs every `build\tests\*.Tests.ps1` and `build\Test-SkillSources.ps1`, once per PowerShell host. `-Only` runs the named scripts, `-List` prints what would run, `-PwshPath` names the PowerShell 7 executable, `-TimeoutSeconds` limits one script under one host (default 1200). |
-| `build\Build-PluginArchive.ps1` | `-Version`, `-Tag`, `-Commit`, `-OutDir`, `-Layout` | Builds the plugin archive. `-Version` is required: `X.Y.Z`, or `0.0.0-ci` for a local build. `-Tag` defaults to the version, `-Commit` to `git rev-parse HEAD`, `-OutDir` to `artifacts` (git ignores it). `-Layout` is `folder` (default), `single-file` or `framework-dependent`. |
+| `build\Build-PluginArchive.ps1` | `-Version`, `-Tag`, `-Commit`, `-OutDir`, `-Layout` | Builds the plugin archive. `-Version` is required: `X.Y.Z`, or `0.0.0-ci` for a local build. `-Tag` defaults to `v<Version>`, `-Commit` to `git rev-parse HEAD`, `-OutDir` to `artifacts` (git ignores it). `-Layout` is `folder` (default), `single-file` or `framework-dependent`. |
 
 A local build, the same way the pull-request check does it:
 
@@ -174,7 +193,7 @@ python -m unittest discover -s .github/stats
 
 Use `py -m unittest ...` if `python` is not on your PATH.
 
-The check needs PowerShell 7. A missing `pwsh` is a visible SKIP on your machine and a failure in CI
+The PowerShell 7 half needs `pwsh`; without it the local run SKIPs, and CI fails
 (`TESTSTAND_MCP_REQUIRE_PWSH=1`).
 
 The one real end-to-end packaging run per layout is off by default, because it publishes the real exe and is
@@ -247,8 +266,10 @@ differs from the manifest. None of them heals by itself. Delete the draft (Relea
 >
 > No release tagged <...> was found in <...>.
 
-Delete the stale draft so exactly one release carries the tag. The second message means the tag is spelled
-differently from the release, or the draft was deleted.
+Delete the stale draft so exactly one release carries the tag, but first confirm it is still a draft:
+`gh release view vX.Y.Z --json isDraft`. A published release with the same tag is the live rollback case
+(see [Rolling back a bad release](#rolling-back-a-bad-release)), not a stale draft. The second message
+means the tag is spelled differently from the release, or the draft was deleted.
 
 **A download failed.** This is a network or HTTP error, not a fault in the release:
 
@@ -296,8 +317,9 @@ package, because it would pull in files nobody reviewed.
 
 ### Installing the plugin from a very long path
 
-`claude plugin marketplace add` can fail with `fatal: '$GIT_DIR' too big` when `CLAUDE_CONFIG_DIR` (or the
-home folder) is a very long path. The same clone works from a short path. Point `CLAUDE_CONFIG_DIR` at a
+`claude plugin marketplace add` can fail with git's own message `fatal: '$GIT_DIR' too big` (it comes from
+git, not from the scripts, so it is inline code and not one of the checked quotes above) when
+`CLAUDE_CONFIG_DIR` (or the home folder) is a very long path. The same clone works from a short path. Point `CLAUDE_CONFIG_DIR` at a
 short folder such as `C:\cc` when you test an install. Seen in the fork rehearsal.
 
 ## Design record
