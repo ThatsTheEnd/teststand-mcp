@@ -43,12 +43,16 @@ public class EnvironmentPathSettingTests
         Assert.That(EnvironmentPathSetting.Resolve("  " + UnexpandedPlaceholder, ConfiguredValue), Is.EqualTo(ConfiguredValue));
     }
 
-    [TestCase(null, null)]
-    [TestCase("", "")]
-    [TestCase("  ", null)]
-    [TestCase(UnexpandedPlaceholder, null)]
-    public void Resolve_NothingUsable_ReturnsBlankOrNull(string? pluginValue, string? configuredValue)
+    // Nothing usable from the plugin: the configured value comes back exactly as it was, blank or null included.
+    [TestCase(null, null, null)]
+    [TestCase("", "", "")]
+    [TestCase("  ", null, null)]
+    [TestCase(UnexpandedPlaceholder, null, null)]
+    [TestCase(UnexpandedPlaceholder, "", "")]
+    [TestCase(null, "   ", "   ")]
+    [TestCase("  " + UnexpandedPlaceholder, "   ", "   ")]
+    public void Resolve_NothingUsable_ReturnsTheConfiguredValueUnchanged(string? pluginValue, string? configuredValue, string? expected)
     {
-        Assert.That(EnvironmentPathSetting.Resolve(pluginValue, configuredValue), Is.Null.Or.Empty.Or.Matches(@"^\s*$"));
+        Assert.That(EnvironmentPathSetting.Resolve(pluginValue, configuredValue), Is.EqualTo(expected));
     }
 }

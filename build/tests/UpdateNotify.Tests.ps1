@@ -191,16 +191,26 @@ try {
         Assert-Equal 1 $fixture.Server.Stats.RequestCount 'requests to the override'
     }
 
-    Invoke-Case 'notify (pure): Test-AllowedBaseUrl accepts https://github.com/ and loopback http only' {
+    Invoke-Case 'notify (pure): Test-AllowedBaseUrl accepts https on github.com and http on a loopback host, judged by the parsed host and not by a text prefix' {
         . $NotifyScriptPath
-        foreach ($good in 'https://github.com/ThatsTheEnd/teststand-mcp', 'HTTPS://GITHUB.COM/x', 'http://127.0.0.1:8080/x', 'http://localhost:8080/x') {
+        foreach ($good in 'https://github.com/Zuehlke/teststand-mcp', 'HTTPS://GITHUB.COM/x', 'http://127.0.0.1:8080/x', 'http://localhost:8080/x', 'http://127.0.0.1/x', 'http://[::1]:8080/x') {
             Assert-Equal $true (Test-AllowedBaseUrl $good) "[$good]"
         }
-        foreach ($bad in 'http://github.com/x', 'https://github.com.evil.io/x', 'https://evil.example.com/x', 'http://127.0.0.1/x', 'http://example.com:80/x', 'ftp://github.com/x', '', ' ') {
+        foreach ($bad in 'http://github.com/x', 'https://github.com.evil.io/x', 'https://evil.example.com/x', 'http://example.com:80/x', 'ftp://github.com/x', '', ' ') {
             Assert-Equal $false (Test-AllowedBaseUrl $bad) "[$bad]"
         }
         Assert-Equal $false (Test-AllowedBaseUrl $null) 'null'
         Assert-Equal $false (Test-AllowedBaseUrl 42) 'a number'
+    }
+
+    # A prefix test lets "http://localhost:" through for a URL whose real host is somewhere else; the host is read from the parsed URL.
+    Invoke-Case 'notify (pure): Test-AllowedBaseUrl refuses a URL that starts like an allowed one but names another host, or carries user info' {
+        . $NotifyScriptPath
+        foreach ($bad in 'http://localhost:@example.com/x', 'http://127.0.0.1:@example.com/x', 'http://localhost:80@example.com/x', 'https://github.com.evil.example/x',
+                         'https://github.com@evil.example/x', 'https://user@github.com/x', 'https://user:secret@github.com/x', 'http://localhost@127.0.0.1:8080/x',
+                         'http://localhost.evil.example:8080/x', 'http://127.0.0.1.evil.example:8080/x', ' https://github.com/x', "https://github.com/x`n", 'https://github.com:evil/x') {
+            Assert-Equal $false (Test-AllowedBaseUrl $bad) "[$bad]"
+        }
     }
 
     # --- time -------------------------------------------------------------------------------------------
@@ -350,15 +360,17 @@ try {
 
     Invoke-ServerCase 'notify: a failing state write cannot cost the message (the output is written first)' {
         $fixture = New-NotifyFixture
-        $dir = New-HooksCopy
-        $scriptPath = Join-Path $dir 'update-notify.ps1'
-        $text = [IO.File]::ReadAllText($scriptPath, $Utf8NoBom)
-        Assert-Contains $text 'function New-AnnouncedState {' 'the function to break'
-        [IO.File]::WriteAllText($scriptPath, $text.Replace('function New-AnnouncedState {', "function New-AnnouncedState {`n    throw 'injected state failure'"), $Utf8NoBom)
-        $envOverrides = @{ CLAUDE_PLUGIN_ROOT = $fixture.PluginRoot; TESTSTAND_MCP_STATE_DIR = $fixture.State; TESTSTAND_MCP_NOW = $FixedNow.ToString('o'); TESTSTAND_MCP_NO_UPDATE_CHECK = $null }
-        $result = Invoke-HookScript -ScriptPath $scriptPath -StdinText '{}' -EnvOverrides $envOverrides
+        $result = Invoke-Notify $fixture -Extra @{ TESTSTAND_MCP_HOOK_SIMULATE = 'announced-state' }
         Assert-Equal 0 $result.ExitCode "exit code (stderr: $($result.Stderr))"
-        Assert-Contains $result.Stdout '1.10.0' 'the message was printed before the failure'
+        Assert-Contains $result.Message '1.10.0' 'the message was printed before the failure'
+    }
+
+    Invoke-ServerCase 'notify: the simulated failure is ignored without TESTSTAND_MCP_STATE_DIR, so production cannot trip it' {
+        $fixture = New-NotifyFixture
+        $pluginData = Join-Path (Split-Path -Parent $fixture.PluginRoot) 'plugin-data'
+        $result = Invoke-Notify $fixture -Extra @{ TESTSTAND_MCP_HOOK_SIMULATE = 'announced-state'; TESTSTAND_MCP_STATE_DIR = $null; CLAUDE_PLUGIN_DATA = $pluginData }
+        Assert-Contains $result.Message '1.10.0' 'the message'
+        Assert-True (Test-Path -LiteralPath (Join-Path $pluginData $NotifyStateFile)) 'the announcement was recorded: the failure was never raised'
     }
 
     # --- the pure decisions ------------------------------------------------------------------------------

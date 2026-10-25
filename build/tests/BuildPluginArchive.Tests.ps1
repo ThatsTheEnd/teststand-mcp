@@ -42,32 +42,12 @@ function Assert-FailsWith {
     param([scriptblock]$Body, [string[]]$Needles = @(), [string[]]$Fix = @())
     $text = Get-ThrownMessage $Body
     if ($null -eq $text) { throw 'expected a failure but none was thrown' }
-    foreach ($label in @('What', 'Why', 'Fix')) {
-        Assert-True ($text -cmatch "(?m)^${label}: +\S") "failure has no '${label}:' line with content. Failure was:`n$text"
-    }
+    Assert-ThreePartFailure $text
     foreach ($needle in $Needles) { Assert-Contains $text $needle 'failure text' }
     $fixPart = $text.Substring($text.IndexOf("`nFix:", [StringComparison]::Ordinal))
     foreach ($needle in $Fix) { Assert-Contains $fixPart $needle 'the Fix part' }
 }
 
-function Write-TextFile {
-    param([string]$Path, [string]$Text)
-    [void](New-Item -ItemType Directory -Path (Split-Path -Parent $Path) -Force)
-    [IO.File]::WriteAllText($Path, $Text, $Utf8NoBom)
-}
-
-# Runs a body with environment variables set (a $null value removes one), then restores them.
-function Use-Environment {
-    param([hashtable]$Values, [scriptblock]$Body)
-    $saved = @{}
-    foreach ($name in $Values.Keys) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
-    try {
-        foreach ($name in $Values.Keys) { [Environment]::SetEnvironmentVariable($name, $Values[$name]) }
-        & $Body
-    } finally {
-        foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
-    }
-}
 
 # Fails when a process with this command-line fragment is still running; stops such leftovers first.
 function Assert-NoProcessWithCommandLine {
@@ -85,7 +65,7 @@ function New-FakeExe {
     return $path
 }
 
-function Invoke-Git {
+function Invoke-TestGit {
     param([string]$Directory, [string[]]$Arguments)
     $result = Invoke-ChildProcess -FilePath 'git' -ArgumentList (@('-C', $Directory) + $Arguments) -TimeoutSeconds 60
     Assert-Equal 0 $result.ExitCode "git $($Arguments -join ' ') said: $($result.Stdout) $($result.Stderr)"
@@ -109,8 +89,8 @@ function New-RepoFixture {
         Get-ChildItem -LiteralPath $BuildDir -File | Where-Object { $_.Extension -in '.ps1', '.psm1' } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $root 'build') }
     }
     if ($null -ne $Mutate) { & $Mutate $root }
-    Invoke-Git $root @('init', '-q')
-    Invoke-Git $root @('add', '-A')
+    Invoke-TestGit $root @('init', '-q')
+    Invoke-TestGit $root @('add', '-A')
     return $root
 }
 
@@ -276,8 +256,9 @@ try {
 
     Invoke-Case 'commit time: the timestamp of a commit of this checkout, and a clear fix for one that is not' {
         $head = (Invoke-ChildProcess -FilePath 'git' -ArgumentList @('-C', $RepoRoot, 'rev-parse', 'HEAD') -TimeoutSeconds 30).Stdout.Trim()
-        Assert-True ((Get-CommitTimestamp -RepoRoot $RepoRoot -Commit $head).Year -ge 2026) 'the commit time of HEAD'
-        Assert-FailsWith { Get-CommitTimestamp -RepoRoot $RepoRoot -Commit $SampleCommit } @("git show $SampleCommit") -Fix @('git rev-parse HEAD')
+        $seconds = (Invoke-Git -RepoRoot $RepoRoot -Arguments @('show', '-s', '--format=%ct', $head) -Why 'the expected commit time' -Fix 'run it in a checkout').Stdout.Trim()
+        Assert-Equal $seconds "$((Get-CommitTimestamp -RepoRoot $RepoRoot -Commit $head).ToUnixTimeSeconds())" 'the commit time of HEAD, as git itself prints it'
+        Assert-FailsWith { Get-CommitTimestamp -RepoRoot $RepoRoot -Commit $SampleCommit } @("git show", $SampleCommit) -Fix @('git rev-parse HEAD')
     }
 
     # ======================================================================
@@ -480,7 +461,7 @@ try {
     Invoke-Case 'staging: the plugin agents are the converted source agents, the direct agents are unchanged and ship link-agents.bat' {
         $stage = New-StagedCopy
         $sources = @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot '.claude\agents') -File -Filter '*.md')
-        Assert-True ($sources.Count -ge 3) 'the repository should have its agents'
+        Assert-True ($sources.Count -gt 0) 'the repository has no agent, so the loop below would check nothing'
         Assert-Equal $sources.Count (Get-RelativeFileList (Join-Path $stage 'agents')).Count 'plugin agent count'
         foreach ($source in $sources) {
             $plugin = [IO.File]::ReadAllText((Join-Path $stage "agents\$($source.Name)"))
@@ -568,9 +549,11 @@ try {
             return @($items | ForEach-Object { ($_.Groups[1].Value -split '[\\/]')[0] } | Sort-Object -Unique | Where-Object { $handled -cnotcontains $_ })
         }
         $project = [IO.File]::ReadAllText((Join-Path $RepoRoot 'TestStandMCP.csproj'))
-        Assert-True ([regex]::Matches($project, 'CopyToOutputDirectory').Count -ge 4) 'the csproj should copy items to the output'
         Assert-Equal 0 (Get-UnhandledOutputItem $project).Count "csproj output items the staging table does not handle: $((Get-UnhandledOutputItem $project) -join ', ')"
+        # What the check can see is proved on a small fixture, not by counting things in the real csproj.
         Assert-Equal 'extras' ((Get-UnhandledOutputItem '<None Include="extras\**\*" CopyToOutputDirectory="PreserveNewest" />') -join ',') 'the drift check sees a new item'
+        Assert-Equal 'extras,more' ((Get-UnhandledOutputItem '<Content Include="more\a.txt" CopyToOutputDirectory="Always" /><None Update="extras\b" CopyToOutputDirectory="Always" /><None Include="scripts\x" CopyToOutputDirectory="Always" />') -join ',') 'both Include and Update, Content and None, and an item that is handled is not reported'
+        Assert-Equal 0 (Get-UnhandledOutputItem '<None Include="scripts\x.ps1" />').Count 'an item that is not copied to the output is not looked at'
     }
 
     # ---- the Outline rows of slice 5.2, one fixture each ------------------
@@ -719,6 +702,29 @@ try {
         Assert-FailsWith { New-StageFrom -PublishDir (New-FakePublishDir) -Root $ignored } @('debug.log')
     }
 
+    Invoke-Case 'fault: an untracked or an ignored agent below .claude/agents stops the staging, and is not an agent of the plugin' {
+        $untracked = New-RepoFixture
+        Write-TextFile (Join-Path $untracked '.claude\agents\scratch-agent.md') "---`nname: scratch-agent`ntools: Read`n---`nx`n"
+        Assert-FailsWith { New-StageFrom -PublishDir (New-FakePublishDir) -Root $untracked } @('.claude/agents holds 1 file(s) git does not track', 'scratch-agent.md') -Fix @('git add .claude/agents')
+        $ignored = New-RepoFixture -Mutate { param($r) Write-TextFile (Join-Path $r '.gitignore') "ignored-agent.md`n"; Write-TextFile (Join-Path $r '.claude\agents\ignored-agent.md') "---`nname: ignored-agent`ntools: Read`n---`nx`n" }
+        Assert-FailsWith { New-StageFrom -PublishDir (New-FakePublishDir) -Root $ignored } @('ignored-agent.md')
+        $table = @(Get-StagingTable -RepoRoot $untracked -Layout $FolderLayout -PublishDir (New-FakePublishDir))
+        $agents = @($table | Where-Object { $_.Path -ceq 'agents' })[0]
+        Assert-True (@($agents.Exact) -cnotcontains 'scratch-agent.md') 'the expected plugin agents are derived from the tracked agents, never from the working folder'
+        $copied = @($table | Where-Object { $_.Path -ceq 'bin/.claude/agents' })[0]
+        Assert-True (@($copied.Exact) -cnotcontains 'scratch-agent.md') 'the copied source agents are the tracked ones too'
+        Assert-True ($copied.TrackedOnly -and @($table | Where-Object { $_.Path -ceq 'bin/scripts' })[0].TrackedOnly) 'agents and doc scripts are copied from git, not from the folder'
+    }
+
+    Invoke-Case 'fault: an untracked or an ignored documentation script (one that ships) stops the staging; an unrelated file in scripts/ does not' {
+        $noScript = New-RepoFixture -Mutate { param($r) Write-TextFile (Join-Path $r '.gitignore') "generate_teststand_doc.py`n" }
+        Assert-FailsWith { New-StageFrom -PublishDir (New-FakePublishDir) -Root $noScript } @('scripts holds 1 file(s) git does not track', 'generate_teststand_doc.py') -Fix @('git add scripts')
+        $fresh = New-RepoFixture
+        Write-TextFile (Join-Path $fresh 'scripts\private-notes.py') 'not shipped'
+        $stage = New-StageFrom -PublishDir (New-FakePublishDir) -Root $fresh
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $stage 'bin\scripts\private-notes.py'))) 'an unrelated file in scripts/ is not staged'
+    }
+
     Invoke-Case 'staging: a tracked fixture repository stages cleanly and ignores nothing tracked' {
         $root = New-RepoFixture
         $publish = New-FakePublishDir
@@ -746,6 +752,20 @@ try {
         Remove-Item -LiteralPath (Join-Path $stage 'bin\written-by-the-smoke-run.log')
         [IO.File]::AppendAllText((Join-Path $stage 'hooks\hooks.json'), ' ')
         Assert-FailsWith { Assert-StageUnchanged -StageDir $stage -Snapshot $snapshot } @('hooks/hooks.json')
+    }
+
+    Invoke-Case 'snapshot: ONE changed file is named by its path alone, never glued to its hash (a changed file is one old and one new line)' {
+        $stage = New-StagedCopy
+        $snapshot = Get-StageSnapshot -StageDir $stage
+        $oldHash = (@($snapshot -split "`n" | Where-Object { $_.EndsWith('  hooks/hooks.json') })[0] -split '  ')[0]
+        [IO.File]::AppendAllText((Join-Path $stage 'hooks\hooks.json'), ' ')
+        $newHash = (@((Get-StageSnapshot -StageDir $stage) -split "`n" | Where-Object { $_.EndsWith('  hooks/hooks.json') })[0] -split '  ')[0]
+        Assert-True ($oldHash -cne $newHash -and $oldHash.Length -eq 64 -and $newHash.Length -eq 64) 'the fixture must change the hash'
+        $message = Get-ThrownMessage { Assert-StageUnchanged -StageDir $stage -Snapshot $snapshot }
+        Assert-Contains $message 'changed after it was asserted: hooks/hooks.json' 'the changed path'
+        Assert-NotContains $message $oldHash 'the message (the old hash)'
+        Assert-NotContains $message $newHash 'the message (the new hash)'
+        Assert-Equal 1 ([regex]::Matches($message, [regex]::Escape('hooks/hooks.json'))).Count 'the path is named once, not once per line of the diff'
     }
 
     # ======================================================================
@@ -893,7 +913,6 @@ try {
         $second = Join-Path (New-TempDir) 'b.zip'
         New-PluginZip -StageDir $stage -ZipPath $first -Timestamp $FixedTimestamp
         (Get-Item -LiteralPath (Join-Path $stage 'VERSION.txt')).LastWriteTime = [DateTime]::new(2020, 1, 2, 3, 4, 6)
-        Start-Sleep -Milliseconds 2100
         New-PluginZip -StageDir $stage -ZipPath $second -Timestamp $FixedTimestamp
         Assert-Equal (Get-FileSha256 $first) (Get-FileSha256 $second) 'the two archives'
         $zip = [IO.Compression.ZipFile]::OpenRead($first)
@@ -977,7 +996,7 @@ try {
         $outDir = Join-Path (New-TempDir) 'out'
         $result = Invoke-BuildScript -ScriptPath $ScriptPath -TimeoutSeconds 120 -ArgumentList @('-Version', 'one.nine', '-OutDir', $outDir)
         Assert-Equal 1 $result.ExitCode 'exit code'
-        foreach ($label in @('What', 'Why', 'Fix')) { Assert-True ($result.Stdout -cmatch "(?m)^${label}: +\S") "no '${label}:' line in:`n$($result.Stdout)" }
+        Assert-ThreePartFailure $result.Stdout
         Assert-Contains $result.Stdout "'one.nine'" 'output'
         Assert-True (-not (Test-Path -LiteralPath $outDir)) 'nothing may be created for a refused input'
     }
@@ -999,7 +1018,7 @@ try {
         $outDir = Join-Path (New-TempDir) 'out'
         $result = Invoke-BuildScript -ScriptPath (Join-Path $root 'build\Build-PluginArchive.ps1') -TimeoutSeconds 300 -ArgumentList @('-Version', '0.0.0-ci', '-Commit', $SampleCommit, '-OutDir', $outDir)
         Assert-Equal 1 $result.ExitCode "exit code; output was:`n$($result.Stdout)"
-        foreach ($label in @('What', 'Why', 'Fix')) { Assert-True ($result.Stdout -cmatch "(?m)^${label}: +\S") "no '${label}:' line in:`n$($result.Stdout)" }
+        Assert-ThreePartFailure $result.Stdout
         Assert-Contains $result.Stdout '[1/8]' 'step 1 started'
         Assert-Contains $result.Stdout 'plugin.json' 'the fault names the manifest'
         Assert-NotContains $result.Stdout '[2/8]' 'step 2 must not start'

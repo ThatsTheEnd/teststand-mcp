@@ -75,6 +75,16 @@ function Get-HookEnvironmentText {
     return $value
 }
 
+# A failure the tests can ask a hook for by name (TESTSTAND_MCP_HOOK_SIMULATE=<name>), to prove that the hook
+# survives it. It is honoured ONLY when TESTSTAND_MCP_STATE_DIR is set too: that variable only tests (and a few
+# unusual stations) set, so a stray value in a user's environment can never make a hook fail by itself.
+$script:SimulateVariable = 'TESTSTAND_MCP_HOOK_SIMULATE'
+function Invoke-HookSimulation {
+    param([Parameter(Mandatory)][string]$Name)
+    if ($null -eq (Get-HookEnvironmentText $script:StateDirOverrideVariable)) { return }
+    if ((Get-HookEnvironmentText $script:SimulateVariable) -ceq $Name) { throw "simulated failure: $Name" }
+}
+
 # A switch variable: only the exact value 1 turns it on.
 function Test-HookFlag {
     param([Parameter(Mandatory)][string]$Name)

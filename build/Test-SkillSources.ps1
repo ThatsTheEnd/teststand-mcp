@@ -189,10 +189,8 @@ function Get-RelativePath {
 
 # git's tracked paths (raw, NUL separated); $null when git is missing, fails or the repository is unreadable.
 function Get-GitTrackedPath {
-    try {
-        $result = Invoke-ChildProcess -FilePath 'git' -ArgumentList @('-c', 'core.quotePath=off', '-C', $RepoRoot, 'ls-files', '-z') -TimeoutSeconds $GitTimeoutSeconds
-    } catch { return $null }
-    if ($result.TimedOut -or $result.ExitCode -ne 0) { return $null }
+    $result = Invoke-Git -RepoRoot $RepoRoot -Arguments @('ls-files', '-z') -TimeoutSeconds $GitTimeoutSeconds -SoftFail
+    if ($null -eq $result) { return $null }
     return , @($result.Stdout -split "`0" | Where-Object { $_ })   # the comma keeps a one-element list an array
 }
 

@@ -40,11 +40,12 @@ defaults:
 jobs:
   check:
     runs-on: windows-latest
-    # Arithmetic: the whole job takes about 30 minutes (setup, unit tests, the script tests under two
-    # hosts, packaging). One script that hangs is stopped after 600 s per host, 2 x 10 = 20 minutes
-    # more, and only then does Invoke-ScriptTests print its FAIL summary. 30 + 20 = 50, plus a margin:
-    # the job must outlive that, or the summary would be lost to a bare cancellation.
-    timeout-minutes: 60
+    # Arithmetic: the whole job takes about 30 minutes. Every step that can hang has its own cap, and the
+    # job must outlive the SUM of them (15 + 30 + 5 + 30 = 80 minutes) plus a margin for the steps without
+    # a cap (checkout, setup, upload), or a step's FAIL output would be lost to a bare cancellation of the
+    # job. Invoke-ScriptTests stops each script after 600 s and starts no script once less than 600 s of its
+    # 1500 s budget are left, so it prints its summary before its own 30-minute step cap.
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -66,19 +67,23 @@ jobs:
       # AnyCPU: the project is built for x86 (the TestStand engine is 32-bit), and an x86 test host
       # would need an x86 .NET runtime the runner does not have. The tests are pure logic.
       - name: Run the engine-free unit tests
+        timeout-minutes: 15
         run: dotnet test Test/TestExecution/TestStandMCP.IntegrationTests.csproj --filter "Category=EngineFree" -p:PlatformTarget=AnyCPU --nologo
 
       - name: Run every script test under Windows PowerShell 5.1 and PowerShell 7
         env:
           TESTSTAND_MCP_REQUIRE_PWSH: '1' # a missing pwsh must fail here, not skip
+        timeout-minutes: 30
         run: |
-          & .\build\Invoke-ScriptTests.ps1 -TimeoutSeconds 600
+          & .\build\Invoke-ScriptTests.ps1 -TimeoutSeconds 600 -TotalSeconds 1500
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run the stats tests
+        timeout-minutes: 5
         run: python -m unittest discover -s .github/stats
 
       - name: Package the plugin archive at the CI version and verify it
+        timeout-minutes: 30
         run: |
           & .\build\Build-PluginArchive.ps1 -Version $env:PACKAGE_VERSION -OutDir $env:PACKAGE_OUT_DIR
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

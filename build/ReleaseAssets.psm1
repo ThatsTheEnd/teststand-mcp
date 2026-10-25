@@ -6,7 +6,7 @@
 #      comparison of an archive against it;
 #    - the own-downloads record (what this repository's workflows downloaded),
 #      which the stats collector subtracts from the public download counts.
-#  The verdict on a release (fault catalog and judge) lives in ReleaseVerdict.psm1.
+#  The verdict on a release (fault catalog, judge, rollback policy, asset-set check) lives in ReleaseVerdict.psm1.
 #  Failures go through Write-BuildFailure (BuildCommon.psm1).
 #  Compatible with Windows PowerShell 5.1 and PowerShell 7.
 # ============================================================================
@@ -20,13 +20,15 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 # ----------------------------------------------------------------------------
 #  Asset contract (exported, read-only)
 # ----------------------------------------------------------------------------
-Set-Variable -Name ReleaseRepoSlug -Value 'ThatsTheEnd/teststand-mcp' -Option ReadOnly -Scope Script
-Set-Variable -Name ReleaseArchiveName -Value 'teststand-mcp.zip' -Option ReadOnly -Scope Script
-Set-Variable -Name ReleaseDigestName -Value 'teststand-mcp.sha256' -Option ReadOnly -Scope Script
-Set-Variable -Name ReleaseManifestName -Value 'teststand-mcp.manifest.sha256' -Option ReadOnly -Scope Script
+Set-Variable -Name ReleaseRepoSlug -Value 'Zuehlke/teststand-mcp' -Option ReadOnly -Scope Script
+# Every asset name starts with this prefix, so a workflow can pick the assets up with one glob ($ReleaseAssetPrefix*).
+Set-Variable -Name ReleaseAssetPrefix -Value 'teststand-mcp' -Option ReadOnly -Scope Script
+Set-Variable -Name ReleaseArchiveName -Value "$ReleaseAssetPrefix.zip" -Option ReadOnly -Scope Script
+Set-Variable -Name ReleaseDigestName -Value "$ReleaseAssetPrefix.sha256" -Option ReadOnly -Scope Script
+Set-Variable -Name ReleaseManifestName -Value "$ReleaseAssetPrefix.manifest.sha256" -Option ReadOnly -Scope Script
 Set-Variable -Name ReleaseUploaderLogin -Value 'github-actions[bot]' -Option ReadOnly -Scope Script
 
-$script:VersionedArchiveFormat = 'teststand-mcp-v{0}.zip'
+$script:VersionedArchiveFormat = "$ReleaseAssetPrefix-v{0}.zip"
 $script:LatestDownloadUrlFormat = 'https://github.com/{0}/releases/latest/download/{1}'
 
 function Get-VersionedArchiveName {
@@ -43,6 +45,36 @@ function Get-RequiredAssetNames {
     return @($ReleaseArchiveName, $ReleaseDigestName, $ReleaseManifestName, (Get-VersionedArchiveName -Version $Version))
 }
 
+# A folder of release assets holds exactly the required files of the version: no missing one, no extra one
+# (an extra file would be uploaded as a release asset nobody verifies). Subfolders are not assets.
+function Assert-ReleaseAssetFiles {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][string]$Version)
+    $resolved = Resolve-BuildPath $Directory
+    $expected = @(Get-RequiredAssetNames -Version $Version)
+    $present = @()
+    if (Test-Path -LiteralPath $resolved -PathType Container) { $present = @(Get-ChildItem -LiteralPath $resolved -File | ForEach-Object { $_.Name }) }
+    $missing = @($expected | Where-Object { $present -cnotcontains $_ })
+    $unexpected = @($present | Where-Object { $expected -cnotcontains $_ })
+    if ($missing.Count -eq 0 -and $unexpected.Count -eq 0) { return }
+    $detail = @()
+    if ($missing.Count -gt 0) { $detail += "missing: $($missing -join ', ')" }
+    if ($unexpected.Count -gt 0) { $detail += "unexpected: $($unexpected -join ', ')" }
+    Write-BuildFailure -What "The asset folder $Directory does not hold exactly the $($expected.Count) release assets of version $Version ($($detail -join '; '))." `
+        -Why 'Every file of the folder would be uploaded to the release, so a missing asset makes an incomplete release and an extra one ships a file nobody verified. Running it again will not help.' `
+        -Fix "Check what the package job uploaded (the release-assets artifact): it must hold exactly $($expected -join ', ')."
+}
+
+# owner/name, as the GitHub API and gh take it; it becomes part of a URL, so only letters, digits, dot, dash and underscore.
+function Assert-RepoSlug {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Repo)
+    $segments = @($Repo -split '/')
+    if ($Repo -cnotmatch '\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z' -or @($segments | Where-Object { $_ -cmatch '\A\.+\z' }).Count -gt 0) {
+        Write-BuildFailure -What "The repository '$Repo' is not owner/name." -Why 'It becomes part of the API URL, so it is restricted to letters, digits, dot, dash and underscore.' -Fix "Pass -Repo $ReleaseRepoSlug."
+    }
+}
+
 # -Repo names another repository (a fork rehearsing the release); the default is the contract repository.
 function Get-LatestDownloadUrl {
     [CmdletBinding()]
@@ -56,7 +88,7 @@ function Get-LatestDownloadUrl {
 #  [0-9] and \A..\z on purpose: \d matches non-ASCII digits and $ matches before a final newline.
 # ----------------------------------------------------------------------------
 $script:ValidTagPattern = '\Av(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\z'
-$script:RehearsalSuffix = '-rehearsal'
+Set-Variable -Name ReleaseRehearsalSuffix -Value '-rehearsal' -Option ReadOnly -Scope Script   # the dry-run tag is v<X.Y.Z>-rehearsal
 $script:TagFormatReason = 'Release tags must be exactly v<major>.<minor>.<patch>: a lower-case v and three numbers without leading zeros. ' +
     'The release workflow, the asset name teststand-mcp-vX.Y.Z.zip and the version stamped into the plugin all derive from the tag.'
 
@@ -90,8 +122,8 @@ function ConvertFrom-ReleaseTag {
     }
 
     if ([regex]::IsMatch($Tag, $script:ValidTagPattern)) { return (& $valid $Tag.Substring(1) $false) }
-    if ($AllowRehearsal -and $Tag.EndsWith($script:RehearsalSuffix, [StringComparison]::Ordinal)) {
-        $baseTag = $Tag.Substring(0, $Tag.Length - $script:RehearsalSuffix.Length)
+    if ($AllowRehearsal -and $Tag.EndsWith($ReleaseRehearsalSuffix, [StringComparison]::Ordinal)) {
+        $baseTag = $Tag.Substring(0, $Tag.Length - $ReleaseRehearsalSuffix.Length)
         if ([regex]::IsMatch($baseTag, $script:ValidTagPattern)) { return (& $valid $baseTag.Substring(1) $true) }
     }
 
@@ -121,7 +153,7 @@ function Format-NumberedSteps {
 # A tag is printed inside runnable commands only when it is made of these characters and does not
 # start with '-' (git would read it as an option). Anything else gets an instruction, never a command.
 $script:SafeTagPattern = '\A[A-Za-z0-9._/+]+[A-Za-z0-9._/+-]*\z'
-$script:FullCommitPattern = '\A[0-9a-f]{40}\z'
+Set-Variable -Name ReleaseCommitPattern -Value '\A[0-9a-f]{40}\z' -Option ReadOnly -Scope Script   # a full commit SHA, lower-case
 $script:CommitPlaceholder = '<commit>'
 $script:ChosenTagPlaceholder = 'vX.Y.Z'
 
@@ -133,7 +165,7 @@ function Get-TagRejection {
     $shownTag = Get-PrintableTag $Result.Tag
     $isEmpty = [string]::IsNullOrWhiteSpace($Result.Tag)
     $isSafeToPrint = [regex]::IsMatch($Result.Tag, $script:SafeTagPattern)
-    $commitKnown = [regex]::IsMatch([string]$Commit, $script:FullCommitPattern)
+    $commitKnown = [regex]::IsMatch([string]$Commit, $ReleaseCommitPattern)
     $commitText = if ($commitKnown) { $Commit } else { $script:CommitPlaceholder }
     $newTag = if ($null -ne $Result.SuggestedTag) { $Result.SuggestedTag } else { $script:ChosenTagPlaceholder }
 
@@ -355,7 +387,7 @@ function Compare-ArchiveManifest {
 #  The stats collector subtracts these from the public download counts (spec AC-18).
 # ----------------------------------------------------------------------------
 $script:OwnDownloadsDateFormat = 'yyyy-MM-dd'
-$script:OwnDownloadPhases = @('draft', 'published')
+Set-Variable -Name OwnDownloadPhases -Value ([string[]]@('draft', 'published')) -Option ReadOnly -Scope Script   # also the ValidateSet of Add-OwnDownload (a test ties them)
 $script:OwnDownloadsDateKeyPattern = '\A[0-9]{4}-[0-9]{2}-[0-9]{2}\z'
 
 function Test-OwnDownloadsDate {
@@ -392,7 +424,7 @@ function Read-OwnDownloads {
         $assets = New-OrdinalOrderedMap
         foreach ($assetProperty in $dateProperty.Value.PSObject.Properties) {
             $cell = [ordered]@{}
-            foreach ($phase in $script:OwnDownloadPhases) {
+            foreach ($phase in $OwnDownloadPhases) {
                 $value = Get-JsonProperty $assetProperty.Value $phase
                 if ($null -eq $value -or $value -is [bool] -or $value -isnot [ValueType] -or [int64]$value -lt 0) { & $fail "$($dateProperty.Name) / $($assetProperty.Name) has no non-negative '$phase' count" }
                 $cell[$phase] = [int]$value
@@ -452,101 +484,19 @@ function Add-OwnDownload {
     }
     if (-not $record.Counts.Contains($Date)) { $record.Counts[$Date] = New-OrdinalOrderedMap }
     $assets = $record.Counts[$Date]
-    if (-not $assets.Contains($Asset)) { $assets[$Asset] = [ordered]@{ draft = 0; published = 0 } }
+    if (-not $assets.Contains($Asset)) {
+        $cell = [ordered]@{}
+        foreach ($known in $OwnDownloadPhases) { $cell[$known] = 0 }
+        $assets[$Asset] = $cell
+    }
     $assets[$Asset][$Phase] = $assets[$Asset][$Phase] + 1
     Save-OwnDownloads -Record $record -Path $Path
 }
 
-# ----------------------------------------------------------------------------
-#  The asset set that was verified is the asset set that goes live. The release workflow calls this
-#  (through Assert-ReleaseAssetSet.ps1) on the body of GET releases/{id} just BEFORE it publishes the
-#  verified draft and again just AFTER: a person or a stray job could add, replace or remove an asset
-#  between the verification and the publish call, and the verification would then say nothing about what
-#  users download. Asset ids are compared (a replaced asset gets a new id), as a set: order is irrelevant.
-#  -ExpectedAssetIds is the verifier's asset_ids output, {"<asset name>": <id>, ...}.
-# ----------------------------------------------------------------------------
-$script:AssetIdPattern = '\A[0-9]+\z'
-$script:AssetSetFixes = @{
-    Restart = 'Delete the draft (gh release delete <tag>, or in the web UI) and start a new release run: the verified assets are no longer what the release holds.'
-    NotLive = 'The release is still a draft, so nothing is live: start a new release run (delete the draft first).'
-    Live    = 'The release is already live with assets nobody verified: delete it so releases/latest falls back to the previous release (safe only once an earlier workflow-built release exists), or fix forward by releasing the next patch version (see CONTRIBUTING).'
-}
-
-function ConvertFrom-ExpectedAssetIds {
-    param([AllowEmptyString()][string]$Text)
-    $fail = {
-        param($Reason)
-        Write-BuildFailure -What "The verified asset ids are unusable: $Reason." `
-            -Why 'They are the verifier''s asset_ids output, the only record of what was verified; without them the release cannot be compared with it. Running it again will not help.' `
-            -Fix 'Check that the verification step wrote asset_ids to its step output, then start a new release run.'
-    }
-    if ([string]::IsNullOrWhiteSpace($Text)) { & $fail 'the value is empty' }
-    try { $json = $Text | ConvertFrom-Json } catch { & $fail 'it is not valid JSON' }
-    $expected = New-OrdinalOrderedMap   # id -> asset name
-    foreach ($property in @(Get-PropertyNames $json)) {
-        $id = [string](Get-JsonProperty $json $property)
-        if ($id -cnotmatch $script:AssetIdPattern) { & $fail "'$property' has the id '$id', which is not a number" }
-        $expected[$id] = $property
-    }
-    if ($expected.Count -eq 0) { & $fail 'it lists no asset' }
-    return $expected
-}
-
-function Assert-ReleaseAssetSet {
-    [CmdletBinding()]
-    param(
-        [AllowEmptyString()][string]$ReleaseJson,
-        [AllowEmptyString()][string]$ExpectedAssetIds,
-        [AllowEmptyString()][string]$ReleaseId,
-        [ValidateSet('BeforePublish', 'AfterPublish')][string]$Stage
-    )
-    $after = ($Stage -ceq 'AfterPublish')
-    $when = if ($after) { 'after the publish call' } else { 'before publishing' }
-    $expected = ConvertFrom-ExpectedAssetIds $ExpectedAssetIds
-
-    $release = $null
-    if (-not [string]::IsNullOrWhiteSpace($ReleaseJson)) { try { $release = $ReleaseJson | ConvertFrom-Json } catch { $release = $null } }
-    if ($null -eq $release -or $null -eq $release.PSObject.Properties['assets']) {   # an empty list is still a list
-        Write-BuildFailure -What "The release response $when is not a release (empty, not JSON, or without an asset list)." `
-            -Why 'The asset set cannot be compared without it. Running it again may help if the API call failed transiently.' `
-            -Fix $(if ($after) { $script:AssetSetFixes.Live } else { $script:AssetSetFixes.Restart })
-    }
-
-    $problems = @()
-    $actualId = [string](Get-JsonProperty $release 'id')
-    if ($actualId -cne $ReleaseId) { $problems += "the API answered with release $actualId, not release $ReleaseId" }
-    $draft = Get-JsonProperty $release 'draft'
-    $isLive = $false
-    if ($draft -isnot [bool]) {
-        $problems += 'the response has no draft flag'
-    } else {
-        $isLive = (-not $draft)
-        if (-not $after -and -not $draft) { $problems += 'the release is not a draft any more' }
-        if ($after -and $draft) { $problems += 'the release is still a draft' }
-    }
-
-    $actual = New-OrdinalOrderedMap   # id -> asset name
-    foreach ($asset in @(Get-JsonProperty $release 'assets')) {
-        if ($null -eq $asset) { continue }
-        $actual[[string](Get-JsonProperty $asset 'id')] = [string](Get-JsonProperty $asset 'name')
-    }
-    foreach ($id in $expected.Keys) { if (-not $actual.Contains($id)) { $problems += "$($expected[$id]) (id $id) is missing" } }
-    foreach ($id in $actual.Keys) { if (-not $expected.Contains($id)) { $problems += "$($actual[$id]) (id $id) was not verified" } }
-
-    if ($problems.Count -eq 0) {
-        Write-Host "Release $ReleaseId holds exactly the $($expected.Count) verified assets ($(if ($isLive) { 'published' } else { 'draft' }))."
-        return
-    }
-    $fix = if ($isLive) { $script:AssetSetFixes.Live } elseif ($after) { $script:AssetSetFixes.NotLive } else { $script:AssetSetFixes.Restart }
-    $state = if ($isLive) { 'The release is live: it' } else { 'The release' }
-    Write-BuildFailure -What "$state does not match what was verified ($when): $($problems -join '; ')." `
-        -Why 'Publishing, or having published, assets the verification never saw would make its result meaningless. Running it again will not help: the release changed after it was verified.' `
-        -Fix $fix
-}
-
-Export-ModuleMember -Variable ReleaseRepoSlug, ReleaseArchiveName, ReleaseDigestName, ReleaseManifestName, ReleaseUploaderLogin, ArchiveProblemKinds
-Export-ModuleMember -Function Get-VersionedArchiveName, Get-RequiredAssetNames, Get-LatestDownloadUrl,
+Export-ModuleMember -Variable ReleaseRepoSlug, ReleaseAssetPrefix, ReleaseArchiveName, ReleaseDigestName, ReleaseManifestName, ReleaseUploaderLogin, ArchiveProblemKinds,
+    ReleaseRehearsalSuffix, ReleaseCommitPattern, OwnDownloadPhases
+Export-ModuleMember -Function Get-VersionedArchiveName, Get-RequiredAssetNames, Assert-ReleaseAssetFiles, Assert-RepoSlug, Get-LatestDownloadUrl,
     Get-FileSha256, Get-StreamSha256, Format-HashLine, ConvertFrom-HashLines,
-    ConvertFrom-ReleaseTag, Get-TagRejection,
+    ConvertFrom-ReleaseTag, Get-TagRejection, Get-PrintableTag, New-OrdinalOrderedMap,
     New-ArchiveDigest, ConvertFrom-DigestText, New-ArchiveManifest, Compare-ArchiveManifest,
-    Read-OwnDownloads, Add-OwnDownload, Assert-ReleaseAssetSet
+    Read-OwnDownloads, Add-OwnDownload

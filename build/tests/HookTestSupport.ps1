@@ -15,70 +15,27 @@ $HostPath = (Get-Process -Id $PID).Path
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $FixedNow = [DateTimeOffset]::new(2026, 10, 24, 12, 0, 0, [TimeSpan]::Zero)   # the injected clock (TESTSTAND_MCP_NOW)
 $Hours = 3600
-$ProcessTimeoutMilliseconds = 120000
+$ProcessTimeoutSeconds = 120
 
+Import-Module (Join-Path $RepoRoot 'build\BuildCommon.psm1') -Force   # Invoke-ChildProcess, ConvertTo-ArgumentElement
 Import-Module $IdentityModulePath -Force
 $IdentityPrefix = (Get-PluginIdentity).pluginToolPrefix
 $PluginName = (Get-PluginIdentity).name
 
 # ---- processes ----------------------------------------------------------------------------------
-# Runs a program with stdin text and a controlled environment; never throws on a non-zero exit, but
-# kills it and throws when it runs longer than two minutes.
-# $EnvOverrides: name -> value; a $null value REMOVES the variable from the child.
-function Invoke-ProcessWithStdin {
+# Runs a program with stdin text and a controlled environment (BuildCommon's Invoke-ChildProcess, which quotes
+# each argument like a spawned "args" list); never fails on a non-zero exit, but kills it and throws when it
+# runs longer than two minutes. $EnvOverrides: name -> value; a $null value REMOVES the variable from the child.
+function Invoke-HookProcess {
     param(
-        [Parameter(Mandatory)][string]$FileName,
-        [Parameter(Mandatory)][string]$Arguments,
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
         [AllowEmptyString()][string]$StdinText = '',
         [hashtable]$EnvOverrides = @{}
     )
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $FileName
-    $startInfo.Arguments = $Arguments
-    $startInfo.UseShellExecute = $false
-    $startInfo.RedirectStandardInput = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $startInfo.CreateNoWindow = $true
-    foreach ($name in $EnvOverrides.Keys) {
-        if ($null -eq $EnvOverrides[$name]) { [void]$startInfo.EnvironmentVariables.Remove($name) }
-        else { $startInfo.EnvironmentVariables[$name] = [string]$EnvOverrides[$name] }
-    }
-    $clock = [Diagnostics.Stopwatch]::StartNew()
-    $process = [Diagnostics.Process]::Start($startInfo)
-    try {
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        $stdinBytes = $Utf8NoBom.GetBytes($StdinText)
-        try {
-            $process.StandardInput.BaseStream.Write($stdinBytes, 0, $stdinBytes.Length)
-            $process.StandardInput.Close()
-        } catch [System.IO.IOException] {
-            # the hook stopped reading (an oversized input) and exited first: not a test failure
-        }
-        if (-not $process.WaitForExit($ProcessTimeoutMilliseconds)) {
-            try { $process.Kill() } catch { }
-            throw "$FileName ran longer than $ProcessTimeoutMilliseconds ms and was killed"
-        }
-        return [pscustomobject]@{
-            ExitCode  = $process.ExitCode
-            Stdout    = $stdoutTask.Result
-            Stderr    = $stderrTask.Result
-            ElapsedMs = $clock.ElapsedMilliseconds
-        }
-    } finally {
-        $process.Dispose()
-    }
-}
-
-# One argument as a Windows command-line element: quoted when it holds a space or a quote, with the
-# backslash rules of CommandLineToArgvW. This is what spawning an "args" list does for each element.
-function ConvertTo-ArgumentElement {
-    param([string]$Text)
-    if ($Text.Length -gt 0 -and $Text -notmatch '[\s"]') { return $Text }
-    $escaped = [regex]::Replace($Text, '(\\*)"', '$1$1\"')
-    $escaped = [regex]::Replace($escaped, '(\\+)\z', '$1$1')
-    return '"' + $escaped + '"'
+    $result = Invoke-ChildProcess -FilePath $FilePath -ArgumentList $ArgumentList -StdinText $StdinText -EnvOverrides $EnvOverrides -TimeoutSeconds $ProcessTimeoutSeconds
+    if ($result.TimedOut) { throw "$FilePath ran longer than $ProcessTimeoutSeconds s and was killed" }
+    return $result
 }
 
 # Runs a PowerShell script under the SAME host that runs this file.
@@ -88,10 +45,16 @@ function Invoke-HookScript {
         [AllowEmptyString()][string]$StdinText = '',
         [hashtable]$EnvOverrides = @{}
     )
-    $arguments = (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath) | ForEach-Object { ConvertTo-ArgumentElement $_ }) -join ' '
-    return Invoke-ProcessWithStdin -FileName $HostPath -Arguments $arguments -StdinText $StdinText -EnvOverrides $EnvOverrides
+    return Invoke-HookProcess -FilePath $HostPath -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath) -StdinText $StdinText -EnvOverrides $EnvOverrides
 }
 
+# The hook input a tool call produces: tool name, tool_input and (unless $null) the session's cwd.
+function ConvertTo-HookInput {
+    param([string]$ToolName, $ToolInput = @{}, [AllowNull()][string]$Cwd = $null)
+    $request = [ordered]@{ hook_event_name = 'PreToolUse'; tool_name = $ToolName; tool_input = $ToolInput }
+    if ($null -ne $Cwd) { $request['cwd'] = $Cwd }
+    return ($request | ConvertTo-Json -Compress -Depth 6)
+}
 function Assert-AsciiOnly {
     param([string]$Text, [string]$What = 'output')
     foreach ($char in $Text.ToCharArray()) {

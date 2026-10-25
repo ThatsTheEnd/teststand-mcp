@@ -2,7 +2,8 @@
 #  ReleaseVerdict.psm1 - the verdict on a release, with no network and no process state.
 #    Get-ReleaseProblems   the judge: plain asset data in, a list of problems out;
 #    New-Problem           builds one problem from the fault catalog (ONE map);
-#    Format-ReleaseFailure the What/Why/Fix of a list of problems.
+#    Format-ReleaseFailure the What/Why/Fix of a list of problems;
+#    Assert-ReleaseAssetSet the asset set that was verified is the asset set that goes live.
 #  An asset is a plain object { Name; Uploader; Size; Path }. A release is judged in two scopes so
 #  nothing is downloaded for a fault the listing already shows:
 #    Listing  presence, who uploaded EVERY asset, versioned-vs-plugin archive size;
@@ -20,11 +21,16 @@ $script:UnknownUploader = '(unknown)'
 $script:NeverRetriesWhy = 'Running the verifier again will not help'
 $script:MayRetryWhy = 'Running the verifier again may help'
 
+# THE rollback policy: what a maintainer does about a bad release that is already LIVE. Every report of such a
+# release (a faulty published release, a mismatching latest download, a changed asset set after publishing)
+# ends in this one sentence; CONTRIBUTING quotes it.
+$script:RollbackAdvice = 'delete the release so releases/latest falls back to the previous release (safe only once an earlier workflow-built release exists), or fix forward by releasing the next patch version (see CONTRIBUTING).'
+
 # What the maintainer does after a fault, by where the assets came from AND by release.draft: only a draft is
 # deleted first; a published release is rolled back or fixed forward. Local mode never talks about either.
 $script:RestartFix = @{
     Api          = 'Start a new release run (delete the draft first).'
-    ApiPublished = 'The release is already published, so there is no draft to delete: delete the release so releases/latest falls back to the previous release (safe only once an earlier workflow-built release exists), or fix forward by releasing the next patch version (see CONTRIBUTING).'
+    ApiPublished = "The release is already published, so there is no draft to delete: $script:RollbackAdvice"
     Local        = ('Run the packaging script again so it produces all {0} assets.' -f (Get-RequiredAssetNames -Version '0.0.0').Count)
 }
 
@@ -87,7 +93,7 @@ $script:Faults = @{
     'latest-mismatch'              = @{ Fault = "the plugin archive users download from releases/latest (hash {0}) does not match the published archive digest ({1})"
                                         Why = 'users would install a different file than the one the release was verified for'
                                         OwnFix = $true
-                                        Fix = 'Check what releases/latest points at. If a bad release is live, delete it so latest falls back to the previous release, or release the next patch version (see CONTRIBUTING).' }
+                                        Fix = "Check what releases/latest points at. If a bad release is live, $script:RollbackAdvice" }
     'latest-not-verified'          = @{ Fault = "the plugin archive users download from releases/latest (hash {0}) is not the archive of the release that was just verified (hash {1})"
                                         Why = 'releases/latest still serves another release, or the download has not propagated yet, so users would not get the release that was just published'
                                         OwnFix = $true
@@ -240,4 +246,91 @@ function Format-ReleaseFailure {
     }
 }
 
-Export-ModuleMember -Function Get-ReleaseProblems, New-Problem, Get-ReleaseFaultCodes, Format-ReleaseFailure
+# ----------------------------------------------------------------------------
+#  The asset set that was verified is the asset set that goes live. The release workflow calls this
+#  (through Assert-ReleaseAssetSet.ps1) on the body of GET releases/{id} just BEFORE it publishes the
+#  verified draft and again just AFTER: a person or a stray job could add, replace or remove an asset
+#  between the verification and the publish call, and the verification would then say nothing about what
+#  users download. Asset ids are compared (a replaced asset gets a new id), as a set: order is irrelevant.
+#  -ExpectedAssetIds is the verifier's asset_ids output, {"<asset name>": <id>, ...}.
+# ----------------------------------------------------------------------------
+$script:AssetIdPattern = '\A[0-9]+\z'
+$script:AssetSetFixes = @{
+    Restart = 'Delete the draft (gh release delete <tag>, or in the web UI) and start a new release run: the verified assets are no longer what the release holds.'
+    NotLive = 'The release is still a draft, so nothing is live: start a new release run (delete the draft first).'
+    Live    = "The release is already live with assets nobody verified: $script:RollbackAdvice"
+}
+
+function ConvertFrom-ExpectedAssetIds {
+    param([AllowEmptyString()][string]$Text)
+    $fail = {
+        param($Reason)
+        Write-BuildFailure -What "The verified asset ids are unusable: $Reason." `
+            -Why 'They are the verifier''s asset_ids output, the only record of what was verified; without them the release cannot be compared with it. Running it again will not help.' `
+            -Fix 'Check that the verification step wrote asset_ids to its step output, then start a new release run.'
+    }
+    if ([string]::IsNullOrWhiteSpace($Text)) { & $fail 'the value is empty' }
+    try { $json = $Text | ConvertFrom-Json } catch { & $fail 'it is not valid JSON' }
+    $expected = New-OrdinalOrderedMap   # id -> asset name
+    foreach ($property in @(Get-PropertyNames $json)) {
+        $id = [string](Get-JsonProperty $json $property)
+        if ($id -cnotmatch $script:AssetIdPattern) { & $fail "'$property' has the id '$id', which is not a number" }
+        $expected[$id] = $property
+    }
+    if ($expected.Count -eq 0) { & $fail 'it lists no asset' }
+    return $expected
+}
+
+function Assert-ReleaseAssetSet {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$ReleaseJson,
+        [AllowEmptyString()][string]$ExpectedAssetIds,
+        [AllowEmptyString()][string]$ReleaseId,
+        [ValidateSet('BeforePublish', 'AfterPublish')][string]$Stage
+    )
+    $after = ($Stage -ceq 'AfterPublish')
+    $when = if ($after) { 'after the publish call' } else { 'before publishing' }
+    $expected = ConvertFrom-ExpectedAssetIds $ExpectedAssetIds
+
+    $release = $null
+    if (-not [string]::IsNullOrWhiteSpace($ReleaseJson)) { try { $release = $ReleaseJson | ConvertFrom-Json } catch { $release = $null } }
+    if ($null -eq $release -or $null -eq $release.PSObject.Properties['assets']) {   # an empty list is still a list
+        Write-BuildFailure -What "The release response $when is not a release (empty, not JSON, or without an asset list)." `
+            -Why 'The asset set cannot be compared without it. Running it again may help if the API call failed transiently.' `
+            -Fix $(if ($after) { $script:AssetSetFixes.Live } else { $script:AssetSetFixes.Restart })
+    }
+
+    $problems = @()
+    $actualId = [string](Get-JsonProperty $release 'id')
+    if ($actualId -cne $ReleaseId) { $problems += "the API answered with release $actualId, not release $ReleaseId" }
+    $draft = Get-JsonProperty $release 'draft'
+    $isLive = $false
+    if ($draft -isnot [bool]) {
+        $problems += 'the response has no draft flag'
+    } else {
+        $isLive = (-not $draft)
+        if (-not $after -and -not $draft) { $problems += 'the release is not a draft any more' }
+        if ($after -and $draft) { $problems += 'the release is still a draft' }
+    }
+
+    $actual = New-OrdinalOrderedMap   # id -> asset name
+    foreach ($asset in @(Get-JsonProperty $release 'assets')) {
+        if ($null -eq $asset) { continue }
+        $actual[[string](Get-JsonProperty $asset 'id')] = [string](Get-JsonProperty $asset 'name')
+    }
+    foreach ($id in $expected.Keys) { if (-not $actual.Contains($id)) { $problems += "$($expected[$id]) (id $id) is missing" } }
+    foreach ($id in $actual.Keys) { if (-not $expected.Contains($id)) { $problems += "$($actual[$id]) (id $id) was not verified" } }
+
+    if ($problems.Count -eq 0) {
+        Write-Host "Release $ReleaseId holds exactly the $($expected.Count) verified assets ($(if ($isLive) { 'published' } else { 'draft' }))."
+        return
+    }
+    $fix = if ($isLive) { $script:AssetSetFixes.Live } elseif ($after) { $script:AssetSetFixes.NotLive } else { $script:AssetSetFixes.Restart }
+    $state = if ($isLive) { 'The release is live: it' } else { 'The release' }
+    Write-BuildFailure -What "$state does not match what was verified ($when): $($problems -join '; ')." `
+        -Why 'Publishing, or having published, assets the verification never saw would make its result meaningless. Running it again will not help: the release changed after it was verified.' `
+        -Fix $fix
+}
+
+Export-ModuleMember -Function Get-ReleaseProblems, New-Problem, Get-ReleaseFaultCodes, Format-ReleaseFailure, Assert-ReleaseAssetSet

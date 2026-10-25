@@ -81,13 +81,7 @@ function Get-StagedExePath {
 # ----------------------------------------------------------------------------
 function Get-GitPathList {
     param([string]$RepoRoot, [string[]]$GitArguments, [string]$Pathspec)
-    $git = Get-Command git -ErrorAction SilentlyContinue
-    if ($null -eq $git) {
-        Write-BuildFailure -What 'git was not found on the PATH.' -Why 'The archive stages only files git tracks, so it needs git to list them.' -Fix 'Install Git for Windows and open a new shell.'
-    }
-    $result = Invoke-ChildProcess -FilePath $git.Source -TimeoutSeconds $script:GitTimeoutSeconds `
-        -ArgumentList (@('-c', 'core.quotePath=off', '-C', $RepoRoot) + $GitArguments + @('--', $Pathspec))
-    Assert-ChildOutcome -Result $result -Name "git $($GitArguments -join ' ')" -TimeoutSeconds $script:GitTimeoutSeconds `
+    $result = Invoke-Git -RepoRoot $RepoRoot -Arguments (@($GitArguments) + @('--', $Pathspec)) -TimeoutSeconds $script:GitTimeoutSeconds `
         -Why 'The archive stages only files git tracks; without the list nothing can be staged.' `
         -Fix "Run it by hand in ${RepoRoot}: git $($GitArguments -join ' ') -- $Pathspec (the folder must be inside a git checkout)."
     return @($result.Stdout -split "`0" | Where-Object { $_ })
@@ -101,13 +95,21 @@ function Get-TrackedFileList {
     return [string[]]@($tracked | Where-Object { $_.StartsWith($prefix, [StringComparison]::Ordinal) } | ForEach-Object { $_.Substring($prefix.Length) })
 }
 
+# The agents the archive ships: the *.md files directly below .claude/agents that git tracks (never what
+# merely sits in the working folder).
+function Get-TrackedAgentName {
+    param([string]$RepoRoot)
+    return [string[]]@(Get-TrackedFileList -RepoRoot $RepoRoot -Dir $script:Paths.SourceAgents | Where-Object { $_ -like '*.md' -and $_ -notlike '*/*' } | Sort-Object { $_ })
+}
+
 # Fails when the folder holds a file git does not track or ignores: it would ship unreviewed, or
-# (when only the working tree has it) make the archive differ from the commit.
+# (when only the working tree has it) make the archive differ from the commit. -Only restricts the check
+# to the named files of the folder (the documentation scripts: the rest of scripts/ never ships).
 function Assert-FolderTracked {
-    param([string]$RepoRoot, [string]$Dir)
+    param([string]$RepoRoot, [string]$Dir, [string[]]$Only = $null)
     $untracked = @(Get-GitPathList -RepoRoot $RepoRoot -GitArguments @('ls-files', '-z', '--others', '--exclude-standard') -Pathspec $Dir)
     $ignored = @(Get-GitPathList -RepoRoot $RepoRoot -GitArguments @('ls-files', '-z', '--others', '--ignored', '--exclude-standard') -Pathspec $Dir)
-    $stray = @($untracked + $ignored)
+    $stray = @(@($untracked) + @($ignored) | Where-Object { $null -eq $Only -or $Only -ccontains $_.Substring($Dir.TrimEnd('/').Length + 1) })
     if ($stray.Count -eq 0) { return }
     Write-BuildFailure -What "$Dir holds $($stray.Count) file(s) git does not track: $(($stray | Select-Object -First 5) -join ', ')" `
         -Why 'The archive is built from the commit; a file that exists only in this working folder (untracked or ignored) would ship unreviewed and could not be rebuilt by the release workflow.' `
@@ -156,8 +158,7 @@ function Get-StagingTable {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)]$Layout, [Parameter(Mandatory)][string]$PublishDir)
     $p = $script:Paths
-    $agentDir = Join-Path $RepoRoot $p.SourceAgents
-    $sourceAgents = [string[]]@(Get-ChildItem -LiteralPath $agentDir -File -Filter '*.md' | ForEach-Object { $_.Name } | Sort-Object { $_ })
+    $sourceAgents = Get-TrackedAgentName -RepoRoot $RepoRoot
     return @(
         (New-StagingEntry -Path $p.Root -Source $p.PluginDir -Copy $script:CopyAll -TrackedOnly -ExactTopLevel -Required @($p.McpJson, $p.SkillMd) `
             -Why 'The archive layout requires it (spec AC-4), and nothing else may sit at the archive root; without the required files Claude Code cannot load the plugin or start its server.' `
@@ -181,10 +182,10 @@ function Get-StagingTable {
         (New-StagingEntry -Path $p.BinClaudeMd -Kind File -Generated 'ClaudeMd' `
             -Why 'The direct installation route reads its rules from bin/CLAUDE.md: the user rules of the skill and nothing else (spec AC-4).' `
             -Fix 'Never edit bin/CLAUDE.md; New-ClaudeMdText in build\PluginStaging.psm1 generates it from plugin/skills and the import order of CLAUDE.md.'),
-        (New-StagingEntry -Path $p.BinScripts -Source $p.DocScripts -Copy $script:CopyListed -Exact $script:DocScriptFiles `
+        (New-StagingEntry -Path $p.BinScripts -Source $p.DocScripts -Copy $script:CopyListed -TrackedOnly -Exact $script:DocScriptFiles `
             -Why 'The archive ships only the documentation and presentation generators and their template. A maintainer script would run from a user''s installation and expose paths nobody should depend on.' `
             -Fix 'Remove the unexpected file from the staged tree, or add a generator deliberately to $script:DocScriptFiles in build\PluginStaging.psm1.'),
-        (New-StagingEntry -Path $p.BinAgents -Source $p.SourceAgents -Copy $script:CopyAll -SameContentAs -Required @('link-agents.bat') -Exact (Get-RelativeFileList $agentDir) `
+        (New-StagingEntry -Path $p.BinAgents -Source $p.SourceAgents -Copy $script:CopyAll -TrackedOnly -SameContentAs -Required @('link-agents.bat') -Exact (Get-TrackedFileList -RepoRoot $RepoRoot -Dir $p.SourceAgents) `
             -Why 'The direct installation route (link-agents.bat) needs the source agents unchanged next to the exe (spec AC-5).' `
             -Fix 'Restore the folder .claude/agents (git checkout -- .claude/agents) and package again; bin/.claude/agents is a plain copy of it.')
     )
@@ -292,17 +293,17 @@ function Assert-VersionTxt {
 # ----------------------------------------------------------------------------
 function Write-PluginAgents {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$SourceDir, [Parameter(Mandatory)][string]$TargetDir, [Parameter(Mandatory)]$Identity)
+    param([Parameter(Mandatory)][string]$SourceDir, [Parameter(Mandatory)][string[]]$Names, [Parameter(Mandatory)][string]$TargetDir, [Parameter(Mandatory)]$Identity)
     [void](New-Item -ItemType Directory -Path $TargetDir -Force)
-    foreach ($agent in (Get-ChildItem -LiteralPath $SourceDir -File -Filter '*.md' | Sort-Object Name)) {
+    foreach ($name in $Names) {
         try {
-            $text = ConvertTo-PluginAgent -Path $agent.FullName -Identity $Identity
+            $text = ConvertTo-PluginAgent -Path (Join-Path $SourceDir $name) -Identity $Identity
         } catch {
-            Write-BuildFailure -What "The agent $($agent.Name) cannot be converted to the plugin flavour: $($_.Exception.Message)" `
+            Write-BuildFailure -What "The agent $name cannot be converted to the plugin flavour: $($_.Exception.Message)" `
                 -Why 'The plugin ships the converted agents; one that does not convert would ship tool names a plugin install does not have.' `
-                -Fix "Fix .claude/agents/$($agent.Name) (the mapping rules are in build\PluginIdentity.psm1), then package again."
+                -Fix "Fix .claude/agents/$name (the mapping rules are in build\PluginIdentity.psm1), then package again."
         }
-        [IO.File]::WriteAllText((Join-Path $TargetDir $agent.Name), $text, (Get-Utf8NoBomEncoding))
+        [IO.File]::WriteAllText((Join-Path $TargetDir $name), $text, (Get-Utf8NoBomEncoding))
     }
 }
 
@@ -378,7 +379,7 @@ $script:Generators = @{
         Assert = { param($Entry, $Context) Assert-VersionTxt -Path (Join-Path $Context.StageDir $Entry.Path) -Expected $Context.Release }
     }
     Agents = @{
-        Write  = { param($Entry, $Context) Write-PluginAgents -SourceDir (Join-Path $Context.RepoRoot $script:Paths.SourceAgents) -TargetDir (Join-Path $Context.StageDir $Entry.Path) -Identity $Context.Identity }
+        Write  = { param($Entry, $Context) Write-PluginAgents -SourceDir (Join-Path $Context.RepoRoot $script:Paths.SourceAgents) -Names (Get-TrackedAgentName -RepoRoot $Context.RepoRoot) -TargetDir (Join-Path $Context.StageDir $Entry.Path) -Identity $Context.Identity }
         Assert = { param($Entry, $Context) Assert-PluginAgents -TargetDir (Join-Path $Context.StageDir $Entry.Path) -Identity $Context.Identity }
     }
     ClaudeMd = @{
@@ -410,6 +411,8 @@ function New-StagedPlugin {
     )
     $context = New-StagingContext $RepoRoot $PublishDir $StageDir $Layout $Release
     Assert-FolderTracked -RepoRoot $RepoRoot -Dir $script:Paths.PluginDir
+    Assert-FolderTracked -RepoRoot $RepoRoot -Dir $script:Paths.SourceAgents
+    Assert-FolderTracked -RepoRoot $RepoRoot -Dir $script:Paths.DocScripts -Only $script:DocScriptFiles
     Remove-BuildTempTree -Path $StageDir
     [void](New-Item -ItemType Directory -Path $StageDir -Force)
     foreach ($entry in (Get-StagingTable -RepoRoot $RepoRoot -Layout $Layout -PublishDir $PublishDir)) {
@@ -527,7 +530,8 @@ function Assert-StageUnchanged {
     if ([string]::Equals($now, $Snapshot, [StringComparison]::Ordinal)) { return }
     $before = @($Snapshot -split "`n" | Where-Object { $_ })
     $after = @($now -split "`n" | Where-Object { $_ })
-    $changed = @(($before | Where-Object { $after -cnotcontains $_ }) + ($after | Where-Object { $before -cnotcontains $_ }) | ForEach-Object { ($_ -split '  ', 2)[1] } | Sort-Object -Unique | Select-Object -First 5)
+    # Each side is wrapped before the '+': one changed file is ONE old line and ONE new line, and two bare strings would be glued together.
+    $changed = @((@($before | Where-Object { $after -cnotcontains $_ }) + @($after | Where-Object { $before -cnotcontains $_ })) | ForEach-Object { ($_ -split '  ', 2)[1] } | Sort-Object -Unique | Select-Object -First 5)
     Write-BuildFailure -What "The staged tree changed after it was asserted: $($changed -join ', ')" `
         -Why 'Only the asserted tree may be zipped; a file added or changed since (by the smoke run, or anything else writing into the stage folder) was never checked.' `
         -Fix 'Find what writes into the stage folder (the staged exe run by PluginSmoke.psm1 writes nothing next to itself by design), then package again.'

@@ -1,11 +1,13 @@
 # ============================================================================
-#  WorkflowMutations.Tests.ps1 - proves that the workflow contract tests (Workflows.Tests.ps1) can FAIL.
+#  WorkflowMutations.Tests.ps1 - proves that the workflow contract (WorkflowContract.ps1) can FAIL.
 #  A passing test that cannot fail protects nothing, and no actionlint or runner is at hand, so every rule
-#  of that file gets a mutation here: a copy of the workflows in a temp folder with ONE deliberate defect
-#  (an unpinned action, a write token on the build job, publishing by tag name, a cleanup that ends on a
-#  failed probe, ...). Workflows.Tests.ps1 runs against the copy through its -WorkflowDirectory seam, in a
-#  child process, and must exit 1 with a FAIL line naming the rule that the defect breaks. The unmutated
-#  copy must pass, so a broken table or a broken copy cannot make every row look "caught".
+#  of the contract gets a mutation here: a copy of the workflows in a temp folder with ONE deliberate defect
+#  (an unpinned action, a write token on the build job, publishing by tag name, a cleanup that is given the
+#  wrong id, ...). The contract runs against the copy IN THIS PROCESS (no child process per mutation) and
+#  must report at least one failed case whose name contains the rule that the defect breaks. The unmutated
+#  copy must pass every case, so a broken table or a broken copy cannot make every row look "caught".
+#  Each mutation is anchored on a stable token (a key, a value, an action pin), never on a run of spaces
+#  or on a trailing comment: a re-flowed comment must not turn the whole table into "does not apply".
 #  Runs under Windows PowerShell 5.1 and PowerShell 7:
 #    powershell.exe -NoProfile -ExecutionPolicy Bypass -File build\tests\WorkflowMutations.Tests.ps1
 #  ASCII only on purpose: 5.1 reads a BOM-less script as ANSI.
@@ -14,19 +16,17 @@ $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $WorkflowDir = Join-Path $RepoRoot '.github\workflows'
-$ContractTests = Join-Path $PSScriptRoot 'Workflows.Tests.ps1'
-$ChildTimeoutSeconds = 120
 $MinimumMutations = 20
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 . (Join-Path $PSScriptRoot 'TestHarness.ps1')
+. (Join-Path $PSScriptRoot 'WorkflowContract.ps1')
 $script:TempDirPrefix = 'WorkflowMutationsTests_'
-Import-Module (Join-Path (Split-Path -Parent $PSScriptRoot) 'BuildCommon.psm1') -Force
 
 $script:Mutations = @()
 
 # One row of the table: Old must occur in the file (the FIRST occurrence is replaced) and New replaces it.
-# Expect is a piece of the name of the Workflows.Tests case that the defect must break.
+# Expect is a piece of the name of the contract case that the defect must break.
 function Add-Mutation {
     param([string]$Name, [string]$File, [string]$Expect, [string]$Old, [string]$New)
     $script:Mutations += [pscustomobject]@{ Name = $Name; File = $File; Expect = $Expect; Old = $Old.Replace("`r`n", "`n"); New = $New.Replace("`r`n", "`n") }
@@ -48,14 +48,19 @@ function New-WorkflowCopy {
     return $dir
 }
 
-# Runs the contract tests against a folder, in a child of the current host.
-function Invoke-ContractTests {
+# Runs the contract against a folder: one { Name; Passed; Message } per case. A contract that cannot even
+# read the workflows (a job it needs is gone) is one failed case named 'the contract could not run'.
+function Invoke-ContractAgainst {
     param([string]$Directory)
-    $hostPath = (Get-Process -Id $PID).Path
-    $result = Invoke-ChildProcess -FilePath $hostPath -TimeoutSeconds $ChildTimeoutSeconds `
-        -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $ContractTests, '-WorkflowDirectory', $Directory)
-    if ($result.TimedOut) { throw "the contract tests did not finish within $ChildTimeoutSeconds s" }
-    return @{ ExitCode = $result.ExitCode; Output = ($result.Stdout + $result.Stderr) }
+    $results = New-Object System.Collections.ArrayList
+    $recorder = {
+        param([string]$Name, [scriptblock]$Body)
+        try { & $Body; [void]$results.Add(@{ Name = $Name; Passed = $true; Message = '' }) }
+        catch { [void]$results.Add(@{ Name = $Name; Passed = $false; Message = $_.Exception.Message }) }
+    }.GetNewClosure()
+    try { Invoke-WorkflowContract -WorkflowDir $Directory -RepoRoot $RepoRoot -Case $recorder }
+    catch { [void]$results.Add(@{ Name = 'the contract could not run'; Passed = $false; Message = $_.Exception.Message }) }
+    return @($results)
 }
 
 $CheckoutPin = 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1'
@@ -66,43 +71,55 @@ $SetupDotnetPin = 'actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68
 Add-Mutation 'an action pinned by a movable tag' 'release.yml' 'every action is pinned' $DownloadPin 'actions/download-artifact@v8'
 Add-Mutation 'a pin without its version comment' 'release.yml' 'every action is pinned' $SetupDotnetPin 'actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68'
 Add-Mutation 'an expression inside a run: block' 'release.yml' 'no run: block contains an expression' "Write-Host '::error::A release is cut by pushing a tag vX.Y.Z." "Write-Host '`${{ github.ref_name }}'; Write-Host '::error::A release is cut by pushing a tag vX.Y.Z."
-Add-Mutation 'the release job loses its write permission' 'release.yml' 'only the release job may write' 'contents: write   # create' 'contents: read   # create'
+Add-Mutation 'the release job loses its write permission' 'release.yml' 'only the release job may write' "      contents: write" "      contents: read"
 Add-Mutation 'the package job gets a write token' 'release.yml' 'only the release job may write' "    permissions:`n      contents: read`n    outputs:" "    permissions:`n      contents: write`n    outputs:"
-Add-Mutation 'an extra permission on the release job' 'release.yml' 'only the release job may write' 'contents: write   # create' "contents: write`n      id-token: write   # create"
+Add-Mutation 'an extra permission on the release job' 'release.yml' 'only the release job may write' "      contents: write" "      contents: write`n      id-token: write"
 Add-Mutation 'the release job no longer needs the package job' 'release.yml' 'the two jobs are split' "    needs: package`n" ''
-Add-Mutation 'a dotnet step in the job that holds the write token' 'release.yml' 'the two jobs are split' "      - name: Download the four assets built by the package job" "      - uses: $SetupDotnetPin`n      - name: Download the four assets built by the package job"
-Add-Mutation 'the tag filter narrowed to v*' 'release.yml' 'a pushed tag of any name starts it' "    tags: ['**']" "    tags: ['v*']"
-Add-Mutation 'tag pushes queue per ref again' 'release.yml' 'ONE queue' "group: release-`${{ github.event_name == 'push' && 'publish' || github.ref }}" 'group: release-${{ github.ref }}'
-Add-Mutation 'a running release may be cancelled' 'release.yml' 'ONE queue' 'cancel-in-progress: false' 'cancel-in-progress: true'
-Add-Mutation 'publishing by tag name' 'release.yml' 'publishing is by the verifier release id' '"repos/$env:REPO/releases/$env:RELEASE_ID" -F draft=false' '"repos/$env:REPO/releases/tags/$env:RELEASE_TAG" -F draft=false'
-Add-Mutation 'draft=false sent as a string' 'release.yml' 'publishing is by the verifier release id' '-F draft=false' '-f draft=false'
+Add-Mutation 'a dotnet step in the job that holds the write token' 'release.yml' 'the two jobs are split' "      - name: Download the release assets built by the package job" "      - uses: $SetupDotnetPin`n      - name: Download the release assets built by the package job"
+Add-Mutation 'a release script in the package job, which has no token' 'release.yml' 'the two jobs are split' "      - name: Install .NET 8" "      - name: Publish early`n        run: |`n          & .\build\Publish-Release.ps1 -Repo `$env:REPO -ReleaseId 1`n      - name: Install .NET 8"
+Add-Mutation 'the tag filter narrowed to v*' 'release.yml' 'a pushed tag of any name starts it' "push:`n    tags: ['**']" "push:`n    tags: ['v*']"
+Add-Mutation 'tag pushes share one queue again' 'release.yml' 'queues per ref' 'group: release-${{ github.ref }}' "group: release-`${{ github.event_name == 'push' && 'publish' || github.ref }}"
+Add-Mutation 'a running release may be cancelled' 'release.yml' 'queues per ref' 'cancel-in-progress: false' 'cancel-in-progress: true'
+Add-Mutation 'publishing by tag name' 'release.yml' 'publishing is by the verifier release id' '& .\build\Publish-Release.ps1 -Repo $env:REPO -ReleaseId $env:RELEASE_ID' '& .\build\Publish-Release.ps1 -Repo $env:REPO -ReleaseId $env:RELEASE_TAG'
+Add-Mutation 'publishing with a make_latest that is fixed in the workflow' 'release.yml' 'publishing is by the verifier release id' '& .\build\Publish-Release.ps1' 'gh api -X PATCH "repos/$env:REPO/releases/$env:RELEASE_ID" -F draft=false -f make_latest=true; & .\build\Publish-Release.ps1'
 Add-Mutation 'publishing without the asset recheck' 'release.yml' 'publishing is by the verifier release id' " && steps.verify.outcome == 'success' && steps.recheck.outcome == 'success'" " && steps.verify.outcome == 'success'"
 Add-Mutation 'publishing in a dry run' 'release.yml' 'publishing is by the verifier release id' "if: env.DRY_RUN != 'true' && steps.verify.outcome == 'success' && steps.recheck.outcome == 'success'" "if: steps.verify.outcome == 'success' && steps.recheck.outcome == 'success'"
 Add-Mutation 'the first asset check asks for the wrong stage' 'release.yml' 'checked again just before and just after' '-Stage BeforePublish' '-Stage AfterPublish'
 Add-Mutation 'the second asset check forgets the verified ids' 'release.yml' 'checked again just before and just after' '-ExpectedAssetIds $env:ASSET_IDS -ReleaseId $env:RELEASE_ID -Stage AfterPublish' '-ReleaseId $env:RELEASE_ID -Stage AfterPublish'
+Add-Mutation 'an asset check that reads the release list instead of the id' 'release.yml' 'checked again just before and just after' '& .\build\Assert-ReleaseAssetSet.ps1 -Repo $env:REPO -ExpectedAssetIds $env:ASSET_IDS -ReleaseId $env:RELEASE_ID -Stage BeforePublish' '& .\build\Assert-ReleaseAssetSet.ps1 -ReleaseJson (gh api "repos/$env:REPO/releases") -ExpectedAssetIds $env:ASSET_IDS -ReleaseId $env:RELEASE_ID -Stage BeforePublish'
 Add-Mutation 'the final fetch without the verified digest' 'release.yml' 'after publishing, releases/latest is fetched' ' -ExpectedArchiveSha256 $env:ARCHIVE_SHA256' ''
+Add-Mutation 'the final fetch also runs for a release that was not made the latest one' 'release.yml' 'after publishing, releases/latest is fetched' " && steps.recheck_after.outcome == 'success' && steps.publish.outputs.make_latest == 'true'" " && steps.recheck_after.outcome == 'success'"
+Add-Mutation 'the final fetch without the digest guard' 'release.yml' 'after publishing, releases/latest is fetched' "if (`$env:ARCHIVE_SHA256 -cnotmatch '^[0-9a-f]{64}`$') {" 'if ($false) {'
+Add-Mutation 'the draft creation inlined again' 'release.yml' 'the draft is created by the script' '& .\build\New-ReleaseDraft.ps1' 'gh release create $env:RELEASE_TAG --repo $env:REPO --draft; & .\build\New-ReleaseDraft.ps1'
+Add-Mutation 'a dry run decided by the shape of the tag when the draft is created' 'release.yml' 'the draft is created by the script' "`$dryRun = (`$env:DRY_RUN -eq 'true')" "`$dryRun = (`$env:RELEASE_TAG -like '*-rehearsal')"
 Add-Mutation 'the cleanup is not always()' 'release.yml' 'always() step' "if: always() && env.DRY_RUN == 'true' && needs.package.outputs.rehearsal == 'true'" "if: env.DRY_RUN == 'true' && needs.package.outputs.rehearsal == 'true'"
 Add-Mutation 'the cleanup may run for a real release' 'release.yml' 'always() step' "if: always() && env.DRY_RUN == 'true' && needs.package.outputs.rehearsal == 'true'" "if: always() && needs.package.outputs.rehearsal == 'true'"
-Add-Mutation 'the cleanup ends on its tolerated probe' 'release.yml' 'ends with an explicit exit' "          if (`$failed) { exit 1 }`n          exit 0`n" "          if (`$failed) { exit 1 }`n"
-Add-Mutation 'the cleanup treats every probe failure as an absent tag' 'release.yml' 'always() step' "elseif (`$probe -match 'HTTP 404')" 'elseif ($true)'
+Add-Mutation 'the cleanup is given another id than the one the create step reported' 'release.yml' 'deletes the draft it created' '-ReleaseId $env:CREATED_RELEASE_ID' '-ReleaseId $env:RELEASE_ID'
+Add-Mutation 'the cleanup id is not the create step output' 'release.yml' 'deletes the draft it created' 'CREATED_RELEASE_ID: ${{ steps.create.outputs.release_id }}' 'CREATED_RELEASE_ID: ${{ steps.verify.outputs.release_id }}'
+Add-Mutation 'the cleanup lists drafts by tag again' 'release.yml' 'deletes the draft it created' '& .\build\Remove-RehearsalRelease.ps1' 'gh api "repos/$env:REPO/releases" --jq ".[] | select(.draft == true)"; & .\build\Remove-RehearsalRelease.ps1'
+Add-Mutation 'the cleanup tolerates failing native commands' 'release.yml' 'tolerates a failing native command' '& .\build\Remove-RehearsalRelease.ps1' "`$ErrorActionPreference = 'Continue'; & .\build\Remove-RehearsalRelease.ps1"
 Add-Mutation 'own-downloads not uploaded after a failure' 'release.yml' 'own-downloads is uploaded' "        if: always()`n        uses: actions/upload-artifact" '        uses: actions/upload-artifact'
-Add-Mutation 'own-downloads uploaded under another name' 'release.yml' 'own-downloads is uploaded' '          name: own-downloads' '          name: downloads'
-Add-Mutation 'the asset artifact kept for 90 days' 'release.yml' 'short-lived artifact' "          retention-days: 1`n" "          retention-days: 90`n"
-Add-Mutation 'the release job checks out something else than the tagged commit' 'release.yml' 'short-lived artifact' "          ref: `${{ github.sha }}`n" ''
+Add-Mutation 'own-downloads uploaded under another name' 'release.yml' 'own-downloads is uploaded' 'name: own-downloads' 'name: downloads'
+Add-Mutation 'the asset artifact kept for 90 days' 'release.yml' 'short-lived artifact' 'retention-days: 1' 'retention-days: 90'
+Add-Mutation 'the release job checks out something else than the tagged commit' 'release.yml' 'short-lived artifact' 'ref: ${{ github.sha }}' 'ref: main'
+Add-Mutation 'the asset upload glob is no longer the contract prefix' 'release.yml' 'short-lived artifact' '/teststand-mcp*' '/release-assets*'
 Add-Mutation 'the fault injection runs outside a dry run' 'release.yml' 'injected fault' "if: env.DRY_RUN == 'true' && env.INJECT_FAULT == 'corrupt-zip'" "if: env.INJECT_FAULT == 'corrupt-zip'"
 Add-Mutation 'the verify step without a timeout' 'release.yml' 'has its own timeout' "        timeout-minutes: 30`n        run: |`n          `$rehearsal = (`$env:DRY_RUN -eq 'true')`n          & .\build\Assert-PublishedRelease.ps1 -Repo" "        run: |`n          `$rehearsal = (`$env:DRY_RUN -eq 'true')`n          & .\build\Assert-PublishedRelease.ps1 -Repo"
-Add-Mutation 'a typo in a run: block' 'release.yml' 'valid PowerShell' "if (`$env:RELEASE_ID -notmatch '^[0-9]+`$') {" "if (`$env:RELEASE_ID -notmatch '^[0-9]+`$' {"
-Add-Mutation 'the workflow bound to one repository' 'release.yml' 'nothing is bound to one repository' 'REPO: ${{ github.repository }}' 'REPO: ThatsTheEnd/teststand-mcp'
-Add-Mutation 'releases created as non-drafts' 'release.yml' 'the draft is created as a draft' 'gh release create $env:RELEASE_TAG @assets --repo $env:REPO --draft --verify-tag' 'gh release create $env:RELEASE_TAG @assets --repo $env:REPO --verify-tag'
+Add-Mutation 'a typo in a run: block' 'release.yml' 'valid PowerShell' "if (`$env:ARCHIVE_SHA256 -cnotmatch '^[0-9a-f]{64}`$') {" "if (`$env:ARCHIVE_SHA256 -cnotmatch '^[0-9a-f]{64}`$' {"
+Add-Mutation 'a build script called with a parameter it does not have' 'release.yml' 'takes every parameter' '-ReleaseId $env:RELEASE_ID' '-ReleaseIdentifier $env:RELEASE_ID'
+Add-Mutation 'a build script that does not exist' 'release.yml' 'takes every parameter' '& .\build\Publish-Release.ps1' '& .\build\Publish-Everything.ps1'
+Add-Mutation 'the workflow bound to one repository' 'release.yml' 'nothing is bound to one repository' 'REPO: ${{ github.repository }}' 'REPO: Zuehlke/teststand-mcp'
 Add-Mutation 'a rehearsal decided by the shape of the tag' 'release.yml' 'the tag is user input' "`$rehearsal = (`$env:DRY_RUN -eq 'true')`n          & .\build\Assert-ReleaseTag.ps1" "`$rehearsal = (`$env:TAG -like '*-rehearsal')`n          & .\build\Assert-ReleaseTag.ps1"
-Add-Mutation 'the token in workflow-level env' 'release.yml' 'verified with the token' "  DOTNET_NOLOGO: 'true'`n  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'`n  OUT_DIR" "  DOTNET_NOLOGO: 'true'`n  GH_TOKEN: `${{ github.token }}`n  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'`n  OUT_DIR"
-Add-Mutation 'the provenance limit no longer stated' 'release.yml' 'header says what the verification does not prove' 'What the verification does NOT prove' 'What the verification proves'
+Add-Mutation 'the token in workflow-level env' 'release.yml' 'verified with the token' "  DOTNET_NOLOGO: 'true'`n" "  DOTNET_NOLOGO: 'true'`n  GH_TOKEN: `${{ github.token }}`n"
 
 # --- ci.yml --------------------------------------------------------------------------------------------
 Add-Mutation 'ci: an action pinned by a movable tag' 'ci.yml' 'ci.yml : every action is pinned' $CheckoutPin 'actions/checkout@v7'
 Add-Mutation 'ci: a write token' 'ci.yml' 'ci.yml: read-only token' "    permissions:`n      contents: read`n    steps:" "    permissions:`n      contents: write`n    steps:"
-Add-Mutation 'ci: a job timeout too short for two hangs' 'ci.yml' 'a hanging script is stopped' 'timeout-minutes: 60' 'timeout-minutes: 30'
+Add-Mutation 'ci: a job timeout shorter than the sum of its capped steps' 'ci.yml' 'job outlives the SUM' 'timeout-minutes: 90' 'timeout-minutes: 40'
 Add-Mutation 'ci: no per-script timeout' 'ci.yml' 'a hanging script is stopped' ' -TimeoutSeconds 600' ''
+Add-Mutation 'ci: no total budget for the script tests' 'ci.yml' 'a hanging script is stopped' ' -TotalSeconds 1500' ''
+Add-Mutation 'ci: a script test step cap shorter than its own budget' 'ci.yml' 'a hanging script is stopped' "        timeout-minutes: 30`n        run: |`n          & .\build\Invoke-ScriptTests.ps1" "        timeout-minutes: 20`n        run: |`n          & .\build\Invoke-ScriptTests.ps1"
+Add-Mutation 'ci: the unit tests without a timeout' 'ci.yml' 'every step that can hang has its own timeout' "        timeout-minutes: 15`n        run: dotnet test" '        run: dotnet test'
 Add-Mutation 'ci: a missing pwsh no longer fails the run' 'ci.yml' 'the script tests run under both hosts' "TESTSTAND_MCP_REQUIRE_PWSH: '1'" "TESTSTAND_MCP_REQUIRE_PWSH: '0'"
 Add-Mutation 'ci: triggered by pull_request_target' 'ci.yml' 'pull_request_target' "  pull_request:`n    branches: [main]" "  pull_request_target:`n    branches: [main]"
 Add-Mutation 'ci: the wrong test category' 'ci.yml' 'the unit tests run only' 'Category=EngineFree' 'Category=Integration'
@@ -118,19 +135,27 @@ try {
         Assert-Equal $script:Mutations.Count @($script:Mutations | ForEach-Object { $_.Name } | Select-Object -Unique).Count 'mutation names are unique'
     }
 
-    Invoke-Case 'control: an unmutated copy of the workflows passes the contract tests (a broken copy cannot make every row look caught)' {
-        $run = Invoke-ContractTests (New-WorkflowCopy $null)
-        Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
-        Assert-Contains $run.Output 'All cases passed' 'the verdict'
+    Invoke-Case 'mutations: no anchor contains a run of spaces inside a line (alignment padding before a comment must not break the table)' {
+        foreach ($mutation in $script:Mutations) {
+            Assert-True ($mutation.Old -cnotmatch '\S {2,}\S') "the anchor of '$($mutation.Name)' contains a run of spaces inside a line"
+        }
+    }
+
+    Invoke-Case 'control: an unmutated copy of the workflows passes every case of the contract (a broken copy cannot make every row look caught)' {
+        $results = @(Invoke-ContractAgainst (New-WorkflowCopy $null))
+        $failed = @($results | Where-Object { -not $_.Passed })
+        Assert-True ($results.Count -gt 0) "the contract ran no case at all"
+        Assert-Equal 0 $failed.Count "failed cases:`n$(@($failed | ForEach-Object { "$($_.Name): $($_.Message)" }) -join "`n")"
     }
 
     foreach ($mutation in $script:Mutations) {
         $current = $mutation
         Invoke-Case "mutation: $($current.Name) -> fails '$($current.Expect)'" {
-            $run = Invoke-ContractTests (New-WorkflowCopy $current)
-            Assert-Equal 1 $run.ExitCode "exit code (the defect was not caught). Output was:`n$($run.Output)"
-            $caught = [regex]::IsMatch($run.Output, '(?m)^FAIL  [^\r\n]*' + [regex]::Escape($current.Expect))
-            Assert-True $caught "the contract tests failed, but no FAIL line names '$($current.Expect)'. Failing lines:`n$(@($run.Output -split '\r?\n' | Where-Object { $_ -cmatch '^FAIL' }) -join "`n")"
+            $results = @(Invoke-ContractAgainst (New-WorkflowCopy $current))
+            $failed = @($results | Where-Object { -not $_.Passed })
+            Assert-True ($failed.Count -gt 0) 'the defect was not caught: every case of the contract passed'
+            $named = @($failed | Where-Object { $_.Name.Contains($current.Expect) })
+            Assert-True ($named.Count -gt 0) "the contract failed, but no failed case names '$($current.Expect)'. Failed cases:`n$(@($failed | ForEach-Object { $_.Name }) -join "`n")"
         }
     }
 }

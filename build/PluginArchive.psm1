@@ -80,8 +80,6 @@ function Get-ArchiveLayout {
 #  Inputs
 # ----------------------------------------------------------------------------
 $script:VersionPattern = '\A(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]*)?\z'
-$script:CommitPattern = '\A[0-9a-f]{40}\z'
-$script:RehearsalSuffix = '-rehearsal'
 
 # X.Y.Z with an optional pre-release suffix (0.0.0-ci for a local or pull-request build).
 function Assert-BuildVersion {
@@ -106,7 +104,7 @@ function Get-VersionCore {
 function Assert-BuildCommit {
     [CmdletBinding()]
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Commit)
-    if ($Commit -cnotmatch $script:CommitPattern) {
+    if ($Commit -cnotmatch $ReleaseCommitPattern) {
         Write-BuildFailure -What "The commit '$Commit' is not a full 40-character SHA." `
             -Why 'The commit is stamped into the exe (SourceRevisionId) and into VERSION.txt, and --version prints it, so an abbreviation could not be told apart later.' `
             -Fix 'Pass -Commit with the output of: git rev-parse HEAD'
@@ -117,7 +115,7 @@ function Assert-BuildCommit {
 function Assert-BuildTag {
     [CmdletBinding()]
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Tag, [Parameter(Mandatory)][string]$Version)
-    $accepted = @("v$Version", "v$Version$script:RehearsalSuffix")
+    $accepted = @("v$Version", "v$Version$ReleaseRehearsalSuffix")
     if ($accepted -cnotcontains $Tag) {
         Write-BuildFailure -What "The tag '$Tag' does not belong to version $Version (expected $($accepted -join ' or '))." `
             -Why 'VERSION.txt and --version print the tag next to the version; a tag that disagrees with it would mislabel the release.' `
@@ -251,13 +249,7 @@ function New-ReleaseRecord {
 function Get-CommitTimestamp {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][string]$Commit)
-    $git = Get-Command git -ErrorAction SilentlyContinue
-    if ($null -eq $git) {
-        Write-BuildFailure -What 'git was not found on the PATH.' -Why 'The commit time is the timestamp of every zip entry.' -Fix 'Install Git for Windows and open a new shell.'
-    }
-    $result = Invoke-ChildProcess -FilePath $git.Source -TimeoutSeconds $script:GitTimeoutSeconds `
-        -ArgumentList @('-C', $RepoRoot, 'show', '-s', '--format=%cI', "$Commit^{commit}")
-    Assert-ChildOutcome -Result $result -Name "git show $Commit" -TimeoutSeconds $script:GitTimeoutSeconds `
+    $result = Invoke-Git -RepoRoot $RepoRoot -Arguments @('show', '-s', '--format=%cI', "$Commit^{commit}") -TimeoutSeconds $script:GitTimeoutSeconds `
         -Why 'Every entry of the zip is stamped with the commit time, so the archive of one commit has one set of bytes; the commit must exist in this checkout.' `
         -Fix 'Pass -Commit with a commit of this checkout (git rev-parse HEAD), after fetching it if needed.'
     return [DateTimeOffset]::Parse($result.Stdout.Trim(), [Globalization.CultureInfo]::InvariantCulture)

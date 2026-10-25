@@ -584,7 +584,7 @@ Feature: Plugin hooks help without getting in the way
 #### Step 4.1: Allow hook with a literal classification
 
 **Complexity**: standard
-**IMPLEMENT**: `tool-classes.json` holds `allow` and `prompt` arrays of literal names. `allow-readonly.ps1` targets Windows PowerShell 5.1 and returns `allow` + `permissionDecisionReason` ("no TestStand file is modified") for allow-listed names only. It derives the short name as the text after the last `__`, and requires an `mcp__plugin_` start, so it carries no literal prefix. Before the list is committed, each handler is audited for engine-side mutation (`get_step_unique_id`) and for arbitrary file reads (`read_csv_lines`, `find_in_file`, `get_report_text`). Each one is kept or moved to `prompt`, with the reason recorded in `tool-classes.json`. The proposed allow-list (76 tools; the classification test owns the count from here on) is:
+**IMPLEMENT**: `tool-classes.json` holds `allow` and `prompt` arrays of literal names. `allow-readonly.ps1` targets Windows PowerShell 5.1 and returns `allow` + `permissionDecisionReason` ("no TestStand file is modified") for allow-listed names only. It derives the short name as the text after the last `__`, and requires an `mcp__plugin_` start, so it carries no literal prefix. Before the list is committed, each handler is audited for engine-side mutation (`get_step_unique_id`) and for arbitrary file reads (`read_csv_lines`, `find_in_file`, `get_report_text`). Each one is kept or moved to `prompt`, with the reason recorded in `tool-classes.json`. The proposed allow-list (76 tools; this is the PROPOSAL, 75 were committed because the audit moved `read_csv_lines` to `prompt`; the classification test owns the count from here on) is:
 
 ```
 audit_sequence_references audit_type_consistency check_expression check_user_privilege
@@ -1304,8 +1304,8 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
   - [x] Step 7.2: release.yml
 
 #### Wave 5
-- [ ] Slice 10: CONTRIBUTING (PR A)
-  - [ ] Step 10.1: CONTRIBUTING.md
+- [x] Slice 10: CONTRIBUTING (PR A)
+  - [x] Step 10.1: CONTRIBUTING.md
 
 #### Wave 6
 - [ ] Slice 11: README Quickstart (PR B, after the first release)
@@ -1317,10 +1317,20 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
 - Slice 7: a rehearsal tag (`v<X.Y.Z>-rehearsal`) gives the gate's plain `version` output, so its versioned archive is named `teststand-mcp-vX.Y.Z.zip`. (Done in slice 7: `release.yml` passes the gate's `version` and `tag` outputs to the packaging step.)
 - Verifier wording: the Fix line says "delete the draft first" even when the release is already published (seen on the live `v1.8.6` check). Word it by `release.draft` when slice 7 touches the verifier. (Done in slice 7: `Format-ReleaseFailure -Mode ApiPublished`, with tests.)
 - Slice 11 README: auto-allowed reads of a .seq inside the project still run its SequenceFileLoad callback; open only files you trust
+- Slice 11 README troubleshooting: `claude plugin marketplace add` fails with `fatal: '$GIT_DIR' too big` from a very long `CLAUDE_CONFIG_DIR`/home path; a shorter path fixes it (seen in the fork rehearsal).
 - Slice 7: `release.yml` uploads an artifact named exactly `own-downloads` holding `own-downloads.json` (AC-18 schema, at most 1 MiB) with `if: always()`; its `run_id` is `"${{ github.run_id }}"` as a string. Only runs of `.github/workflows/release.yml` in this repository, started by `push` or `workflow_dispatch`, are accepted by the collector. (Done in slice 7: the record is written by the verifier from `GITHUB_RUN_ID` as a JSON string, a test pins it, and `Workflows.Tests.ps1` pins the artifact name, file name and `always()` against the collector's constants.)
 - Slice 7: `ci.yml` runs `python -m unittest discover -s .github/stats` from the repository root, and `actionlint` covers `pages.yml` too. (Done in slice 7, step 7.1: `actionlint` is not installed and is not downloaded, so `Workflows.Tests.ps1` pins the shared rules for all three workflows, `pages.yml` included.)
 - Slice 7: a pre-release build (`-Version 0.0.0-ci`) names its versioned copy after the numeric core: `teststand-mcp-v0.0.0.zip` (the verifier and the tag format know only `X.Y.Z`). The PR check must verify with that name; use a clean `-OutDir`, because assets of another version are not removed. (Done in slice 7, step 7.1: `ci.yml` packages into `artifacts/ci` of a fresh checkout.)
+- Follow-up (/code-review fix round, not done): adopt `actionlint` in CI as one binary, pinned by its sha256. `ci.yml` and the workflow contract tests pin the shared rules as text only, and nothing checks that GitHub accepts the files until a run.
+- Follow-up (not done): record the second cold start of the exe (AC-2, the Defender-scanned start after the first) when AC-10 is checked on the real repository.
+- Follow-up (not done): re-run the AC-10 install check against `Zuehlke/teststand-mcp` after the real `v1.9.0` (the fork rehearsal covered the fork only).
+- Follow-up (not done): the AC-18 draft-count measurement. Right after the fork rehearsal every asset reported `download_count` 0, so GitHub's counter lags; re-read the counts later, then decide `SUBTRACT_DRAFT_DOWNLOADS`.
+- Follow-up (not done): the pre-existing anonymization names in `CLAUDE.md`. That is a user decision and predates this branch, so this branch leaves them alone.
 - Follow-up (slice 7 security review, not done): harden the NuGet restore with lock files (`RestorePackagesWithLockFile` in the csproj files, committed `packages.lock.json`, and `dotnet restore --locked-mode` in `ci.yml` and the `package` job). It needs a csproj change and a first lock file, so it is outside slice 7. Likewise build provenance attestation (see AC-8's note in the spec).
+
+### Backstop /code-review fix round (2026-10-25)
+
+Six areas on this branch, one commit each. A: the release workflow is safe to re-run and to overlap (one concurrency group per ref; `build/Publish-Release.ps1` decides `make_latest`, so latest never moves backwards; `build/New-ReleaseDraft.ps1` deletes a leftover draft of the tag and refuses a published one; `build/Remove-RehearsalRelease.ps1` deletes only the draft its own run created; an empty `-ExpectedArchiveSha256` is refused; the script-test runner has a total budget and fails a script that printed no PASS line). B: one-item lists stay lists. C: the update hook judges the parsed URL, and the staged agents come from tracked files. D: one source per rule across the build modules and the test files. E: fragile and sleepy tests removed. F: this documentation.
 
 ### Fork rehearsal before PR A (added 2026-10-24 at the user's request)
 
@@ -1333,3 +1343,5 @@ The user does not want the real repository to carry an unusable release, so the 
 5. Publish `v1.9.1` in the fork: the update notice, then the auto-update (AC-12, AC-13).
 6. Run `pages.yml` by hand in the fork (Pages optional).
 7. Every failure is fixed on this branch and the fork rerun until all of it passes. Only then is PR A opened against the real repository.
+
+Result (2026-10-25): steps 1 to 6 ran; one bug found and fixed (single-release listing). Marketplace auto-update and the AC-18 draft-count measurement remain open. Record: `docs/validation/fork-rehearsal.md`.
