@@ -12,9 +12,10 @@
 #
 #  The plugin name and the repository come from the installed plugin.json. Injectable through
 #  environment variables, so the tests never touch the network or the real profile:
-#  TESTSTAND_MCP_RELEASES_BASE_URL (honoured only for https://github.com/ and a loopback
-#  http URL), TESTSTAND_MCP_NOW (the clock), TESTSTAND_MCP_STATE_DIR (the cache directory)
-#  and CLAUDE_PLUGIN_ROOT (the plugin root that holds .claude-plugin/plugin.json).
+#  TESTSTAND_MCP_RELEASES_BASE_URL (honoured only for an https URL on github.com and an http URL
+#  on a loopback host, never one with user info), TESTSTAND_MCP_NOW (the clock),
+#  TESTSTAND_MCP_STATE_DIR (the cache directory) and CLAUDE_PLUGIN_ROOT (the plugin root that holds
+#  .claude-plugin/plugin.json).
 # ============================================================================
 Set-StrictMode -Version 2.0
 
@@ -23,7 +24,7 @@ try { . (Join-Path $PSScriptRoot 'hook-common.ps1') } catch { exit 0 }
 $script:OptOutVariable = 'TESTSTAND_MCP_NO_UPDATE_CHECK'
 $script:BaseUrlVariable = 'TESTSTAND_MCP_RELEASES_BASE_URL'
 $script:PluginRootVariable = 'CLAUDE_PLUGIN_ROOT'
-$script:AllowedBaseUrlPrefixes = @('https://github.com/', 'http://127.0.0.1:', 'http://localhost:')
+$script:AllowedHttpsHost = 'github.com'
 $script:LatestReleasePath = '/releases/latest'
 $script:HttpTimeoutMilliseconds = 3000   # the hook timeout is 10 s: shell start plus this stays well inside it
 $script:UserAgent = 'teststand-mcp-update-notify'
@@ -59,12 +60,16 @@ function Get-TagFromLocation {
     return $match.Groups[1].Value
 }
 
+# https on github.com, or http on a loopback host, judged on the PARSED url: a text prefix lets
+# "http://localhost:@example.com/" through, whose host is example.com. A url with user info is refused.
 function Test-AllowedBaseUrl {
     param($Url)
-    if ($Url -isnot [string]) { return $false }
-    foreach ($prefix in $script:AllowedBaseUrlPrefixes) {
-        if ($Url.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $true }
-    }
+    if ($Url -isnot [string] -or $Url.Trim() -cne $Url) { return $false }
+    $parsed = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$parsed)) { return $false }
+    if ($parsed.UserInfo.Length -gt 0) { return $false }
+    if ($parsed.Scheme -ceq 'https') { return ($parsed.Host -ceq $script:AllowedHttpsHost) }
+    if ($parsed.Scheme -ceq 'http') { return $parsed.IsLoopback }
     return $false
 }
 

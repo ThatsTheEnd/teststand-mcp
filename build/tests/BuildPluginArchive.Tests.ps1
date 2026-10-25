@@ -719,6 +719,29 @@ try {
         Assert-FailsWith { New-StageFrom -PublishDir (New-FakePublishDir) -Root $ignored } @('debug.log')
     }
 
+    Invoke-Case 'fault: an untracked or an ignored agent below .claude/agents stops the staging, and is not an agent of the plugin' {
+        $untracked = New-RepoFixture
+        Write-TextFile (Join-Path $untracked '.claude\agents\scratch-agent.md') "---`nname: scratch-agent`ntools: Read`n---`nx`n"
+        Assert-FailsWith { New-StageFrom -PublishDir (New-FakePublishDir) -Root $untracked } @('.claude/agents holds 1 file(s) git does not track', 'scratch-agent.md') -Fix @('git add .claude/agents')
+        $ignored = New-RepoFixture -Mutate { param($r) Write-TextFile (Join-Path $r '.gitignore') "ignored-agent.md`n"; Write-TextFile (Join-Path $r '.claude\agents\ignored-agent.md') "---`nname: ignored-agent`ntools: Read`n---`nx`n" }
+        Assert-FailsWith { New-StageFrom -PublishDir (New-FakePublishDir) -Root $ignored } @('ignored-agent.md')
+        $table = @(Get-StagingTable -RepoRoot $untracked -Layout $FolderLayout -PublishDir (New-FakePublishDir))
+        $agents = @($table | Where-Object { $_.Path -ceq 'agents' })[0]
+        Assert-True (@($agents.Exact) -cnotcontains 'scratch-agent.md') 'the expected plugin agents are derived from the tracked agents, never from the working folder'
+        $copied = @($table | Where-Object { $_.Path -ceq 'bin/.claude/agents' })[0]
+        Assert-True (@($copied.Exact) -cnotcontains 'scratch-agent.md') 'the copied source agents are the tracked ones too'
+        Assert-True ($copied.TrackedOnly -and @($table | Where-Object { $_.Path -ceq 'bin/scripts' })[0].TrackedOnly) 'agents and doc scripts are copied from git, not from the folder'
+    }
+
+    Invoke-Case 'fault: an untracked or an ignored documentation script (one that ships) stops the staging; an unrelated file in scripts/ does not' {
+        $noScript = New-RepoFixture -Mutate { param($r) Write-TextFile (Join-Path $r '.gitignore') "generate_teststand_doc.py`n" }
+        Assert-FailsWith { New-StageFrom -PublishDir (New-FakePublishDir) -Root $noScript } @('scripts holds 1 file(s) git does not track', 'generate_teststand_doc.py') -Fix @('git add scripts')
+        $fresh = New-RepoFixture
+        Write-TextFile (Join-Path $fresh 'scripts\private-notes.py') 'not shipped'
+        $stage = New-StageFrom -PublishDir (New-FakePublishDir) -Root $fresh
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $stage 'bin\scripts\private-notes.py'))) 'an unrelated file in scripts/ is not staged'
+    }
+
     Invoke-Case 'staging: a tracked fixture repository stages cleanly and ignores nothing tracked' {
         $root = New-RepoFixture
         $publish = New-FakePublishDir

@@ -227,7 +227,10 @@ Done once by a repository admin:
    then, and `ci.yml` and `release.yml` are not affected.
 3. **Optional: the `STATS_TRAFFIC_TOKEN` secret** (Settings, Secrets and variables, Actions). The workflow
    token cannot read repository traffic, so the views and clones need a token that can. Without the secret
-   the statistics skip traffic, and the page says so.
+   the statistics skip traffic, and the page says so. Make it a fine-grained personal access token for this
+   ONE repository, with the single repository permission "Administration: Read-only" (that is what the
+   traffic endpoints ask for) and an expiry date; renew it before it expires, or the traffic part stops
+   until you do. A classic `repo` token is not wanted: it can write to every repository you can.
 
 ## Troubleshooting
 
