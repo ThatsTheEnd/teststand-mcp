@@ -384,7 +384,7 @@ try {
     # ======================================================================
     #  Staging: a tiny fake publish output, the real repository sources
     # ======================================================================
-    $Release = @{ tag = "v$SampleVersion"; version = $SampleVersion; commit = $SampleCommit; built = '2026-10-24T12:00:00Z'; run = 'local' }
+    $Release = @{ tag = "v$SampleVersion"; version = $SampleVersion; commit = $SampleCommit; arch = 'x86'; built = '2026-10-24T12:00:00Z'; run = 'local' }
     $FolderLayout = Get-ArchiveLayout 'folder'
 
     # What dotnet publish leaves: the exe and runtime files, plus the files the csproj copies into every
@@ -500,9 +500,9 @@ try {
         Assert-StampedManifest -SourcePath $sourcePath -StagedPath $stagedPath -Version '1.9.0-rc.1'
     }
 
-    Invoke-Case 'staging: VERSION.txt carries tag, version, commit, built and run, one per line, in the format the exe reads' {
+    Invoke-Case 'staging: VERSION.txt carries tag, version, commit, arch, built and run, one per line, in the format the exe reads' {
         $text = [IO.File]::ReadAllText((Join-Path (New-StagedCopy) 'VERSION.txt'))
-        Assert-Equal "tag: v1.9.0`nversion: 1.9.0`ncommit: $SampleCommit`nbuilt: 2026-10-24T12:00:00Z`nrun: local`n" $text 'VERSION.txt'
+        Assert-Equal "tag: v1.9.0`nversion: 1.9.0`ncommit: $SampleCommit`narch: x86`nbuilt: 2026-10-24T12:00:00Z`nrun: local`n" $text 'VERSION.txt'
     }
 
     Invoke-Case 'staging: bin/CLAUDE.md is the user rules only: a header, then the skill files in the import order, no developer section' {
@@ -647,8 +647,8 @@ try {
         Assert-StageFault { param($stage) [IO.File]::WriteAllText((Join-Path $stage 'bin\CLAUDE.md'), "# TestStand MCP rules`n") } @('not what the skill files generate')
     }
 
-    Invoke-Case 'fault: VERSION.txt lacks one of tag, version, commit, built, run' {
-        foreach ($key in @('tag', 'version', 'commit', 'built', 'run')) {
+    Invoke-Case 'fault: VERSION.txt lacks one of tag, version, commit, arch, built, run' {
+        foreach ($key in @('tag', 'version', 'commit', 'arch', 'built', 'run')) {
             Assert-StageFault {
                 param($stage)
                 $path = Join-Path $stage 'VERSION.txt'
@@ -659,7 +659,11 @@ try {
     }
 
     Invoke-Case 'fault: VERSION.txt names another version than the one built' {
-        Assert-StageFault { param($stage) Write-TextFile (Join-Path $stage 'VERSION.txt') "tag: v1.9.0`nversion: 1.8.0`ncommit: $SampleCommit`nbuilt: x`nrun: local`n" } @("version '1.8.0'", "'1.9.0' was requested")
+        Assert-StageFault { param($stage) Write-TextFile (Join-Path $stage 'VERSION.txt') "tag: v1.9.0`nversion: 1.8.0`ncommit: $SampleCommit`narch: x86`nbuilt: x`nrun: local`n" } @("version '1.8.0'", "'1.9.0' was requested")
+    }
+
+    Invoke-Case 'fault: VERSION.txt names another architecture than the one built' {
+        Assert-StageFault { param($stage) Write-TextFile (Join-Path $stage 'VERSION.txt') "tag: v1.9.0`nversion: 1.9.0`ncommit: $SampleCommit`narch: x64`nbuilt: x`nrun: local`n" } @("arch 'x64'", "'x86' was requested")
     }
 
     Invoke-Case 'fault: the staged plugin.json differs from the source in more than the version' {
@@ -771,30 +775,35 @@ try {
     # ======================================================================
     #  Smoke tests of the staged exe (PluginSmoke): fake exes are .cmd files
     # ======================================================================
-    $VersionLines = @('echo TestStand MCP Server 1.9.0', 'echo   tag:     v1.9.0', "echo   commit:  $SampleCommit", 'echo   built:   2026-10-24T12:00:00Z', 'echo   run:     local')
+    $VersionLines = @('echo TestStand MCP Server 1.9.0', 'echo   tag:     v1.9.0', "echo   commit:  $SampleCommit", 'echo   arch:    x86', 'echo   built:   2026-10-24T12:00:00Z', 'echo   run:     local')
 
     Invoke-Case 'smoke --version: the version, the tag and the commit on stdout with exit 0 pass' {
-        Assert-VersionOutput -ExePath (New-FakeExe $VersionLines) -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit
+        Assert-VersionOutput -ExePath (New-FakeExe $VersionLines) -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit -Arch 'x86'
     }
 
     Invoke-Case 'fault: --version names another version' {
-        $exe = New-FakeExe (@('echo TestStand MCP Server 1.8.0') + $VersionLines[1..4])
-        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @("its first line ends with '1.8.0', not '1.9.0'", '--version output is wrong') -Fix @('VERSION.txt')
+        $exe = New-FakeExe (@('echo TestStand MCP Server 1.8.0') + $VersionLines[1..5])
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit -Arch 'x86' } @("its first line ends with '1.8.0', not '1.9.0'", '--version output is wrong') -Fix @('VERSION.txt')
+    }
+
+    Invoke-Case 'fault: --version names another architecture than the archive' {
+        $exe = New-FakeExe $VersionLines
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit -Arch 'x64' } @("reports arch 'x86' but the archive is for 'x64'") -Fix @('-Architecture')
     }
 
     Invoke-Case 'fault: --version lacks the tag (an untagged or unreadable VERSION.txt)' {
         $exe = New-FakeExe @('echo TestStand MCP Server 1.9.0', "echo   commit:  $SampleCommit", 'echo   note:    release metadata incomplete: no tag')
-        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @("does not name 'v1.9.0'", 'release-metadata note')
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit -Arch 'x86' } @("does not name 'v1.9.0'", 'release-metadata note')
     }
 
     Invoke-Case 'fault: --version reports an untagged -dev build' {
         $exe = New-FakeExe @('echo TestStand MCP Server 1.9.0-dev', 'echo   tag:     v1.9.0', "echo   commit:  $SampleCommit")
-        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @("untagged build ('-dev')")
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit -Arch 'x86' } @("untagged build ('-dev')")
     }
 
     Invoke-Case 'fault: --version exits non-zero' {
         $exe = New-FakeExe @('echo broken', 'exit /b 3')
-        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @('failed (exit code 3)', 'broken') -Fix @('Run it by hand')
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit -Arch 'x86' } @('failed (exit code 3)', 'broken') -Fix @('Run it by hand')
     }
 
     # tool list: a classification of get_a, get_b (allow) and set_c (prompt) over a three-tool registry

@@ -240,6 +240,7 @@ function New-ReleaseRecord {
         tag     = $Tag
         version = $Version
         commit  = $Commit
+        arch    = $script:BuildPlatform
         built   = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
         run     = (Get-RunUrl)
     }

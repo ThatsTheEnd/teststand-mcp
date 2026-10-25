@@ -256,7 +256,7 @@ function Assert-StampedManifest {
 # ----------------------------------------------------------------------------
 #  Generator: VERSION.txt (key: value lines, the format src/VersionInfo.cs reads)
 # ----------------------------------------------------------------------------
-$script:VersionTxtKeys = @('tag', 'version', 'commit', 'built', 'run')
+$script:VersionTxtKeys = @('tag', 'version', 'commit', 'arch', 'built', 'run')
 
 function Write-VersionTxt {
     [CmdletBinding()]
@@ -279,11 +279,11 @@ function Assert-VersionTxt {
             -Why '--version prints these lines, and the exe reports "release metadata incomplete" when the tag is missing.' `
             -Fix 'Never edit VERSION.txt; package again with build\Build-PluginArchive.ps1, which writes it with Write-VersionTxt (build\PluginStaging.psm1).'
     }
-    foreach ($key in @('tag', 'version', 'commit')) {
+    foreach ($key in @('tag', 'version', 'commit', 'arch')) {
         if (-not [string]::Equals($values[$key], $Expected[$key], [StringComparison]::Ordinal)) {
             Write-BuildFailure -What "VERSION.txt says $key '$($values[$key])' but '$($Expected[$key])' was requested." `
                 -Why 'The archive would name a different release than the one being built.' `
-                -Fix 'Package again with build\Build-PluginArchive.ps1 and the -Version, -Tag and -Commit you mean.'
+                -Fix 'Package again with build\Build-PluginArchive.ps1 and the -Version, -Tag, -Commit and -Architecture you mean.'
         }
     }
 }

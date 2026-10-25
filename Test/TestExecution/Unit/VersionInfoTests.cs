@@ -316,32 +316,52 @@ public class VersionInfoTests
         var path = WriteVersionTxt(Lines(
             "tag: v1.9.0", "built: 2026-10-24T08:15:00Z", "run: https://github.com/o/r/actions/runs/42"));
 
-        var text = VersionInfo.Resolve(TaggedInformationalVersion, path).FormatForCli();
+        var text = (VersionInfo.Resolve(TaggedInformationalVersion, path) with { Arch = "x64" }).FormatForCli();
 
         Assert.That(text, Is.EqualTo(Lines(
             "TestStand MCP Server 1.9.0",
             "  tag:    v1.9.0",
             "  commit: abc123",
+            "  arch:   x64",
             "  built:  2026-10-24T08:15:00Z",
             "  run:    https://github.com/o/r/actions/runs/42")));
     }
 
     [Test]
-    public void FormatForCli_UntaggedBuildWithoutMetadata_IsOnlyTheHeaderLine()
+    public void FormatForCli_UntaggedBuildWithoutMetadata_IsTheHeaderAndTheArchitecture()
     {
-        var text = VersionInfo.Resolve(informationalVersion: null, versionTxtPath: null).FormatForCli();
+        var text = (VersionInfo.Resolve(informationalVersion: null, versionTxtPath: null) with { Arch = "x86" }).FormatForCli();
 
-        Assert.That(text, Is.EqualTo(Lines("TestStand MCP Server 0.0.0-dev")));
+        Assert.That(text, Is.EqualTo(Lines("TestStand MCP Server 0.0.0-dev", "  arch:   x86")));
+    }
+
+    [Test]
+    public void Arch_IsTheRunningProcessArchitecture()
+    {
+        var info = VersionInfo.Resolve(informationalVersion: null, versionTxtPath: null);
+
+        Assert.That(info.Arch, Is.EqualTo(Environment.Is64BitProcess ? "x64" : "x86"));
+    }
+
+    [Test]
+    public void Arch_InVersionTxt_DoesNotOverrideTheProcess()
+    {
+        var path = WriteVersionTxt(Lines("tag: v1.9.0", "arch: arm64"));
+
+        var info = VersionInfo.Resolve(TaggedInformationalVersion, path);
+
+        Assert.That(info.Arch, Is.EqualTo(Environment.Is64BitProcess ? "x64" : "x86"));
     }
 
     [Test]
     public void FormatForCli_TaggedBuildWithoutVersionTxt_AddsCommitAndTheAbsentNote()
     {
-        var text = VersionInfo.Resolve(TaggedInformationalVersion, VersionTxtPath).FormatForCli();
+        var text = (VersionInfo.Resolve(TaggedInformationalVersion, VersionTxtPath) with { Arch = "x86" }).FormatForCli();
 
         Assert.That(text, Is.EqualTo(Lines(
             "TestStand MCP Server 1.9.0",
             "  commit: abc123",
+            "  arch:   x86",
             $"  note:   release metadata absent ({VersionTxtPath} not found)")));
     }
 }

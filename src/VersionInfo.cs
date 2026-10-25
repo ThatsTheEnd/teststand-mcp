@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using TestStandMCP.Models;
 
@@ -15,7 +16,8 @@ namespace TestStandMCP;
 /// <para><b>Where each field comes from.</b> <see cref="Version"/> and <see cref="Commit"/> are stamped
 /// into the assembly's informational version at build time (<c>X.Y.Z+sha</c>: the SDK appends
 /// <c>SourceRevisionId</c> after a <c>'+'</c>). The release workflow's <c>VERSION.txt</c> only adds what
-/// the assembly cannot know — the tag, the build time and the run URL.</para>
+/// the assembly cannot know — the tag, the build time and the run URL. <see cref="Arch"/> is the running
+/// process's architecture, which decides the TestStand bitness this install can drive.</para>
 ///
 /// <para><b>An untagged build is <c>0.0.0-dev</c></b> (the csproj default), never a made-up number.
 /// A missing, oversized or malformed <c>VERSION.txt</c> degrades to a <see cref="Note"/>; resolving a
@@ -29,6 +31,9 @@ public sealed record VersionInfo(
     string? RunUrl,
     string? Note)
 {
+    /// <summary>The process architecture (<c>x86</c> or <c>x64</c>): the TestStand bitness this exe drives.</summary>
+    public string Arch { get; init; } = RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant();
+
     /// <summary>The product's name — shown by <c>--version</c>, in <c>serverInfo</c> and in the logs.</summary>
     public const string ProductName = "TestStand MCP Server";
 
@@ -43,6 +48,7 @@ public sealed record VersionInfo(
     private const string TagKey     = "tag";
     private const string VersionKey = "version";
     private const string CommitKey  = "commit";
+    private const string ArchKey    = "arch";
     private const string BuiltKey   = "built";
     private const string RunKey     = "run";
     private const string NoteLabel  = "note";
@@ -53,10 +59,10 @@ public sealed record VersionInfo(
 
     private const string IncompleteTagNote = "release metadata incomplete: no tag";
 
-    // version and commit are listed so a VERSION.txt that carries them still counts as readable;
-    // the assembly stays the authority for those two.
+    // version, commit and arch are listed so a VERSION.txt that carries them still counts as readable;
+    // the assembly and the process stay the authority for those three.
     private static readonly HashSet<string> RecognisedKeys =
-        new(StringComparer.OrdinalIgnoreCase) { TagKey, VersionKey, CommitKey, BuiltKey, RunKey };
+        new(StringComparer.OrdinalIgnoreCase) { TagKey, VersionKey, CommitKey, ArchKey, BuiltKey, RunKey };
 
     /// <summary>The version of THIS executable, resolved once. VERSION.txt sits one level above the exe.</summary>
     public static VersionInfo Current { get; } = Resolve(
@@ -88,6 +94,7 @@ public sealed record VersionInfo(
         text.AppendLine($"{ProductName} {Version}");
         AppendField(text, TagKey, Tag);
         AppendField(text, CommitKey, Commit);
+        AppendField(text, ArchKey, Arch);
         AppendField(text, BuiltKey, BuiltAt);
         AppendField(text, RunKey, RunUrl);
         AppendField(text, NoteLabel, Note);

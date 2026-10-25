@@ -1,7 +1,7 @@
 # ============================================================================
 #  PluginSmoke.psm1 - the smoke tests of the STAGED exe (spec AC-3, AC-6), run on a machine with no
 #  TestStand: every check starts the exe from the staged tree and nothing else.
-#    Assert-VersionOutput        --version names the version, the tag and the commit (stdout, exit 0)
+#    Assert-VersionOutput        --version names the version, the tag, the commit and the architecture (stdout, exit 0)
 #    Assert-ToolList             --list-tools --json equals the tools classified in tool-classes.json
 #    Assert-InitializeRoundTrip  a stdio initialize returns serverInfo.version, and the startup log
 #                                names the same version
@@ -60,7 +60,7 @@ function Assert-VersionOutput {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$ExePath, [Parameter(Mandatory)][string]$Version,
-        [Parameter(Mandatory)][string]$Tag, [Parameter(Mandatory)][string]$Commit
+        [Parameter(Mandatory)][string]$Tag, [Parameter(Mandatory)][string]$Commit, [Parameter(Mandatory)][string]$Arch
     )
     $result = Invoke-SmokeCommand $ExePath @('--version')
     $problems = @()
@@ -70,6 +70,9 @@ function Assert-VersionOutput {
     foreach ($expected in @($Tag, $Commit)) {
         if ($result.Stdout.IndexOf($expected, [StringComparison]::Ordinal) -lt 0) { $problems += "it does not name '$expected'" }
     }
+    $archMatch = [regex]::Match($result.Stdout, '(?m)^\s*arch:\s*(\S+)')
+    $reportedArch = if ($archMatch.Success) { $archMatch.Groups[1].Value } else { '(none)' }
+    if (-not [string]::Equals($reportedArch, $Arch, [StringComparison]::Ordinal)) { $problems += "it reports arch '$reportedArch' but the archive is for '$Arch'" }
     if ($Version.IndexOf($script:UntaggedMarker, [StringComparison]::Ordinal) -lt 0 -and $result.Stdout.IndexOf($script:UntaggedMarker, [StringComparison]::Ordinal) -ge 0) {
         $problems += "it reports an untagged build ('$script:UntaggedMarker')"
     }
@@ -78,8 +81,8 @@ function Assert-VersionOutput {
     }
     if ($problems.Count -gt 0) {
         Write-BuildFailure -What "The staged exe's --version output is wrong ($($problems -join '; ')):`n$(Get-OutputExcerpt $result.Stdout)" `
-            -Why 'Users and support read --version to learn which release they run; the release must name its own version, tag and commit.' `
-            -Fix 'Check VERSION.txt in the staged tree and the -Version, -Tag and -Commit passed to Build-PluginArchive.ps1, then package again.'
+            -Why 'Users and support read --version to learn which release they run; the release must name its own version, tag, commit and architecture (an exe of the wrong bitness cannot load its TestStand).' `
+            -Fix 'Check VERSION.txt in the staged tree and the -Version, -Tag, -Commit and -Architecture passed to Build-PluginArchive.ps1, then package again.'
     }
 }
 
@@ -189,7 +192,7 @@ function Invoke-SmokeTests {
     param([Parameter(Mandatory)][string]$StageDir, [Parameter(Mandatory)][hashtable]$Release, [Parameter(Mandatory)][string]$RepoRoot)
     $exe = Get-StagedExePath -StageDir $StageDir
     $tools = Get-ToolSourcePath -RepoRoot $RepoRoot
-    Assert-VersionOutput -ExePath $exe -Version $Release.version -Tag $Release.tag -Commit $Release.commit
+    Assert-VersionOutput -ExePath $exe -Version $Release.version -Tag $Release.tag -Commit $Release.commit -Arch $Release.arch
     Assert-ToolList -ExePath $exe -ClassesPath $tools.Classes -RegistryPath $tools.Registry
     Assert-InitializeRoundTrip -ExePath $exe -Version $Release.version -ProgramSourcePath (Join-Path $RepoRoot $script:ProgramSourceRelative)
 }
