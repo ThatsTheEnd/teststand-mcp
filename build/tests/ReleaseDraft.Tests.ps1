@@ -360,6 +360,21 @@ try {
         Assert-Contains $output 'lower version' 'and why'
     }
 
+    Invoke-Case 'publish: the chosen make_latest is written as a step output, so the final latest check runs only for a release that became the latest one' {
+        $outFile = Join-Path (New-TempDir) 'github_output'
+        $higher = New-FakeGh -Releases @((New-Release 61 'v1.9.1')) -Latest 'v1.9.0'
+        Use-Environment @{ GITHUB_OUTPUT = $outFile } { Publish-ReleaseById -ReleaseId '61' -Repo $Repo -Gh $higher.Gh *> $null }
+        Assert-Equal "make_latest=true`n" ([IO.File]::ReadAllText($outFile)) 'the output of a release that became the latest one'
+        $lower = New-FakeGh -Releases @((New-Release 62 'v1.8.0')) -Latest 'v1.9.0'
+        $lowerOut = Join-Path (New-TempDir) 'github_output'
+        Use-Environment @{ GITHUB_OUTPUT = $lowerOut } { Publish-ReleaseById -ReleaseId '62' -Repo $Repo -Gh $lower.Gh *> $null }
+        Assert-Equal "make_latest=false`n" ([IO.File]::ReadAllText($lowerOut)) 'the output of a lower version'
+        $stuck = New-FakeGh -Releases @((New-Release 63 'v1.9.0')) -PatchedDraft 'true'
+        $failedOut = Join-Path (New-TempDir) 'github_output'
+        Use-Environment @{ GITHUB_OUTPUT = $failedOut } { try { Publish-ReleaseById -ReleaseId '63' -Repo $Repo -Gh $stuck.Gh *> $null } catch { } }
+        Assert-True (-not (Test-Path -LiteralPath $failedOut)) 'a release that did not go live reports no make_latest'
+    }
+
     Invoke-Case 'publish: a repository without a latest release (404) makes the release the latest one' {
         $fake = New-FakeGh -Releases @((New-Release 52 'v1.9.0')) -Latest $null
         Publish-ReleaseById -ReleaseId '52' -Repo $Repo -Gh $fake.Gh *> $null

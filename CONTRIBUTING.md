@@ -49,7 +49,9 @@ What the workflow does, in order:
 5. Publishes by the release id the verifier returned, never by tag name (`build\Publish-Release.ps1`), and marks
    it the latest release unless a higher version already is.
 6. Re-checks the asset ids of the live release, then fetches `releases/latest` like a user and compares it
-   with the verified archive.
+   with the verified archive. That last comparison is skipped for a release that was published with
+   `make_latest=false` (a lower version than the latest release): `releases/latest` rightly serves another
+   release then.
 
 A failed verification leaves a draft. `releases/latest` never moves until the whole check has passed. To run it
 again, use Re-run failed jobs on the run: the leftover draft of the tag is deleted first, so the second run

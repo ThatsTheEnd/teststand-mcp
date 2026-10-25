@@ -6,7 +6,9 @@
 #      must still be a DRAFT of a real vX.Y.Z tag (a rehearsal draft is never published);
 #    - releases/latest is read, and the release is marked the latest one only when its version is not lower
 #      than the current latest release's (a lower version is published with make_latest=false, so two tags
-#      that overlap never move "latest" backwards). The chosen value is printed: make_latest=<true|false>.
+#      that overlap never move "latest" backwards). The chosen value is printed: make_latest=<true|false>,
+#      and written as the step output make_latest: the check that releases/latest serves the new archive
+#      runs only when it is true.
 #    -Repo owner/name   -ReleaseId <the verifier's release_id output>
 #  The release is addressed by its id, never by its tag name.
 #  Test seam: -Gh (a scriptblock, see ReleaseDraft.psm1). The parameters are not Mandatory on purpose.

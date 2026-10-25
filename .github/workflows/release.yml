@@ -32,7 +32,8 @@
 #   * Every run queues per ref (`release-<ref>`) and a running release is never cancelled, so two runs of
 #     one tag never overlap. Different tags may overlap, and the one that finishes last would otherwise
 #     take the label "latest": build\Publish-Release.ps1 therefore compares the version with the current
-#     latest release and publishes a LOWER version with make_latest=false (it prints which it chose).
+#     latest release and publishes a LOWER version with make_latest=false (it prints which it chose, and the
+#     final check of releases/latest is skipped for such a release: latest rightly serves another one).
 #     A shared queue is deliberately not used: GitHub keeps one running and one pending run per queue and
 #     cancels the pending one when a third arrives, so a tag could silently never be published.
 #
@@ -256,7 +257,7 @@ jobs:
 
       - name: Fetch releases/latest as users do and compare it with the verified archive
         id: latest
-        if: env.DRY_RUN != 'true' && steps.publish.outcome == 'success' && steps.recheck_after.outcome == 'success'
+        if: env.DRY_RUN != 'true' && steps.publish.outcome == 'success' && steps.recheck_after.outcome == 'success' && steps.publish.outputs.make_latest == 'true'
         env:
           ARCHIVE_SHA256: ${{ steps.verify.outputs.archive_sha256 }}
         timeout-minutes: 15

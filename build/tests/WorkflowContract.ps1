@@ -544,6 +544,7 @@ $ExpectedWorkflows = @('ci.yml', 'pages.yml', 'release.yml')
         Assert-Contains $condition "steps.publish.outcome == 'success'" 'only after the publish step succeeded'
         Assert-Contains $condition "steps.recheck_after.outcome == 'success'" 'only when the live asset set is the verified one'
         Assert-Contains $condition "env.DRY_RUN != 'true'" 'never in a dry run'
+        Assert-Contains $condition "steps.publish.outputs.make_latest == 'true'" 'only for a release that became the latest one (a lower version is published with make_latest=false and latest rightly serves another release)'
         Assert-True ($latest.Text -cmatch 'ARCHIVE_SHA256:\s*\$\{\{ steps\.verify\.outputs\.archive_sha256 \}\}') 'the expected hash is the verifier output'
         Assert-Contains $latest.Text '-Latest' 'the public latest download'
         Assert-Contains $latest.Text '-ExpectedArchiveSha256 $env:ARCHIVE_SHA256' 'the verified archive digest is passed'

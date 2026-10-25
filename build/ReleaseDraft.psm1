@@ -279,6 +279,7 @@ function Publish-ReleaseById {
     if ($result.Stdout.Trim() -cne 'false') {
         Write-BuildFailure -What "Release $ReleaseId is still a draft after the publish call." -Why 'The API accepted the call but the release did not go live. Running it again may help.' -Fix 'Look at the Releases page, and re-run the failed job.'
     }
+    Add-GitHubOutput -Name 'make_latest' -Value $decision.MakeLatest   # the final latest check only makes sense for a release that became the latest one
     Write-Host "Published release $ReleaseId ($tag)."
 }
 
