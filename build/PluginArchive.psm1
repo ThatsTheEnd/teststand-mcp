@@ -27,8 +27,6 @@ $script:SkillCheckScript = Join-Path $PSScriptRoot 'Test-SkillSources.ps1'
 $script:VerifierScript = Join-Path $PSScriptRoot 'Assert-PublishedRelease.ps1'
 
 $script:ProjectFile = 'TestStandMCP.csproj'
-$script:RuntimeIdentifier = 'win-x86'
-$script:BuildPlatform = 'x86'
 $script:BuildConfiguration = 'Release'
 $script:PublishTimeoutSeconds = 900
 $script:SkillCheckTimeoutSeconds = 180
@@ -36,7 +34,7 @@ $script:VerifierTimeoutSeconds = 600
 $script:GitTimeoutSeconds = 60
 $script:SkillCheckExcerptLines = 80
 $script:PublishExcerptLines = 25
-$script:PublishCommandHint = 'dotnet publish TestStandMCP.csproj -c Release -p:Platform=x86 -r win-x86'
+$script:PublishCommandHintFormat = 'dotnet publish TestStandMCP.csproj -c Release -p:Platform={0} -r {1}'
 
 # ----------------------------------------------------------------------------
 #  The exe layouts. 'folder' is the default (docs/validation/self-contained-x86.md): the
@@ -172,9 +170,12 @@ function Publish-PluginExe {
         [Parameter(Mandatory)][string]$Layout,
         [Parameter(Mandatory)][string]$Version,
         [Parameter(Mandatory)][string]$Commit,
-        [Parameter(Mandatory)][string]$PublishDir
+        [Parameter(Mandatory)][string]$PublishDir,
+        [string]$Architecture = 'x86'
     )
     $layoutSettings = Get-ArchiveLayout $Layout
+    $identity = Get-PluginIdentity -Architecture $Architecture
+    $publishCommandHint = $script:PublishCommandHintFormat -f $identity.buildPlatform, $identity.runtimeIdentifier
     $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
     if ($null -eq $dotnet) {
         Write-BuildFailure -What 'dotnet was not found on the PATH.' `
@@ -188,12 +189,12 @@ function Publish-PluginExe {
             -Fix 'Close whatever holds files in it (a running TestStandMCP.exe from that folder) and delete it by hand.'
     }
     $arguments = @('publish', (Join-Path $RepoRoot $script:ProjectFile), '-c', $script:BuildConfiguration,
-        "-p:Platform=$script:BuildPlatform", '-r', $script:RuntimeIdentifier) + @($layoutSettings.PublishArguments) +
+        "-p:Platform=$($identity.buildPlatform)", '-r', $identity.runtimeIdentifier) + @($layoutSettings.PublishArguments) +
         @("-p:Version=$Version", "-p:SourceRevisionId=$Commit", '-o', $PublishDir, '--nologo', '-v:minimal', '--disable-build-servers')
     $result = Invoke-ChildProcess -FilePath $dotnet.Source -ArgumentList $arguments -WorkingDirectory $RepoRoot -TimeoutSeconds $script:PublishTimeoutSeconds
     Assert-ChildOutcome -Result $result -Name 'dotnet publish' -TimeoutSeconds $script:PublishTimeoutSeconds `
         -Why 'Without the exe nothing can be packaged. A timeout may be transient (a busy machine, a slow NuGet feed); a build error is not.' `
-        -Fix "Fix the build error above. To reproduce: $script:PublishCommandHint" -Mode Last -Count $script:PublishExcerptLines
+        -Fix "Fix the build error above. To reproduce: $publishCommandHint" -Mode Last -Count $script:PublishExcerptLines
     $exePath = Get-PublishedExePath -PublishDir $PublishDir
     if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
         Write-BuildFailure -What "dotnet publish succeeded but $exePath is not there." `
@@ -235,12 +236,12 @@ function Get-RunUrl {
 
 function New-ReleaseRecord {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Tag, [Parameter(Mandatory)][string]$Version, [Parameter(Mandatory)][string]$Commit)
+    param([Parameter(Mandatory)][string]$Tag, [Parameter(Mandatory)][string]$Version, [Parameter(Mandatory)][string]$Commit, [string]$Architecture = 'x86')
     return @{
         tag     = $Tag
         version = $Version
         commit  = $Commit
-        arch    = $script:BuildPlatform
+        arch    = (Get-PluginIdentity -Architecture $Architecture).buildPlatform
         built   = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
         run     = (Get-RunUrl)
     }
@@ -309,23 +310,24 @@ function Assert-PluginZip {
 }
 
 # The version-named copy, the digest and the per-file manifest next to the archive. Every name comes
-# from ReleaseAssets.psm1. $ManifestText is the hash list of the staged tree.
+# from ReleaseAssets.psm1; $Prefix is the plugin's asset prefix. $ManifestText is the hash list of the staged tree.
 function Write-ReleaseAssets {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$ZipPath, [Parameter(Mandatory)][string]$ManifestText, [Parameter(Mandatory)][string]$Version)
+    param([Parameter(Mandatory)][string]$ZipPath, [Parameter(Mandatory)][string]$ManifestText, [Parameter(Mandatory)][string]$Version, [string]$Prefix = $ReleaseAssetPrefix)
     $zipFullPath = Resolve-BuildPath $ZipPath
     $outDir = Split-Path -Parent $zipFullPath
-    Copy-Item -LiteralPath $zipFullPath -Destination (Join-Path $outDir (Get-VersionedArchiveName -Version (Get-VersionCore $Version))) -Force
-    [IO.File]::WriteAllText((Join-Path $outDir $ReleaseDigestName), (New-ArchiveDigest -ArchivePath $zipFullPath), (Get-Utf8NoBomEncoding))
-    [IO.File]::WriteAllText((Join-Path $outDir $ReleaseManifestName), $ManifestText, (Get-Utf8NoBomEncoding))
+    $names = Get-PluginAssetNames -Prefix $Prefix -Version (Get-VersionCore $Version)
+    Copy-Item -LiteralPath $zipFullPath -Destination (Join-Path $outDir $names.Versioned) -Force
+    [IO.File]::WriteAllText((Join-Path $outDir $names.Digest), (New-ArchiveDigest -ArchivePath $zipFullPath), (Get-Utf8NoBomEncoding))
+    [IO.File]::WriteAllText((Join-Path $outDir $names.Manifest), $ManifestText, (Get-Utf8NoBomEncoding))
 }
 
 # The release verifier (spec AC-8) in local mode on the asset directory: it must accept the output.
 function Assert-LocalRelease {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$OutDir, [Parameter(Mandatory)][string]$Version)
+    param([Parameter(Mandatory)][string]$OutDir, [Parameter(Mandatory)][string]$Version, [string]$Prefix = $ReleaseAssetPrefix)
     $result = Invoke-BuildScript -ScriptPath $script:VerifierScript -TimeoutSeconds $script:VerifierTimeoutSeconds `
-        -ArgumentList @('-LocalDir', $OutDir, '-Version', (Get-VersionCore $Version))
+        -ArgumentList @('-LocalDir', $OutDir, '-Version', (Get-VersionCore $Version), '-AssetPrefixes', $Prefix)
     Assert-ChildOutcome -Result $result -Name "The release verifier (build\Assert-PublishedRelease.ps1, local mode, $OutDir)" -TimeoutSeconds $script:VerifierTimeoutSeconds `
         -Why 'The same verifier gates the real release; an archive it rejects here would be rejected there, after the tag is pushed.' `
         -Fix 'Fix what the verifier reports (it names the asset and the command), then package again.' -Count $script:PublishExcerptLines

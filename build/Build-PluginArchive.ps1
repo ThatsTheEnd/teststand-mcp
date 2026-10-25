@@ -1,5 +1,6 @@
 # ============================================================================
-#  Build-PluginArchive.ps1 - builds the plugin archive (teststand-mcp.zip) from this checkout.
+#  Build-PluginArchive.ps1 - builds one plugin archive (teststand-mcp.zip, or teststand-mcp-x64.zip
+#  with -Architecture x64) from this checkout.
 #  First it refuses a malformed version, tag, commit or layout; then it runs the steps listed in
 #  $Steps below, in order (the numbering is computed from that list):
 #    - the source checks that need no build (skill sources, tool classification, the plugin.json
@@ -11,8 +12,9 @@
 #    - the zip (forward-slash entry names, the commit time on every entry) and its entry-name check;
 #    - the versioned copy, the digest and the per-file manifest (names from ReleaseAssets.psm1);
 #    - build\Assert-PublishedRelease.ps1 in local mode on the result.
-#  The assets (teststand-mcp.zip, teststand-mcp-v<X.Y.Z>.zip, .sha256, .manifest.sha256) end up in
-#  -OutDir next to the stage\ tree they were built from.
+#  The assets (<prefix>.zip, <prefix>-v<X.Y.Z>.zip, .sha256, .manifest.sha256; the prefix is the
+#  plugin name) end up in -OutDir next to the stage\ tree they were built from, so build the two
+#  architectures into two directories.
 #  Every failure is three parts - what is wrong, why it matters, the command that fixes it -
 #  printed to the host, with exit code 1.
 #
@@ -22,6 +24,7 @@
 #  -Commit   the full 40-character SHA; defaults to git rev-parse HEAD.
 #  -OutDir   where everything is written (default: <repo>\artifacts, which git ignores).
 #  -Layout   folder (default, see docs/validation/self-contained-x86.md), single-file, framework-dependent.
+#  -Architecture  x86 (default: the teststand-mcp plugin, for 32-bit TestStand) or x64 (teststand-mcp-x64).
 #  Windows PowerShell 5.1 and PowerShell 7 compatible.
 # ============================================================================
 param(
@@ -29,13 +32,15 @@ param(
     [string]$Tag,
     [string]$Commit,
     [string]$OutDir = (Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts'),
-    [string]$Layout
+    [string]$Layout,
+    [string]$Architecture = 'x86'
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'BuildCommon.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'ReleaseAssets.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'PluginIdentity.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'PluginStaging.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'PluginArchive.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'PluginSmoke.psm1') -Force
@@ -60,15 +65,17 @@ try {
     Assert-BuildVersion $Version
     Assert-BuildTag -Tag $Tag -Version $Version
     Assert-BuildCommit $Commit
+    $identity = Get-PluginIdentity -Architecture $Architecture
+    $assetNames = Get-PluginAssetNames -Prefix $identity.assetPrefix -Version (Get-VersionCore $Version)
     $layoutSettings = Get-ArchiveLayout $Layout
     $OutDir = Resolve-BuildPath $OutDir
     $publishDir = Join-Path $OutDir $PublishDirName
     $stageDir = Join-Path $OutDir $StageDirName
-    $zipPath = Join-Path $OutDir $ReleaseArchiveName
-    $release = New-ReleaseRecord -Tag $Tag -Version $Version -Commit $Commit
+    $zipPath = Join-Path $OutDir $assetNames.Archive
+    $release = New-ReleaseRecord -Tag $Tag -Version $Version -Commit $Commit -Architecture $Architecture
     $stageSnapshot = $null
     $publishedExe = $null
-    Write-Host "Packaging version $Version ($Tag, commit $Commit), layout $Layout, into $OutDir"
+    Write-Host "Packaging $($identity.name) ($Architecture) version $Version ($Tag, commit $Commit), layout $Layout, into $OutDir"
 
     $Steps = @(
         @{ Name = 'Checking the sources'; Run = {
@@ -76,7 +83,7 @@ try {
         } }
         @{ Name = "Publishing the exe ($Layout)"; Run = {
             [void](New-Item -ItemType Directory -Path $OutDir -Force)
-            $script:publishedExe = Publish-PluginExe -RepoRoot $RepoRoot -Layout $Layout -Version $Version -Commit $Commit -PublishDir $publishDir
+            $script:publishedExe = Publish-PluginExe -RepoRoot $RepoRoot -Layout $Layout -Version $Version -Commit $Commit -PublishDir $publishDir -Architecture $Architecture
         } }
         @{ Name = 'Checking the published exe'; Run = {
             Assert-PublishedVersion -ExePath $publishedExe -Version $Version -Commit $Commit
@@ -89,16 +96,16 @@ try {
         @{ Name = 'Smoke-testing the staged exe'; Run = {
             Invoke-SmokeTests -StageDir $stageDir -Release $release -RepoRoot $RepoRoot
         } }
-        @{ Name = "Zipping $ReleaseArchiveName"; Run = {
+        @{ Name = "Zipping $($assetNames.Archive)"; Run = {
             Assert-StageUnchanged -StageDir $stageDir -Snapshot $stageSnapshot
             New-PluginZip -StageDir $stageDir -ZipPath $zipPath -Timestamp (Get-CommitTimestamp -RepoRoot $RepoRoot -Commit $Commit)
             Assert-PluginZip -ZipPath $zipPath -StageDir $stageDir
         } }
         @{ Name = 'Writing the versioned copy, the digest and the manifest'; Run = {
-            Write-ReleaseAssets -ZipPath $zipPath -ManifestText $stageSnapshot -Version $Version
+            Write-ReleaseAssets -ZipPath $zipPath -ManifestText $stageSnapshot -Version $Version -Prefix $identity.assetPrefix
         } }
         @{ Name = 'Verifying the output the way the release is verified'; Run = {
-            Assert-LocalRelease -OutDir $OutDir -Version $Version
+            Assert-LocalRelease -OutDir $OutDir -Version $Version -Prefix $identity.assetPrefix
         } }
     )
 
@@ -111,7 +118,7 @@ try {
         Remove-BuildTempTree -Path $publishDir
     }
 
-    Write-Host ("Done in {0:N1}s: {1} ({2:N1} MB) and its digest and manifest are in {3}" -f $StepClock.Elapsed.TotalSeconds, $ReleaseArchiveName, ((Get-Item -LiteralPath $zipPath).Length / 1MB), $OutDir)
+    Write-Host ("Done in {0:N1}s: {1} ({2:N1} MB) and its digest and manifest are in {3}" -f $StepClock.Elapsed.TotalSeconds, $assetNames.Archive, ((Get-Item -LiteralPath $zipPath).Length / 1MB), $OutDir)
     exit 0
 } catch {
     Write-Host (Get-ScriptFailureText -ErrorRecord $_)

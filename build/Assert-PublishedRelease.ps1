@@ -46,6 +46,9 @@
 #                                              check is tried up to -PropagationAttempts times,
 #                                              -PropagationDelaySeconds apart; every try is a
 #                                              recorded download.
+#  -AssetPrefixes names the plugins whose assets the release (or -LocalDir) carries, each judged on its own
+#  (default teststand-mcp; teststand-mcp-x64 for the 64-bit plugin). A comma-separated value is split, since
+#  powershell -File passes an array as one string. -Latest checks the x86 plugin.
 #  -Rehearsal accepts the dry-run tag v<X.Y.Z>-rehearsal.
 #  -OwnDownloadsPath records every download in own-downloads.json (see ReleaseAssets.psm1)
 #  immediately BEFORE its request. The phase comes from the release's own draft flag; -Draft
@@ -63,6 +66,7 @@ param(
     [string]$Token = $env:GITHUB_TOKEN,
     [string]$LocalDir,
     [string]$ReleaseJson,
+    [string[]]$AssetPrefixes,
     [switch]$Latest,
     [string]$ExpectedArchiveSha256,
     [int]$PropagationAttempts = 6,
@@ -210,7 +214,7 @@ function Test-LatestOnce {
         Assert-ReleaseFailure 'The latest release' @(New-Problem 'digest-malformed' @($_.Exception.Message)) 'ApiPublished'
     }
     $archiveHash = Get-FileSha256 $transfer.Saved[$ReleaseArchiveName]
-    if ($digest.Name -cne $ReleaseArchiveName) { Assert-ReleaseFailure 'The latest release' @(New-Problem 'digest-name' @($digest.Name)) 'ApiPublished' }
+    if ($digest.Name -cne $ReleaseArchiveName) { Assert-ReleaseFailure 'The latest release' @(New-Problem 'digest-name' @($digest.Name, $ReleaseArchiveName)) 'ApiPublished' }
     if ($digest.Hash -cne $archiveHash) { Assert-ReleaseFailure 'The latest release' @(New-Problem 'latest-mismatch' @($archiveHash, $digest.Hash)) 'ApiPublished' }
     if ($ExpectedHash -and $archiveHash -cne $ExpectedHash) {
         Assert-ReleaseFailure 'The latest release' @(New-Problem 'latest-not-verified' @($archiveHash, $ExpectedHash)) 'ApiPublished'
@@ -247,9 +251,9 @@ function Test-ApiRelease {
     $isDraft = [bool]$Draft -or ((Get-JsonProperty $release 'draft') -eq $true)
     $failureMode = if ($isDraft) { 'Api' } else { 'ApiPublished' }   # the fix differs: a draft is deleted, a published release is rolled back
     $listedAssets = @(ConvertTo-ListedAssets $release)
-    Assert-ReleaseFailure "Release $Tag" @(Get-ReleaseProblems -Assets $listedAssets -Version $ReleaseVersion -Scope Listing) $failureMode
+    Assert-ReleaseFailure "Release $Tag" @(Get-ReleaseProblems -Assets $listedAssets -Version $ReleaseVersion -Scope Listing -Prefixes $AssetPrefixes) $failureMode
 
-    $requiredNames = @(Get-RequiredAssetNames -Version $ReleaseVersion)
+    $requiredNames = @(Get-RequiredAssetNames -Version $ReleaseVersion -Prefixes $AssetPrefixes)
     $requests = @(foreach ($name in $requiredNames) {
         $asset = @($listedAssets | Where-Object { $_.Name -ceq $name })[0]
         if ($asset.Id -cnotmatch $AssetIdPattern) {
@@ -268,9 +272,9 @@ function Test-ApiRelease {
     Assert-DownloadsSucceeded $outcome "Release $Tag"
 
     foreach ($asset in $listedAssets) { if ($transfer.Saved.ContainsKey($asset.Name)) { $asset.Path = $transfer.Saved[$asset.Name] } }
-    Assert-ReleaseFailure "Release $Tag" @(Get-ReleaseProblems -Assets $listedAssets -Version $ReleaseVersion -Scope Content) $failureMode
+    Assert-ReleaseFailure "Release $Tag" @(Get-ReleaseProblems -Assets $listedAssets -Version $ReleaseVersion -Scope Content -Prefixes $AssetPrefixes) $failureMode
 
-    Write-StepOutputs -Release $release -Assets $listedAssets -RequiredNames $requiredNames -ArchiveSha256 (Get-FileSha256 $transfer.Saved[$ReleaseArchiveName])
+    Write-StepOutputs -Release $release -Assets $listedAssets -RequiredNames $requiredNames -ArchiveSha256 (Get-FileSha256 $transfer.Saved[$requiredNames[0]])
     Write-Host "Release $Tag verified: the $($requiredNames.Count) required assets match (digest, manifest, versioned archive), every asset uploaded by $ReleaseUploaderLogin."
     Write-Host "Requested $($transfer.Requested) asset download(s) in $($outcome.Attempts) attempt(s)."
 }
@@ -282,15 +286,17 @@ function Test-LocalRelease {
         Write-BuildFailure -What '-ReleaseJson needs -Tag.' -Why 'The release is looked up in the JSON by its tag.' -Fix 'Pass -Tag vX.Y.Z together with -ReleaseJson.'
     }
     $listing = Get-LocalListing -LocalDir $LocalDir -Tag $Tag -ReleaseJson $ReleaseJson
-    Assert-ReleaseFailure $subject @(Get-ReleaseProblems -Assets $listing.Assets -Version $ReleaseVersion -CheckUploader $listing.CheckUploader) 'Local'
+    Assert-ReleaseFailure $subject @(Get-ReleaseProblems -Assets $listing.Assets -Version $ReleaseVersion -CheckUploader $listing.CheckUploader -Prefixes $AssetPrefixes) 'Local'
     $uploaderNote = if ($listing.CheckUploader) { "every asset uploaded by $ReleaseUploaderLogin" } else { 'uploader check skipped (no release metadata given)' }
-    Write-Host "$subject verified: the $(@(Get-RequiredAssetNames -Version $ReleaseVersion).Count) required assets match (digest, manifest, versioned archive), $uploaderNote."
+    Write-Host "$subject verified: the $(@(Get-RequiredAssetNames -Version $ReleaseVersion -Prefixes $AssetPrefixes).Count) required assets match (digest, manifest, versioned archive), $uploaderNote."
     Write-Host 'Requested 0 asset download(s) in 1 attempt(s) (local assets).'
 }
 
 try {
     Import-Module (Join-Path $PSScriptRoot 'ReleaseAssets.psm1') -Force
     Import-Module (Join-Path $PSScriptRoot 'ReleaseVerdict.psm1') -Force
+    $AssetPrefixes = if ($AssetPrefixes) { @($AssetPrefixes | ForEach-Object { $_ -split ',' } | Where-Object { $_ }) } else { @($ReleaseAssetPrefix) }
+    foreach ($prefix in $AssetPrefixes) { [void](Get-PluginAssetNames -Prefix $prefix -Version '0.0.0') }   # refuses a prefix that is not a plugin name
 
     Assert-SourceChoice
     $connection = New-Connection -Token $Token -HttpGet $HttpGet -TimeoutSeconds $TimeoutSeconds -ApiBaseUrl $ApiBaseUrl

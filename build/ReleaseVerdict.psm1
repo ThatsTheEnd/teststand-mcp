@@ -9,6 +9,7 @@
 #    Listing  presence, who uploaded EVERY asset, versioned-vs-plugin archive size;
 #    Content  digest, manifest (archive entries), versioned archive bytes.
 #  Terms: plugin archive (teststand-mcp.zip), versioned archive, archive digest, archive manifest.
+#  A release may carry several plugins (one per asset prefix); each one's four assets are judged on their own.
 #  Compatible with Windows PowerShell 5.1 and PowerShell 7.
 # ============================================================================
 Set-StrictMode -Version 2.0
@@ -53,14 +54,14 @@ $script:Faults = @{
                                         Fix = '' }
     'digest-malformed'             = @{ Fault = 'the archive digest is malformed: {0}'
                                         Why = 'the uploaded digest cannot be read, so the plugin archive cannot be checked against it'
-                                        Fix = "The digest must be one `"<sha256>  $ReleaseArchiveName`" line." }
-    'digest-name'                  = @{ Fault = "the archive digest names '{0}', not $ReleaseArchiveName"
+                                        Fix = 'The digest must be one "<sha256>  <plugin archive name>" line.' }
+    'digest-name'                  = @{ Fault = "the archive digest names '{0}', not {1}"
                                         Why = '"sha256sum -c" would check the wrong file'
                                         Fix = '' }
-    'digest-mismatch'              = @{ Fault = "the plugin archive $ReleaseArchiveName does not match the archive digest $ReleaseDigestName (digest {0}, archive {1})"
+    'digest-mismatch'              = @{ Fault = 'the plugin archive {2} does not match the archive digest {3} (digest {0}, archive {1})'
                                         Why = 'the uploaded archive is not the file the digest was made for'
                                         Fix = '' }
-    'versioned-differs'            = @{ Fault = 'the versioned archive {0} differs from the plugin archive ' + $ReleaseArchiveName
+    'versioned-differs'            = @{ Fault = 'the versioned archive {0} differs from the plugin archive {1}'
                                         Why = 'the two archives must be the same bytes, or users get a different build depending on the URL'
                                         Fix = '' }
     'archive-unreadable'           = @{ Fault = 'the plugin archive cannot be read as a zip file: {1}'
@@ -122,62 +123,65 @@ function New-Problem {
 # ----------------------------------------------------------------------------
 #  Small checks. Each takes plain data and returns an array of problems.
 # ----------------------------------------------------------------------------
+# $Prefixes: the asset prefixes of the plugins the release carries.
 function Get-AssetLabel {
-    param([string]$Name, [string]$Version)
-    $role = 'asset'
-    if ($Name -ceq $ReleaseArchiveName) { $role = 'plugin archive' }
-    elseif ($Name -ceq $ReleaseDigestName) { $role = 'archive digest' }
-    elseif ($Name -ceq $ReleaseManifestName) { $role = 'archive manifest' }
-    elseif ($Name -ceq (Get-VersionedArchiveName -Version $Version)) { $role = 'versioned archive' }
-    return "the $role $Name"
+    param([string]$Name, [string]$Version, [string[]]$Prefixes)
+    foreach ($prefix in $Prefixes) {
+        $names = Get-PluginAssetNames -Prefix $prefix -Version $Version
+        if ($Name -ceq $names.Archive) { return "the plugin archive $Name" }
+        if ($Name -ceq $names.Digest) { return "the archive digest $Name" }
+        if ($Name -ceq $names.Manifest) { return "the archive manifest $Name" }
+        if ($Name -ceq $names.Versioned) { return "the versioned archive $Name" }
+    }
+    return "the asset $Name"
 }
 
 function Get-PresenceProblems {
-    param($AssetsByName, [string]$Version)
+    param($AssetsByName, [string]$Version, [string[]]$Prefixes)
     $problems = @()
-    foreach ($name in (Get-RequiredAssetNames -Version $Version)) {
-        if (-not $AssetsByName.ContainsKey($name)) { $problems += New-Problem 'asset-missing' @((Get-AssetLabel $name $Version)) }
+    foreach ($name in (Get-RequiredAssetNames -Version $Version -Prefixes $Prefixes)) {
+        if (-not $AssetsByName.ContainsKey($name)) { $problems += New-Problem 'asset-missing' @((Get-AssetLabel $name $Version $Prefixes)) }
     }
     return $problems
 }
 
 # EVERY asset of the release, including ones this workflow never builds: a hand-attached extra is also a fault.
 function Get-UploaderProblems {
-    param([object[]]$Assets, [string]$Version)
+    param([object[]]$Assets, [string]$Version, [string[]]$Prefixes)
     $problems = @()
     foreach ($asset in $Assets) {
-        if ($asset.Uploader -cne $ReleaseUploaderLogin) { $problems += New-Problem 'hand-uploaded-asset' @((Get-AssetLabel $asset.Name $Version), $asset.Uploader) }
+        if ($asset.Uploader -cne $ReleaseUploaderLogin) { $problems += New-Problem 'hand-uploaded-asset' @((Get-AssetLabel $asset.Name $Version $Prefixes), $asset.Uploader) }
     }
     return $problems
 }
 
+# $Names: one plugin's names (Get-PluginAssetNames); the checks below each judge one plugin.
 function Get-VersionedSizeProblems {
-    param($AssetsByName, [string]$Version)
-    $versionedName = Get-VersionedArchiveName -Version $Version
-    if (-not ($AssetsByName.ContainsKey($versionedName) -and $AssetsByName.ContainsKey($ReleaseArchiveName))) { return @() }
-    $versioned = $AssetsByName[$versionedName]
-    $plugin = $AssetsByName[$ReleaseArchiveName]
+    param($AssetsByName, $Names)
+    if (-not ($AssetsByName.ContainsKey($Names.Versioned) -and $AssetsByName.ContainsKey($Names.Archive))) { return @() }
+    $versioned = $AssetsByName[$Names.Versioned]
+    $plugin = $AssetsByName[$Names.Archive]
     if ($null -eq $versioned.Size -or $null -eq $plugin.Size -or $versioned.Size -eq $plugin.Size) { return @() }
-    return @(New-Problem 'versioned-size-differs' @((Get-AssetLabel $versionedName $Version), $versioned.Size, $plugin.Size))
+    return @(New-Problem 'versioned-size-differs' @("the versioned archive $($Names.Versioned)", $versioned.Size, $plugin.Size))
 }
 
 function Get-DigestProblems {
-    param($AssetsByName, [string]$ArchiveHash)
-    if (-not $AssetsByName.ContainsKey($ReleaseDigestName)) { return @() }
+    param($AssetsByName, $Names, [string]$ArchiveHash)
+    if (-not $AssetsByName.ContainsKey($Names.Digest)) { return @() }
     try {
-        $digest = ConvertFrom-DigestText -Text (Read-Utf8Text $AssetsByName[$ReleaseDigestName].Path)
+        $digest = ConvertFrom-DigestText -Text (Read-Utf8Text $AssetsByName[$Names.Digest].Path)
     } catch {
         return @(New-Problem 'digest-malformed' @($_.Exception.Message))
     }
-    if ($digest.Name -cne $ReleaseArchiveName) { return @(New-Problem 'digest-name' @($digest.Name)) }
-    if ($digest.Hash -cne $ArchiveHash) { return @(New-Problem 'digest-mismatch' @($digest.Hash, $ArchiveHash)) }
+    if ($digest.Name -cne $Names.Archive) { return @(New-Problem 'digest-name' @($digest.Name, $Names.Archive)) }
+    if ($digest.Hash -cne $ArchiveHash) { return @(New-Problem 'digest-mismatch' @($digest.Hash, $ArchiveHash, $Names.Archive, $Names.Digest)) }
     return @()
 }
 
 function Get-ManifestProblems {
-    param($AssetsByName, [string]$ArchivePath)
-    if (-not $AssetsByName.ContainsKey($ReleaseManifestName)) { return @() }
-    $differences = @(Compare-ArchiveManifest -ArchivePath $ArchivePath -ManifestText (Read-Utf8Text $AssetsByName[$ReleaseManifestName].Path))
+    param($AssetsByName, $Names, [string]$ArchivePath)
+    if (-not $AssetsByName.ContainsKey($Names.Manifest)) { return @() }
+    $differences = @(Compare-ArchiveManifest -ArchivePath $ArchivePath -ManifestText (Read-Utf8Text $AssetsByName[$Names.Manifest].Path))
     $problems = @()
     foreach ($difference in ($differences | Select-Object -First $script:MaxManifestProblemsShown)) {
         $problems += New-Problem $difference.Kind @($difference.Path, $difference.Detail)
@@ -187,11 +191,10 @@ function Get-ManifestProblems {
 }
 
 function Get-VersionedArchiveProblems {
-    param($AssetsByName, [string]$Version, [string]$ArchiveHash)
-    $versionedName = Get-VersionedArchiveName -Version $Version
-    if (-not $AssetsByName.ContainsKey($versionedName)) { return @() }
-    if ((Get-FileSha256 $AssetsByName[$versionedName].Path) -ceq $ArchiveHash) { return @() }
-    return @(New-Problem 'versioned-differs' @($versionedName))
+    param($AssetsByName, $Names, [string]$ArchiveHash)
+    if (-not $AssetsByName.ContainsKey($Names.Versioned)) { return @() }
+    if ((Get-FileSha256 $AssetsByName[$Names.Versioned].Path) -ceq $ArchiveHash) { return @() }
+    return @(New-Problem 'versioned-differs' @($Names.Versioned, $Names.Archive))
 }
 
 # ----------------------------------------------------------------------------
@@ -203,7 +206,8 @@ function Get-ReleaseProblems {
         [object[]]$Assets = @(),
         [Parameter(Mandatory)][string]$Version,
         [bool]$CheckUploader = $true,
-        [ValidateSet('Listing', 'Content', 'All')][string]$Scope = 'All'
+        [ValidateSet('Listing', 'Content', 'All')][string]$Scope = 'All',
+        [string[]]$Prefixes = @($ReleaseAssetPrefix)
     )
     # Asset names match exactly: 'Teststand-MCP.zip' is not 'teststand-mcp.zip'.
     $assetsByName = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
@@ -211,16 +215,18 @@ function Get-ReleaseProblems {
 
     $problems = @()
     if ($Scope -ne 'Content') {
-        $problems += @(Get-PresenceProblems $assetsByName $Version)
-        if ($CheckUploader) { $problems += @(Get-UploaderProblems $Assets $Version) }
-        $problems += @(Get-VersionedSizeProblems $assetsByName $Version)
+        $problems += @(Get-PresenceProblems $assetsByName $Version $Prefixes)
+        if ($CheckUploader) { $problems += @(Get-UploaderProblems $Assets $Version $Prefixes) }
     }
-    if ($Scope -ne 'Listing' -and $assetsByName.ContainsKey($ReleaseArchiveName)) {
-        $archivePath = $assetsByName[$ReleaseArchiveName].Path
+    foreach ($prefix in $Prefixes) {
+        $names = Get-PluginAssetNames -Prefix $prefix -Version $Version
+        if ($Scope -ne 'Content') { $problems += @(Get-VersionedSizeProblems $assetsByName $names) }
+        if ($Scope -eq 'Listing' -or -not $assetsByName.ContainsKey($names.Archive)) { continue }
+        $archivePath = $assetsByName[$names.Archive].Path
         $archiveHash = Get-FileSha256 $archivePath
-        $problems += @(Get-DigestProblems $assetsByName $archiveHash)
-        $problems += @(Get-ManifestProblems $assetsByName $archivePath)
-        $problems += @(Get-VersionedArchiveProblems $assetsByName $Version $archiveHash)
+        $problems += @(Get-DigestProblems $assetsByName $names $archiveHash)
+        $problems += @(Get-ManifestProblems $assetsByName $names $archivePath)
+        $problems += @(Get-VersionedArchiveProblems $assetsByName $names $archiveHash)
     }
     return $problems
 }

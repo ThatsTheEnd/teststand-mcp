@@ -21,37 +21,56 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 #  Asset contract (exported, read-only)
 # ----------------------------------------------------------------------------
 Set-Variable -Name ReleaseRepoSlug -Value 'Zuehlke/teststand-mcp' -Option ReadOnly -Scope Script
-# Every asset name starts with this prefix, so a workflow can pick the assets up with one glob ($ReleaseAssetPrefix*).
+# The x86 plugin's asset prefix. Each plugin's assets start with its own prefix (PluginIdentity.psm1
+# assetPrefix: teststand-mcp, teststand-mcp-x64), so one glob ($ReleaseAssetPrefix*) picks up both.
+# The Release*Name variables are the x86 names; Get-PluginAssetNames gives any plugin's.
 Set-Variable -Name ReleaseAssetPrefix -Value 'teststand-mcp' -Option ReadOnly -Scope Script
 Set-Variable -Name ReleaseArchiveName -Value "$ReleaseAssetPrefix.zip" -Option ReadOnly -Scope Script
 Set-Variable -Name ReleaseDigestName -Value "$ReleaseAssetPrefix.sha256" -Option ReadOnly -Scope Script
 Set-Variable -Name ReleaseManifestName -Value "$ReleaseAssetPrefix.manifest.sha256" -Option ReadOnly -Scope Script
 Set-Variable -Name ReleaseUploaderLogin -Value 'github-actions[bot]' -Option ReadOnly -Scope Script
 
-$script:VersionedArchiveFormat = "$ReleaseAssetPrefix-v{0}.zip"
 $script:LatestDownloadUrlFormat = 'https://github.com/{0}/releases/latest/download/{1}'
+$script:AssetPrefixPattern = '\A[a-z0-9][a-z0-9-]*\z'
+
+# The four asset names of one plugin. The prefix becomes part of file names and URLs, so it is
+# restricted to what a plugin name may be.
+function Get-PluginAssetNames {
+    [CmdletBinding()]
+    param([string]$Prefix = $ReleaseAssetPrefix, [Parameter(Mandatory)][string]$Version)
+    if ($Prefix -cnotmatch $script:AssetPrefixPattern) { throw "The asset prefix '$Prefix' is not a plugin name (lowercase letters, digits and dashes)." }
+    return [pscustomobject]@{
+        Archive   = "$Prefix.zip"
+        Digest    = "$Prefix.sha256"
+        Manifest  = "$Prefix.manifest.sha256"
+        Versioned = "$Prefix-v$Version.zip"
+    }
+}
 
 function Get-VersionedArchiveName {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Version)
-    return ($script:VersionedArchiveFormat -f $Version)
+    param([Parameter(Mandatory)][string]$Version, [string]$Prefix = $ReleaseAssetPrefix)
+    return (Get-PluginAssetNames -Prefix $Prefix -Version $Version).Versioned
 }
 
-# Download order: the plugin archive first (every other check needs it), the small digest and
-# manifest next, and the second full-size archive last so a cheap fault stops the run before it.
+# Per plugin, in download order: the plugin archive first (every other check needs it), the small
+# digest and manifest next, and the second full-size archive last so a cheap fault stops the run before it.
 function Get-RequiredAssetNames {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Version)
-    return @($ReleaseArchiveName, $ReleaseDigestName, $ReleaseManifestName, (Get-VersionedArchiveName -Version $Version))
+    param([Parameter(Mandatory)][string]$Version, [string[]]$Prefixes = @($ReleaseAssetPrefix))
+    return @(foreach ($prefix in $Prefixes) {
+        $names = Get-PluginAssetNames -Prefix $prefix -Version $Version
+        $names.Archive, $names.Digest, $names.Manifest, $names.Versioned
+    })
 }
 
 # A folder of release assets holds exactly the required files of the version: no missing one, no extra one
 # (an extra file would be uploaded as a release asset nobody verifies). Subfolders are not assets.
 function Assert-ReleaseAssetFiles {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][string]$Version)
+    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][string]$Version, [string[]]$Prefixes = @($ReleaseAssetPrefix))
     $resolved = Resolve-BuildPath $Directory
-    $expected = @(Get-RequiredAssetNames -Version $Version)
+    $expected = @(Get-RequiredAssetNames -Version $Version -Prefixes $Prefixes)
     $present = @()
     if (Test-Path -LiteralPath $resolved -PathType Container) { $present = @(Get-ChildItem -LiteralPath $resolved -File | ForEach-Object { $_.Name }) }
     $missing = @($expected | Where-Object { $present -cnotcontains $_ })
@@ -495,7 +514,7 @@ function Add-OwnDownload {
 
 Export-ModuleMember -Variable ReleaseRepoSlug, ReleaseAssetPrefix, ReleaseArchiveName, ReleaseDigestName, ReleaseManifestName, ReleaseUploaderLogin, ArchiveProblemKinds,
     ReleaseRehearsalSuffix, ReleaseCommitPattern, OwnDownloadPhases
-Export-ModuleMember -Function Get-VersionedArchiveName, Get-RequiredAssetNames, Assert-ReleaseAssetFiles, Assert-RepoSlug, Get-LatestDownloadUrl,
+Export-ModuleMember -Function Get-PluginAssetNames, Get-VersionedArchiveName, Get-RequiredAssetNames, Assert-ReleaseAssetFiles, Assert-RepoSlug, Get-LatestDownloadUrl,
     Get-FileSha256, Get-StreamSha256, Format-HashLine, ConvertFrom-HashLines,
     ConvertFrom-ReleaseTag, Get-TagRejection, Get-PrintableTag, New-OrdinalOrderedMap,
     New-ArchiveDigest, ConvertFrom-DigestText, New-ArchiveManifest, Compare-ArchiveManifest,

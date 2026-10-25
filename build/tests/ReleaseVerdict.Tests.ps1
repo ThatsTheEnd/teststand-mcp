@@ -37,10 +37,10 @@ try {
         $alone = Format-ReleaseFailure -Subject 'The latest release' -Problems @($propagation) -Mode ApiPublished
         Assert-Contains $alone.Why $MayHelp 'why of a lone propagation fault'
         Assert-NotContains $alone.Why $NeverHelps 'why of a lone propagation fault'
-        $mixed = Format-ReleaseFailure -Subject 'x' -Problems @($propagation, (New-Problem 'digest-mismatch' @('a', 'b'))) -Mode ApiPublished
+        $mixed = Format-ReleaseFailure -Subject 'x' -Problems @($propagation, (New-Problem 'digest-mismatch' @('a', 'b', 'c', 'd'))) -Mode ApiPublished
         Assert-Contains $mixed.Why $NeverHelps 'one non-retryable fault decides'
         foreach ($code in @(Get-ReleaseFaultCodes | Where-Object { $_ -cne 'latest-not-verified' })) {
-            Assert-True (-not (New-Problem $code @('a', 'b', 'c')).Retryable) "$code must not be marked retryable"
+            Assert-True (-not (New-Problem $code @('a', 'b', 'c', 'd')).Retryable) "$code must not be marked retryable"
         }
     }
 
@@ -75,12 +75,12 @@ try {
 
     Invoke-Case 'rollback policy: every report of a bad release that is already live ends in the SAME sentence' {
         $policy = 'releases/latest falls back to the previous release (safe only once an earlier workflow-built release exists), or fix forward by releasing the next patch version (see CONTRIBUTING).'
-        $published = (Format-ReleaseFailure -Subject 'x' -Problems @(New-Problem 'digest-mismatch' @('a', 'b')) -Mode ApiPublished).Fix
+        $published = (Format-ReleaseFailure -Subject 'x' -Problems @(New-Problem 'digest-mismatch' @('a', 'b', 'c', 'd')) -Mode ApiPublished).Fix
         $latest = (Format-ReleaseFailure -Subject 'x' -Problems @(New-Problem 'latest-mismatch' @('a', 'b')) -Mode ApiPublished).Fix
         $assets = ConvertTo-Json -InputObject ([ordered]@{ 'a.zip' = 1 }) -Compress
         $live = Get-AssetSetFailure @{ ReleaseJson = (New-AssetSetJson -Draft $false -Assets ([ordered]@{ 'a.zip' = 2 })); ExpectedAssetIds = $assets; ReleaseId = "$ReleaseId"; Stage = 'AfterPublish' }
         foreach ($report in @($published, $latest, $live)) { Assert-Contains $report $policy 'a report of a live release' }
-        $draft = (Format-ReleaseFailure -Subject 'x' -Problems @(New-Problem 'digest-mismatch' @('a', 'b')) -Mode Api).Fix
+        $draft = (Format-ReleaseFailure -Subject 'x' -Problems @(New-Problem 'digest-mismatch' @('a', 'b', 'c', 'd')) -Mode Api).Fix
         Assert-NotContains $draft 'releases/latest falls back' 'the fix of a DRAFT (nothing is live, nothing to roll back)'
     }
 

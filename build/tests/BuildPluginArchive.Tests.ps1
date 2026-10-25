@@ -253,6 +253,8 @@ try {
         Assert-Equal 'v1.9.0,1.9.0,local' ("$($record.tag),$($record.version),$($record.run)") 'values'
         Assert-Equal $SampleCommit $record.commit 'commit'
         Assert-True ($record.built -cmatch '\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\z') "built was [$($record.built)]"
+        Assert-Equal 'x86' $record.arch 'the default architecture'
+        Assert-Equal 'x64' (New-ReleaseRecord -Tag 'v1.9.0' -Version '1.9.0' -Commit $SampleCommit -Architecture 'x64').arch 'the x64 architecture'
     }
 
     Invoke-Case 'commit time: the timestamp of a commit of this checkout, and a clear fix for one that is not' {
@@ -379,7 +381,9 @@ try {
         $emptyRepo = New-TempDir
         $publishDir = Join-Path (New-TempDir) 'publish'
         Assert-FailsWith { Publish-PluginExe -RepoRoot $emptyRepo -Layout 'folder' -Version $SampleVersion -Commit $SampleCommit -PublishDir $publishDir } `
-            @('dotnet publish failed', 'exit code') -Fix @('dotnet publish TestStandMCP.csproj')
+            @('dotnet publish failed', 'exit code') -Fix @('dotnet publish TestStandMCP.csproj -c Release -p:Platform=x86 -r win-x86')
+        Assert-FailsWith { Publish-PluginExe -RepoRoot $emptyRepo -Layout 'folder' -Version $SampleVersion -Commit $SampleCommit -PublishDir $publishDir -Architecture 'x64' } `
+            @('dotnet publish failed') -Fix @('-p:Platform=x64 -r win-x64')
     }
 
     # ======================================================================
@@ -1047,6 +1051,33 @@ try {
         Assert-FailsWith { Assert-LocalRelease -OutDir $outDir -Version '1.9.0' } @('release verifier', $ReleaseDigestName) -Fix @('Fix what the verifier reports')
     }
 
+    Invoke-Case 'assets x64: the four assets carry the x64 prefix, its verifier accepts them and the x86 one finds its own missing' {
+        $prefix = (Get-PluginIdentity -Architecture 'x64').assetPrefix
+        $names = Get-PluginAssetNames -Prefix $prefix -Version '1.9.0'
+        $stage = New-SmallStage
+        $outDir = New-TempDir
+        $zipPath = Join-Path $outDir $names.Archive
+        New-PluginZip -StageDir $stage -ZipPath $zipPath -Timestamp $FixedTimestamp
+        Write-ReleaseAssets -ZipPath $zipPath -ManifestText (Get-StageSnapshot -StageDir $stage) -Version '1.9.0' -Prefix $prefix
+        Assert-Equal ((@($names.Archive, $names.Digest, $names.Manifest, $names.Versioned) | Sort-Object) -join ',') ((@(Get-ChildItem -LiteralPath $outDir -File | ForEach-Object { $_.Name }) | Sort-Object) -join ',') 'the written assets'
+        Assert-Equal 'teststand-mcp-x64-v1.9.0.zip' $names.Versioned 'the versioned name'
+        Assert-Contains (Read-Utf8Text (Join-Path $outDir $names.Digest)) "  $($names.Archive)" 'the digest names the x64 archive'
+        Assert-LocalRelease -OutDir $outDir -Version '1.9.0' -Prefix $prefix
+        Assert-FailsWith { Assert-LocalRelease -OutDir $outDir -Version '1.9.0' } @('release verifier', "the plugin archive $ReleaseArchiveName is missing") -Fix @('Fix what the verifier reports')
+    }
+
+    Invoke-Case 'fault x64: a digest that does not match the x64 archive is named with the x64 names' {
+        $prefix = (Get-PluginIdentity -Architecture 'x64').assetPrefix
+        $names = Get-PluginAssetNames -Prefix $prefix -Version '1.9.0'
+        $stage = New-SmallStage
+        $outDir = New-TempDir
+        $zipPath = Join-Path $outDir $names.Archive
+        New-PluginZip -StageDir $stage -ZipPath $zipPath -Timestamp $FixedTimestamp
+        Write-ReleaseAssets -ZipPath $zipPath -ManifestText (Get-StageSnapshot -StageDir $stage) -Version '1.9.0' -Prefix $prefix
+        Write-TextFile (Join-Path $outDir $names.Digest) (('0' * 64) + "  $($names.Archive)`n")
+        Assert-FailsWith { Assert-LocalRelease -OutDir $outDir -Version '1.9.0' -Prefix $prefix } @("the plugin archive $($names.Archive) does not match the archive digest $($names.Digest)") -Fix @('Fix what the verifier reports')
+    }
+
     # ======================================================================
     #  The script itself
     # ======================================================================
@@ -1056,6 +1087,16 @@ try {
         Assert-Equal 1 $result.ExitCode 'exit code'
         Assert-ThreePartFailure $result.Stdout
         Assert-Contains $result.Stdout "'one.nine'" 'output'
+        Assert-True (-not (Test-Path -LiteralPath $outDir)) 'nothing may be created for a refused input'
+    }
+
+    Invoke-Case 'script: an unknown architecture stops it with exit code 1, naming x86 and x64, before anything is built' {
+        $outDir = Join-Path (New-TempDir) 'out'
+        $result = Invoke-BuildScript -ScriptPath $ScriptPath -TimeoutSeconds 120 -ArgumentList @('-Version', $SampleVersion, '-Commit', $SampleCommit, '-OutDir', $outDir, '-Architecture', 'arm64')
+        Assert-Equal 1 $result.ExitCode 'exit code'
+        Assert-ThreePartFailure $result.Stdout
+        Assert-Contains $result.Stdout "Unknown architecture 'arm64'" 'output'
+        Assert-Contains $result.Stdout 'x86 and x64' 'the allowed values'
         Assert-True (-not (Test-Path -LiteralPath $outDir)) 'nothing may be created for a refused input'
     }
 
