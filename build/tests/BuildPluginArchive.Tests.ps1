@@ -256,7 +256,8 @@ try {
 
     Invoke-Case 'commit time: the timestamp of a commit of this checkout, and a clear fix for one that is not' {
         $head = (Invoke-ChildProcess -FilePath 'git' -ArgumentList @('-C', $RepoRoot, 'rev-parse', 'HEAD') -TimeoutSeconds 30).Stdout.Trim()
-        Assert-True ((Get-CommitTimestamp -RepoRoot $RepoRoot -Commit $head).Year -ge 2026) 'the commit time of HEAD'
+        $seconds = (Invoke-Git -RepoRoot $RepoRoot -Arguments @('show', '-s', '--format=%ct', $head) -Why 'the expected commit time' -Fix 'run it in a checkout').Stdout.Trim()
+        Assert-Equal $seconds "$((Get-CommitTimestamp -RepoRoot $RepoRoot -Commit $head).ToUnixTimeSeconds())" 'the commit time of HEAD, as git itself prints it'
         Assert-FailsWith { Get-CommitTimestamp -RepoRoot $RepoRoot -Commit $SampleCommit } @("git show", $SampleCommit) -Fix @('git rev-parse HEAD')
     }
 
