@@ -1304,8 +1304,8 @@ Design, UX, Strategic, Parallelization. All five ran; none were skipped.
   - [x] Step 7.2: release.yml
 
 #### Wave 5
-- [ ] Slice 10: CONTRIBUTING (PR A)
-  - [ ] Step 10.1: CONTRIBUTING.md
+- [x] Slice 10: CONTRIBUTING (PR A)
+  - [x] Step 10.1: CONTRIBUTING.md
 
 #### Wave 6
 - [ ] Slice 11: README Quickstart (PR B, after the first release)
