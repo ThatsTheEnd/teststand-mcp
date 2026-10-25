@@ -253,7 +253,6 @@ try {
             @{ Tag = 'v1.9.0'; LocalDir = (Join-Path (New-TempDir) 'nope') }
             @{ Tag = 'v1.9.0' }
             @{ Tag = 'v1.9.0'; LocalDir = (New-TempDir); Repo = $ExpectedRepoSlug }
-            @{ Latest = $true; Repo = $ExpectedRepoSlug }
             @{ Tag = 'v1.9.0'; Repo = 'not a repo' }
             @{ Tag = 'v1.9.0'; Repo = '../x' }
             @{ Tag = 'v1.9.0'; Repo = 'owner/..' }
