@@ -87,9 +87,12 @@ Add-Mutation 'publishing in a dry run' 'release.yml' 'publishing is by the verif
 Add-Mutation 'the first asset check asks for the wrong stage' 'release.yml' 'checked again just before and just after' '-Stage BeforePublish' '-Stage AfterPublish'
 Add-Mutation 'the second asset check forgets the verified ids' 'release.yml' 'checked again just before and just after' '-ExpectedAssetIds $env:ASSET_IDS -ReleaseId $env:RELEASE_ID -Stage AfterPublish' '-ReleaseId $env:RELEASE_ID -Stage AfterPublish'
 Add-Mutation 'an asset check that reads the release list instead of the id' 'release.yml' 'checked again just before and just after' '& .\build\Assert-ReleaseAssetSet.ps1 -Repo $env:REPO -ExpectedAssetIds $env:ASSET_IDS -ReleaseId $env:RELEASE_ID -Stage BeforePublish' '& .\build\Assert-ReleaseAssetSet.ps1 -ReleaseJson (gh api "repos/$env:REPO/releases") -ExpectedAssetIds $env:ASSET_IDS -ReleaseId $env:RELEASE_ID -Stage BeforePublish'
-Add-Mutation 'the final fetch without the verified digest' 'release.yml' 'after publishing, releases/latest is fetched' ' -ExpectedArchiveSha256 $env:ARCHIVE_SHA256' ''
+Add-Mutation 'the final fetch without the verified digest' 'release.yml' 'after publishing, releases/latest is fetched' ' -ExpectedArchiveHashes $env:ARCHIVE_HASHES' ''
 Add-Mutation 'the final fetch also runs for a release that was not made the latest one' 'release.yml' 'after publishing, releases/latest is fetched' " && steps.recheck_after.outcome == 'success' && steps.publish.outputs.make_latest == 'true'" " && steps.recheck_after.outcome == 'success'"
-Add-Mutation 'the final fetch without the digest guard' 'release.yml' 'after publishing, releases/latest is fetched' "if (`$env:ARCHIVE_SHA256 -cnotmatch '^[0-9a-f]{64}`$') {" 'if ($false) {'
+Add-Mutation 'the final fetch without the digest guard' 'release.yml' 'after publishing, releases/latest is fetched' 'if ([string]::IsNullOrWhiteSpace($env:ARCHIVE_HASHES)) {' 'if ($false) {'
+Add-Mutation 'one architecture packaged only' 'release.yml' 'packages every architecture' 'foreach ($architecture in (Get-PluginArchitectures)) {' "foreach (`$architecture in @('x86')) {"
+Add-Mutation 'the verifier no longer told about the x64 plugin' 'release.yml' 'packages every architecture' '-Token $env:GH_TOKEN -AssetPrefixes $env:ASSET_PREFIXES' '-Token $env:GH_TOKEN'
+Add-Mutation 'the x64 fault dropped' 'release.yml' 'takes the dry-run inputs' "          - corrupt-zip-x64`n" ''
 Add-Mutation 'the draft creation inlined again' 'release.yml' 'the draft is created by the script' '& .\build\New-ReleaseDraft.ps1' 'gh release create $env:RELEASE_TAG --repo $env:REPO --draft; & .\build\New-ReleaseDraft.ps1'
 Add-Mutation 'a dry run decided by the shape of the tag when the draft is created' 'release.yml' 'the draft is created by the script' "`$dryRun = (`$env:DRY_RUN -eq 'true')" "`$dryRun = (`$env:RELEASE_TAG -like '*-rehearsal')"
 Add-Mutation 'the cleanup is not always()' 'release.yml' 'always() step' "if: always() && env.DRY_RUN == 'true' && needs.package.outputs.rehearsal == 'true'" "if: env.DRY_RUN == 'true' && needs.package.outputs.rehearsal == 'true'"
@@ -103,9 +106,9 @@ Add-Mutation 'own-downloads uploaded under another name' 'release.yml' 'own-down
 Add-Mutation 'the asset artifact kept for 90 days' 'release.yml' 'short-lived artifact' 'retention-days: 1' 'retention-days: 90'
 Add-Mutation 'the release job checks out something else than the tagged commit' 'release.yml' 'short-lived artifact' 'ref: ${{ github.sha }}' 'ref: main'
 Add-Mutation 'the asset upload glob is no longer the contract prefix' 'release.yml' 'short-lived artifact' '/teststand-mcp*' '/release-assets*'
-Add-Mutation 'the fault injection runs outside a dry run' 'release.yml' 'injected fault' "if: env.DRY_RUN == 'true' && env.INJECT_FAULT == 'corrupt-zip'" "if: env.INJECT_FAULT == 'corrupt-zip'"
+Add-Mutation 'the fault injection runs outside a dry run' 'release.yml' 'injected fault' "if: env.DRY_RUN == 'true' && (env.INJECT_FAULT" "if: (env.INJECT_FAULT"
 Add-Mutation 'the verify step without a timeout' 'release.yml' 'has its own timeout' "        timeout-minutes: 30`n        run: |`n          `$rehearsal = (`$env:DRY_RUN -eq 'true')`n          & .\build\Assert-PublishedRelease.ps1 -Repo" "        run: |`n          `$rehearsal = (`$env:DRY_RUN -eq 'true')`n          & .\build\Assert-PublishedRelease.ps1 -Repo"
-Add-Mutation 'a typo in a run: block' 'release.yml' 'valid PowerShell' "if (`$env:ARCHIVE_SHA256 -cnotmatch '^[0-9a-f]{64}`$') {" "if (`$env:ARCHIVE_SHA256 -cnotmatch '^[0-9a-f]{64}`$' {"
+Add-Mutation 'a typo in a run: block' 'release.yml' 'valid PowerShell' 'if ([string]::IsNullOrWhiteSpace($env:ARCHIVE_HASHES)) {' 'if ([string]::IsNullOrWhiteSpace($env:ARCHIVE_HASHES) {'
 Add-Mutation 'a build script called with a parameter it does not have' 'release.yml' 'takes every parameter' '-ReleaseId $env:RELEASE_ID' '-ReleaseIdentifier $env:RELEASE_ID'
 Add-Mutation 'a build script that does not exist' 'release.yml' 'takes every parameter' '& .\build\Publish-Release.ps1' '& .\build\Publish-Everything.ps1'
 Add-Mutation 'the workflow bound to one repository' 'release.yml' 'nothing is bound to one repository' 'REPO: ${{ github.repository }}' 'REPO: Zuehlke/teststand-mcp'
@@ -115,7 +118,7 @@ Add-Mutation 'the token in workflow-level env' 'release.yml' 'verified with the 
 # --- ci.yml --------------------------------------------------------------------------------------------
 Add-Mutation 'ci: an action pinned by a movable tag' 'ci.yml' 'ci.yml : every action is pinned' $CheckoutPin 'actions/checkout@v7'
 Add-Mutation 'ci: a write token' 'ci.yml' 'ci.yml: read-only token' "    permissions:`n      contents: read`n    steps:" "    permissions:`n      contents: write`n    steps:"
-Add-Mutation 'ci: a job timeout shorter than the sum of its capped steps' 'ci.yml' 'job outlives the SUM' 'timeout-minutes: 90' 'timeout-minutes: 40'
+Add-Mutation 'ci: a job timeout shorter than the sum of its capped steps' 'ci.yml' 'job outlives the SUM' 'timeout-minutes: 100' 'timeout-minutes: 40'
 Add-Mutation 'ci: no per-script timeout' 'ci.yml' 'a hanging script is stopped' ' -TimeoutSeconds 600' ''
 Add-Mutation 'ci: no total budget for the script tests' 'ci.yml' 'a hanging script is stopped' ' -TotalSeconds 1500' ''
 Add-Mutation 'ci: a script test step cap shorter than its own budget' 'ci.yml' 'a hanging script is stopped' "        timeout-minutes: 30`n        run: |`n          & .\build\Invoke-ScriptTests.ps1" "        timeout-minutes: 20`n        run: |`n          & .\build\Invoke-ScriptTests.ps1"

@@ -143,6 +143,9 @@ gh workflow run release.yml --ref main -f tag=v1.9.2-rehearsal -f dry_run=true -
 In the rehearsal of 2026-10-25 this failed at the listing check (the versioned archive was 76 MB, the plugin
 archive 15 bytes) and the draft was deleted.
 
+A tag releases both plugins, the x86 `teststand-mcp` and the x64 `teststand-mcp-x64`. `inject_fault=corrupt-zip-x64`
+corrupts the x64 zip instead, and must fail the same way.
+
 ### Full end-to-end test in a fork
 
 A dry run cannot publish, so it cannot test the real release, the `releases/latest` check or an install.
