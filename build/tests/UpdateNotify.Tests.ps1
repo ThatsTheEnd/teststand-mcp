@@ -104,6 +104,18 @@ try {
         Assert-Equal '/ThatsTheEnd/teststand-mcp/releases/latest' $fixture.Server.Stats.RequestPath 'request path'
     }
 
+    Invoke-Case 'state: without CLAUDE_PLUGIN_DATA each plugin keeps its cache in LOCALAPPDATA\<its own name>' {
+        $localAppData = New-TempDir
+        foreach ($name in @((Get-PluginIdentity -Architecture 'x86').name, (Get-PluginIdentity -Architecture 'x64').name)) {
+            $fixture = New-NotifyFixture -Name $name -NoServer
+            $dir = Use-Environment @{ CLAUDE_PLUGIN_ROOT = $fixture.PluginRoot; TESTSTAND_MCP_STATE_DIR = $null; CLAUDE_PLUGIN_DATA = $null; LOCALAPPDATA = $localAppData } {
+                . (Join-Path $HooksDir 'hook-common.ps1')
+                Get-HookStateDir
+            }
+            Assert-Equal (Join-Path $localAppData $name) $dir "state folder of $name"
+        }
+    }
+
     Invoke-ServerCase 'notify: the plugin name in the update command comes from plugin.json' {
         $fixture = New-NotifyFixture -Name 'some-other-plugin'
         Assert-Contains (Invoke-Notify $fixture).Message '2. claude plugin update some-other-plugin' 'step 2'

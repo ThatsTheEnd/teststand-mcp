@@ -283,42 +283,12 @@ public class SequenceEditorService : ISequenceEditorService
 
     // ── Path Resolution ───────────────────────────────────────────────────────
 
+    // Same-bitness only, like the other NI tools: an editor from the other tree would open the file
+    // against a different install than the one the server drives (see TestStandInstallLocator).
     private static string? FindSeqEditPath()
     {
-        // 1. Check TESTSTANDBIN environment variable
-        var tsBin = Environment.GetEnvironmentVariable("TESTSTANDBIN");
-        if (!string.IsNullOrEmpty(tsBin))
-        {
-            var seqEdit = Path.Combine(tsBin, "SeqEdit.exe");
-            if (File.Exists(seqEdit)) return seqEdit;
-        }
-
-        // 2. Check TESTSTANDPUBLIC (go up to installation root, then Bin)
-        var tsPublic = Environment.GetEnvironmentVariable("TESTSTANDPUBLIC");
-        if (!string.IsNullOrEmpty(tsPublic))
-        {
-            var root = Path.GetDirectoryName(tsPublic);
-            if (root != null)
-            {
-                var seqEdit = Path.Combine(root, "Bin", "SeqEdit.exe");
-                if (File.Exists(seqEdit)) return seqEdit;
-            }
-        }
-
-        // 3. Search the standard NI installation directories, newest release first. Delegated to
-        //    TestStandInstallLocator: iterating SpecialFolder.ProgramFiles + ProgramFilesX86 here
-        //    would scan the SAME directory twice (WOW64 redirects both to "…(x86)" in this 32-bit
-        //    host) and could never find a 64-bit install.
-        foreach (var root in TestStandInstallLocator.GetProgramFilesRoots())
-        {
-            foreach (var bin in TestStandInstallLocator.EnumerateTestStandBins(root))
-            {
-                var seqEdit = Path.Combine(bin, "SeqEdit.exe");
-                if (File.Exists(seqEdit)) return seqEdit;
-            }
-        }
-
-        return null;
+        var (bin, _) = TestStandInstallLocator.Resolve("SeqEdit.exe", engineBinDir: null);
+        return bin.Length > 0 ? Path.Combine(bin, "SeqEdit.exe") : null;
     }
 
     /// <summary>Releases the OS handles held by a set of <see cref="Process"/> objects.</summary>

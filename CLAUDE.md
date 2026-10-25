@@ -48,6 +48,7 @@ The skill states each rule for a plugin user: no dates, no test IDs, no class na
 - Live thread context (`T29`): the access path is `Thread.GetSequenceContext(frame).AsPropertyObject()`, the ThisContext tree. No active frame raises `InvalidOperationException`, a bad `call_stack_index` `ArgumentOutOfRangeException`, an unknown execution `KeyNotFoundException`.
 - Validation: `validate_sequence_plan` `T10`, `T31`; `audit_sequence_references` `T28` (pure logic in `ReferenceAuditor`); since 2026-07 the plan validator also checks `Parameters.X` when a `parameters` list is passed. The Select/Case structure is enforced by `E_CASE_WITHOUT_SELECT` / `E_UNCLOSED_BLOCK`; flow-step configurability was established by a property-tree audit.
 - Analyzer measured 2026-07-29: ~511 s on the 30-sequence `TFW_MDC_com_Python.seq` once Python 3.11 and LabVIEW were installed and running, versus seconds before when every load failed instantly (a 360 s poll budget looked exactly like a hang). The counting rules are `NI_SequenceFileCount` / `NI_SequenceCount` / `NI_StepCount`. The old 120 s timeout was dead code: `proc.StandardOutput.ReadToEnd()` blocks until the child closes the pipe, so `WaitForExit(120_000)` afterwards always returned true; the pipes now drain via `ReadToEndAsync` and `WaitForExit` enforces `timeout_seconds` (default 900), killing the process tree.
+- Both bitnesses (2026-10-25, plan `plans/dual-bitness-plugins.md`): the unchanged code built and ran for x64 in a spike (connect, Single Pass `Passed`, diff, analyzer against 64-bit TestStand); after the analyzer template fix the suite was 660/660 on each engine. That fix (`cab876a`): the built-in analyzer project header needs `buildversion`, or the engine rejects it as "not a property object file" (-17100) and `AnalyzerApp.exe` blocks on a modal dialog. Only a station without a saved `MyAnalyzerProject.tsaproj` uses the template, which is why it showed on 32-bit TestStand 2026 only. Measured through the engine API on both bitnesses, no dialog. Station record: `docs/validation/dual-bitness.md`.
 - Analyzer async (2026-07-09): `AnalyzerJob` / `StartAnalyzerJob` / `GetAnalysisStatusAsync` in `TestStandService`, jobs kept in `_analyzerJobs` ~10 min, mirroring the `load_module_prototype` async-job infrastructure. No isolated worker is needed: the fault-prone module loads already happen inside `AnalyzerApp.exe`, which a native `.lvlibp` fault kills without taking the server down. Verified by `T14.AnalyzeDetailed_Async_ReturnsJobThenSameResultAsSync`.
 
 ---
@@ -153,7 +154,8 @@ Never cut: validation at trust boundaries, error handling that prevents data los
   `taskkill //F //IM TestStandMCP.exe` + `dotnet build --configuration Debug --framework net8.0-windows -p:Platform=x86`
   (Target framework is **net8.0-windows / x86**. The TestStand engine requires the host's
   runtimeconfig to declare `Microsoft.WindowsDesktop.App` + `Microsoft.AspNetCore.App` — both
-  are wired via `FrameworkReference` in the .csproj. Output: `bin\x86\Debug\net8.0-windows\`.)
+  are wired via `FrameworkReference` in the .csproj. Output: `bin\x86\Debug\net8.0-windows\`.
+  For 64-bit TestStand build with `-p:Platform=x64`; output `bin\x64\Debug\net8.0-windows\`.)
 - **New tool NAMES, enum values and optional params need a FRESH MCP session.** The client caches
   the tool catalog and argument schema at session start and rejects the new values with
   `invalid_enum_value` until then. This applies to every batch below.

@@ -368,7 +368,7 @@ $ExpectedWorkflows = @('ci.yml', 'pages.yml', 'release.yml')
         foreach ($input in @('tag', 'dry_run', 'inject_fault')) { Assert-True ($on -cmatch "(?m)^      ${input}:") "workflow_dispatch has no input $input" }
         Assert-True ($on -cmatch '(?s)dry_run:.*?type: boolean') 'dry_run must be a boolean'
         Assert-True ($on -cmatch '(?s)inject_fault:.*?type: choice') 'inject_fault must be a choice'
-        Assert-True ($on -cmatch '(?s)inject_fault:.*?options:\s*\n\s+- none\s*\n\s+- corrupt-zip') 'inject_fault offers none and corrupt-zip'
+        Assert-True ($on -cmatch '(?s)inject_fault:.*?options:\s*\n\s+- none\s*\n\s+- corrupt-zip\s*\n\s+- corrupt-zip-x64\s*\n') 'inject_fault offers none, corrupt-zip and corrupt-zip-x64'
         Assert-True ($on -cmatch '(?s)      tag:.*?required: true') 'the rehearsal tag is required'
     }
 
@@ -406,6 +406,18 @@ $ExpectedWorkflows = @('ci.yml', 'pages.yml', 'release.yml')
             Assert-True ($packageJob -cmatch "(?m)^      ${output}:\s*\`$\{\{ steps\.gate\.outputs\.${output} \}\}") "the package job passes the gate output $output on"
         }
         Assert-True ($releaseJob -cmatch '(?m)^      RELEASE_TAG:\s*\$\{\{ needs\.package\.outputs\.tag \}\}') 'the release job takes the tag the gate validated'
+    }
+
+    Invoke-Case 'release.yml: one tag packages every architecture and the release job checks the assets of every plugin' {
+        $package = Get-PackageStep '(?m)^\s+id: package\s*$' 'package'
+        Assert-Contains $package.Text 'foreach ($architecture in (Get-PluginArchitectures))' 'every architecture of the identity table is built'
+        Assert-Contains $package.Text '-Architecture $architecture' 'each build names its architecture'
+        Assert-Contains $package.Text 'Add-GitHubOutput -Name ''asset_prefixes'' -Value ((Get-PluginAssetPrefixes) -join '','')' 'the plugins come from the identity table'
+        Assert-True ($packageJob -cmatch '(?m)^      asset_prefixes:\s*\$\{\{ steps\.package\.outputs\.asset_prefixes \}\}') 'the package job passes the plugins on'
+        Assert-True ($releaseJob -cmatch '(?m)^      ASSET_PREFIXES:\s*\$\{\{ needs\.package\.outputs\.asset_prefixes \}\}') 'the release job takes them'
+        foreach ($id in @('create', 'verify', 'latest')) {
+            Assert-Contains (Get-ReleaseStep "(?m)^\s+id: $id\s*$" $id).Text '-AssetPrefixes $env:ASSET_PREFIXES' "the $id step names every plugin"
+        }
     }
 
     Invoke-Case 'release.yml: the assets travel as a short-lived artifact and the release job starts from a fresh checkout of the tagged commit' {
@@ -545,13 +557,13 @@ $ExpectedWorkflows = @('ci.yml', 'pages.yml', 'release.yml')
         Assert-Contains $condition "steps.recheck_after.outcome == 'success'" 'only when the live asset set is the verified one'
         Assert-Contains $condition "env.DRY_RUN != 'true'" 'never in a dry run'
         Assert-Contains $condition "steps.publish.outputs.make_latest == 'true'" 'only for a release that became the latest one (a lower version is published with make_latest=false and latest rightly serves another release)'
-        Assert-True ($latest.Text -cmatch 'ARCHIVE_SHA256:\s*\$\{\{ steps\.verify\.outputs\.archive_sha256 \}\}') 'the expected hash is the verifier output'
+        Assert-True ($latest.Text -cmatch 'ARCHIVE_HASHES:\s*\$\{\{ steps\.verify\.outputs\.archive_hashes \}\}') 'the expected hashes are the verifier output'
         Assert-Contains $latest.Text '-Latest' 'the public latest download'
-        Assert-Contains $latest.Text '-ExpectedArchiveSha256 $env:ARCHIVE_SHA256' 'the verified archive digest is passed'
+        Assert-Contains $latest.Text '-ExpectedArchiveHashes $env:ARCHIVE_HASHES' 'the verified archive digests are passed'
         Assert-Contains $latest.Text '-Repo $env:REPO' 'the repository of the run'
         Assert-Contains $latest.Text '-OwnDownloadsPath $env:OWN_DOWNLOADS_FILE' 'the public fetch is recorded'
-        Assert-Contains $latest.Text '$env:ARCHIVE_SHA256 -cnotmatch ''^[0-9a-f]{64}$''' 'an unset or malformed digest stops the step (case-sensitively) before the weaker check could run'
-        Assert-True ($latest.Text.IndexOf('-cnotmatch', [StringComparison]::Ordinal) -lt $latest.Text.IndexOf('Assert-PublishedRelease.ps1', [StringComparison]::Ordinal)) 'the guard comes before the verifier call'
+        Assert-Contains $latest.Text '[string]::IsNullOrWhiteSpace($env:ARCHIVE_HASHES)' 'an unset output stops the step before the weaker check could run'
+        Assert-True ($latest.Text.IndexOf('IsNullOrWhiteSpace', [StringComparison]::Ordinal) -lt $latest.Text.IndexOf('Assert-PublishedRelease.ps1', [StringComparison]::Ordinal)) 'the guard comes before the verifier call'
     }
 
     Invoke-Case 'release.yml: the injected fault corrupts the uploaded zip after the upload, for a dry run only' {
@@ -559,8 +571,10 @@ $ExpectedWorkflows = @('ci.yml', 'pages.yml', 'release.yml')
         $condition = Get-StepField $inject 'if'
         Assert-Contains $condition "env.DRY_RUN == 'true'" 'only in a dry run'
         Assert-Contains $condition "env.INJECT_FAULT == 'corrupt-zip'" 'only when asked'
+        Assert-Contains $condition "env.INJECT_FAULT == 'corrupt-zip-x64'" 'only when asked (x64)'
         Assert-Contains $inject.Text 'gh release upload' 'the zip asset is replaced on the draft'
         Assert-Contains $inject.Text '$ReleaseArchiveName' 'the asset name comes from the release contract module'
+        Assert-Contains $inject.Text "(Get-PluginIdentity -Architecture 'x64').assetPrefix" 'the x64 asset name comes from the identity table'
     }
 
     Invoke-Case 'release.yml: a dry run deletes the draft it created (by id) and its tag in an always() step that can never touch a real release' {

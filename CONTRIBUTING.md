@@ -37,10 +37,10 @@ Two things to know about the push itself:
 
 What the workflow does, in order:
 
-1. Job `package` (read-only token): the tag gate, then `build\Build-PluginArchive.ps1`, which builds the exe,
-   stages the plugin, smoke-tests it and zips it. The four assets are kept as a workflow artifact. If this
-   job fails, nothing is created, not even a draft.
-2. Job `release` (write token): checks that the artifact holds exactly the four assets, deletes every
+1. Job `package` (read-only token): the tag gate, then `build\Build-PluginArchive.ps1` once per architecture
+   (x86, then x64), each of which builds the exe, stages the plugin, smoke-tests it and zips it. Both plugins'
+   assets are kept as one workflow artifact. If this job fails, nothing is created, not even a draft.
+2. Job `release` (write token): checks that the artifact holds exactly each plugin's four assets, deletes every
    leftover DRAFT of the same tag (from an earlier failed run), and creates a DRAFT release with them
    (`build\New-ReleaseDraft.ps1`). A published release that already carries the tag stops the run.
 3. Verifies the draft through the API, downloading the assets the way a user would
@@ -61,8 +61,12 @@ does not collide with the first. If a PUBLISHED release already carries the tag,
 
 That tag is spent. Fix forward with the next patch version.
 
-The four assets are `teststand-mcp.zip` (the file users get from `releases/latest/download/`),
+One tag releases both plugins: `teststand-mcp` for 32-bit TestStand and `teststand-mcp-x64` for 64-bit
+TestStand (the names come from `build\PluginIdentity.psm1`). Each plugin has four assets, eight in all.
+The x86 plugin's are `teststand-mcp.zip` (the file users get from `releases/latest/download/`),
 `teststand-mcp-vX.Y.Z.zip` (the same bytes), `teststand-mcp.sha256` and `teststand-mcp.manifest.sha256`.
+The x64 plugin's are the same names with `teststand-mcp-x64` in place of `teststand-mcp`. A missing or
+damaged asset of either plugin stops the whole release.
 
 ### A tag is rejected
 
@@ -108,6 +112,9 @@ If the verification failed, there is nothing to roll back: only a draft exists. 
 (Re-run failed jobs). To get rid of it without a re-run, delete the draft (Releases page, or
 `gh release delete vX.Y.Z`).
 
+A release carries both plugins, so a rollback always moves both: a bad x64 archive is rolled back
+by the same delete or fix-forward as a bad x86 one.
+
 If a bad release went live, there are two ways out. The scripts say the same:
 
 > so releases/latest falls back to the previous release (safe only once an earlier workflow-built release exists), or fix forward by releasing the next patch version (see CONTRIBUTING).
@@ -142,6 +149,9 @@ gh workflow run release.yml --ref main -f tag=v1.9.2-rehearsal -f dry_run=true -
 
 In the rehearsal of 2026-10-25 this failed at the listing check (the versioned archive was 76 MB, the plugin
 archive 15 bytes) and the draft was deleted.
+
+A tag releases both plugins, the x86 `teststand-mcp` and the x64 `teststand-mcp-x64`. `inject_fault=corrupt-zip-x64`
+corrupts the x64 zip instead, and must fail the same way.
 
 ### Full end-to-end test in a fork
 
@@ -187,12 +197,18 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File build\Invoke-ScriptTests
 | Script | Parameters | What it does |
 |---|---|---|
 | `build\Invoke-ScriptTests.ps1` | `-Only`, `-List`, `-PwshPath`, `-TimeoutSeconds`, `-TotalSeconds` | Runs every `build\tests\*.Tests.ps1` and `build\Test-SkillSources.ps1`, once per PowerShell host. `-Only` runs the named scripts, `-List` prints what would run, `-PwshPath` names the PowerShell 7 executable, `-TimeoutSeconds` limits one script under one host (default 1200). `-TotalSeconds` is a budget for the whole run (default 0, none): no script starts once less than `-TimeoutSeconds` of it is left, and the scripts left out count as failed. A script that prints no `PASS` line ran no case and fails too. |
-| `build\Build-PluginArchive.ps1` | `-Version`, `-Tag`, `-Commit`, `-OutDir`, `-Layout` | Builds the plugin archive. `-Version` is required: `X.Y.Z`, or `0.0.0-ci` for a local build. `-Tag` defaults to `v<Version>`, `-Commit` to `git rev-parse HEAD`, `-OutDir` to `artifacts` (git ignores it). `-Layout` is `folder` (default), `single-file` or `framework-dependent`. |
+| `build\Build-PluginArchive.ps1` | `-Version`, `-Tag`, `-Commit`, `-OutDir`, `-Layout`, `-Architecture` | Builds the plugin archive. `-Version` is required: `X.Y.Z`, or `0.0.0-ci` for a local build. `-Tag` defaults to `v<Version>`, `-Commit` to `git rev-parse HEAD`, `-OutDir` to `artifacts` (git ignores it). `-Layout` is `folder` (default), `single-file` or `framework-dependent`. `-Architecture` is `x86` (default, the `teststand-mcp` plugin) or `x64` (`teststand-mcp-x64`). |
 
 A local build, the same way the pull-request check does it:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File build\Build-PluginArchive.ps1 -Version 0.0.0-ci -OutDir artifacts\local
+```
+
+The x64 plugin, into its own folder (as the workflows do it, one folder per architecture):
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File build\Build-PluginArchive.ps1 -Version 0.0.0-ci -Architecture x64 -OutDir artifacts\local-x64
 ```
 
 Use a clean `-OutDir`: assets of another version in it are not removed.

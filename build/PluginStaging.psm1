@@ -3,7 +3,7 @@
 #  ONE table (Get-StagingTable) describes every file and directory of the archive, and that same
 #  table drives BOTH the staging (what is copied or generated) and the assertions (what must be
 #  there, what may not be, what must equal its source). Generated outputs (the stamped plugin.json,
-#  VERSION.txt, the plugin agents, bin/CLAUDE.md) are rows of the table too, with a Generated column
+#  hooks/hooks.json, VERSION.txt, the plugin agents, bin/CLAUDE.md) are rows of the table too, with a Generated column
 #  naming their generator; each generator has a writer and its own assertion ($script:Generators).
 #
 #  A row (New-StagingEntry):
@@ -48,6 +48,7 @@ $script:Paths = @{
     VersionTxt   = 'VERSION.txt'
     Agents       = 'agents'
     Hooks        = 'hooks'
+    HooksJson    = 'hooks/hooks.json'
     Bin          = 'bin'
     BinClaudeMd  = 'bin/CLAUDE.md'
     BinScripts   = 'bin/scripts'
@@ -172,6 +173,9 @@ function Get-StagingTable {
         (New-StagingEntry -Path $p.Hooks -Exact $script:HookFiles `
             -Why 'hooks/ is what Claude Code runs on the user''s machine on every session start and tool call. It must hold exactly the runtime hook files, never a test, a build script or a leftover.' `
             -Fix 'Remove the unexpected file from plugin/hooks, or add a new runtime hook to $script:HookFiles in build\PluginStaging.psm1; restore a missing one with git checkout -- plugin/hooks.'),
+        (New-StagingEntry -Path $p.HooksJson -Kind File -Generated 'HooksJson' `
+            -Why 'Claude Code starts the allow hook only for the tool names in its matcher, and those carry this plugin''s own prefix.' `
+            -Fix 'Regenerate plugin/hooks/hooks.json with build\New-HooksJson.ps1; the staged copy is written by New-HooksJsonText in build\PluginStaging.psm1.'),
         (New-StagingEntry -Path $p.Agents -Generated 'Agents' -Exact $sourceAgents `
             -Why 'The plugin ships one converted agent per source agent (spec AC-5); a different number means an agent was dropped or one was added without a source.' `
             -Fix 'Fix the source folder .claude/agents (the plugin agents are generated from it by Write-PluginAgents in build\PluginStaging.psm1), never agents/.'),
@@ -201,7 +205,8 @@ function Get-EntrySourceFile {
 }
 
 # ----------------------------------------------------------------------------
-#  Generator: plugin.json (the committed text with ONLY the placeholder's value replaced)
+#  Generator: plugin.json (the committed text with ONLY the placeholder's value replaced and, for a
+#  plugin other than the committed x86 one, its name, displayName and description)
 # ----------------------------------------------------------------------------
 # A file's bytes read as ISO-8859-1: one char per byte, so a text edit can never change another byte.
 $script:ByteTextEncoding = [Text.Encoding]::GetEncoding(28591)
@@ -226,37 +231,111 @@ function Edit-TextRange {
     return $Text.Remove($Index, $Length).Insert($Index, $Replacement)
 }
 
-function Write-StampedManifest {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$SourcePath, [Parameter(Mandatory)][string]$DestPath, [Parameter(Mandatory)][string]$Version)
-    $text = $script:ByteTextEncoding.GetString([IO.File]::ReadAllBytes($SourcePath))
-    $placeholder = Find-VersionPlaceholder -Text $text -Path $SourcePath
-    $stamped = $placeholder.Value -replace '"0\.0\.0"\z', ('"' + $Version + '"')
-    [void](New-Item -ItemType Directory -Path (Split-Path -Parent $DestPath) -Force)
-    [IO.File]::WriteAllBytes($DestPath, $script:ByteTextEncoding.GetBytes((Edit-TextRange $text $placeholder.Index $placeholder.Length $stamped)))
+$script:IdentityManifestKeys = @('name', 'displayName', 'description')
+
+# The single "key": "value" string member of the manifest text; fails when there is none or more than one.
+function Find-ManifestMember {
+    param([string]$Text, [string]$Path, [string]$Key, [string]$Value)
+    $found = @([regex]::Matches($Text, '"' + $Key + '"\s*:\s*"' + [regex]::Escape($Value) + '"'))
+    if ($found.Count -ne 1) {
+        Write-BuildFailure -What "$Path holds $($found.Count) occurrences of `"$Key`": `"$Value`" instead of exactly one." `
+            -Why "The build stamps the $Key of the plugin it packages into this member; without exactly one, the stamped manifest would not name that plugin." `
+            -Fix 'Restore the committed manifest: git checkout -- plugin/.claude-plugin/plugin.json (it holds the x86 identity of build\PluginIdentity.psm1).'
+    }
+    return $found[0]
 }
 
-# The staged manifest equals the source byte for byte once its version is put back.
+# The source text with the version placeholder and, where $Identity differs from the committed x86
+# identity, the identity members replaced. Every replaced member must occur exactly once.
+function New-StampedManifestText {
+    param([string]$SourcePath, [string]$Version, $Identity)
+    $text = $script:ByteTextEncoding.GetString([IO.File]::ReadAllBytes($SourcePath))
+    $placeholder = Find-VersionPlaceholder -Text $text -Path $SourcePath
+    $text = Edit-TextRange $text $placeholder.Index $placeholder.Length ($placeholder.Value -replace '"0\.0\.0"\z', ('"' + $Version + '"'))
+    if ($null -eq $Identity) { return $text }
+    $committed = (Read-Utf8Text $SourcePath) | ConvertFrom-Json
+    foreach ($key in $script:IdentityManifestKeys) {
+        $from = [string]$committed.$key
+        $to = [string]$Identity.$key
+        if ([string]::Equals($from, $to, [StringComparison]::Ordinal)) { continue }
+        $member = Find-ManifestMember $text $SourcePath $key $from
+        $text = Edit-TextRange $text $member.Index $member.Length ('"' + $key + '": "' + $to + '"')
+    }
+    return $text
+}
+
+function Write-StampedManifest {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$SourcePath, [Parameter(Mandatory)][string]$DestPath, [Parameter(Mandatory)][string]$Version, $Identity = $null)
+    $text = New-StampedManifestText $SourcePath $Version $Identity
+    [void](New-Item -ItemType Directory -Path (Split-Path -Parent $DestPath) -Force)
+    [IO.File]::WriteAllBytes($DestPath, $script:ByteTextEncoding.GetBytes($text))
+}
+
+# The staged manifest equals the source byte for byte once stamped: the version and, for the x64
+# plugin, its identity members are the only change.
 function Assert-StampedManifest {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$SourcePath, [Parameter(Mandatory)][string]$StagedPath, [Parameter(Mandatory)][string]$Version)
-    $source = $script:ByteTextEncoding.GetString([IO.File]::ReadAllBytes($SourcePath))
+    param([Parameter(Mandatory)][string]$SourcePath, [Parameter(Mandatory)][string]$StagedPath, [Parameter(Mandatory)][string]$Version, $Identity = $null)
+    $expected = New-StampedManifestText $SourcePath $Version $Identity
     $staged = $script:ByteTextEncoding.GetString([IO.File]::ReadAllBytes($StagedPath))
-    $sourceToken = (Find-VersionPlaceholder -Text $source -Path $SourcePath).Value
-    $stagedTokens = @([regex]::Matches($staged, '"version"\s*:\s*"' + [regex]::Escape($Version) + '"'))
-    $restored = $null
-    if ($stagedTokens.Count -eq 1) { $restored = Edit-TextRange $staged $stagedTokens[0].Index $stagedTokens[0].Length $sourceToken }
-    if ($null -eq $restored -or -not [string]::Equals($restored, $source, [StringComparison]::Ordinal)) {
-        Write-BuildFailure -What "The staged plugin.json is not the source with only `"version`": `"$Version`" changed (it holds $($stagedTokens.Count) such version entries)." `
+    if (-not [string]::Equals($staged, $expected, [StringComparison]::Ordinal)) {
+        Write-BuildFailure -What "The staged plugin.json is not the source with only `"version`": `"$Version`" and the plugin identity stamped." `
             -Why 'Claude Code takes the plugin version from plugin.json; a manifest that differs from the reviewed source in anything else would ship an unreviewed change.' `
             -Fix 'Package again with build\Build-PluginArchive.ps1; the manifest is stamped from plugin/.claude-plugin/plugin.json and must not be edited in the staged tree.'
     }
 }
 
 # ----------------------------------------------------------------------------
+#  Generator: hooks/hooks.json (the committed x86 file with the plugin's own tool prefix)
+# ----------------------------------------------------------------------------
+# build\New-HooksJson.ps1 writes the committed file for the x86 prefix (HooksJson.Tests pins it); every
+# other plugin gets the same file with its own prefix, so a matcher never names the other plugin's tools.
+function New-HooksJsonText {
+    param([string]$RepoRoot, $Identity)
+    $committed = Read-Utf8Text (Join-Path $RepoRoot 'plugin\hooks\hooks.json')
+    $x86Prefix = (Get-PluginIdentity -PluginJsonPath (Get-PluginSourcePath $RepoRoot).PluginJson -McpJsonPath (Get-PluginSourcePath $RepoRoot).McpJson).pluginToolPrefix
+    return $committed.Replace($x86Prefix, $Identity.pluginToolPrefix)
+}
+
+function Assert-HooksJsonGenerated {
+    param([string]$Path, [string]$RepoRoot, $Identity)
+    if (-not [string]::Equals((Read-Utf8Text $Path), (New-HooksJsonText $RepoRoot $Identity), [StringComparison]::Ordinal)) {
+        Write-BuildFailure -What "hooks/hooks.json is not plugin/hooks/hooks.json with the tool prefix $($Identity.pluginToolPrefix)." `
+            -Why 'Its matcher decides which tool calls start the allow hook; a matcher for another prefix would leave this plugin''s read-only tools prompting.' `
+            -Fix 'Never edit the staged hooks.json; regenerate plugin/hooks/hooks.json with build\New-HooksJson.ps1 and package again.'
+    }
+}
+
+# No staged text file names the other plugin: neither its tool prefix nor (when it is not part of this
+# plugin's own name) its name. The bin/ binaries are not text and are the same for both plugins' names.
+$script:IdentityScanExtensions = @('.json', '.md', '.ps1', '.psm1', '.py', '.html', '.bat', '.txt')
+function Assert-NoForeignIdentity {
+    param([string]$StageDir, $Context)
+    $own = $Context.Identity
+    $foreign = @(foreach ($architecture in (Get-PluginArchitectures)) {
+        if ($architecture -ceq $own.architecture) { continue }
+        $other = Get-PluginIdentity -PluginJsonPath $Context.Sources.PluginJson -McpJsonPath $Context.Sources.McpJson -Architecture $architecture
+        $other.pluginToolPrefix
+        if ($own.name.IndexOf($other.name, [StringComparison]::Ordinal) -lt 0) { $other.name }
+    })
+    foreach ($name in (Get-RelativeFileList $StageDir)) {
+        if ($script:IdentityScanExtensions -notcontains [IO.Path]::GetExtension($name).ToLowerInvariant()) { continue }
+        $text = Read-Utf8Text (Join-Path $StageDir $name)
+        foreach ($term in $foreign) {
+            if ($text.IndexOf($term, [StringComparison]::Ordinal) -ge 0) {
+                Write-BuildFailure -What "$name names '$term', which belongs to another plugin than $($own.name)." `
+                    -Why 'Each archive is one plugin; a reference to the other one would allow, call or name tools this installation does not have.' `
+                    -Fix 'Derive the name from the installed plugin.json (hooks) or from build\PluginIdentity.psm1 (staging) instead of spelling it.'
+            }
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
 #  Generator: VERSION.txt (key: value lines, the format src/VersionInfo.cs reads)
 # ----------------------------------------------------------------------------
-$script:VersionTxtKeys = @('tag', 'version', 'commit', 'built', 'run')
+$script:VersionTxtKeys = @('tag', 'version', 'commit', 'arch', 'built', 'run')
 
 function Write-VersionTxt {
     [CmdletBinding()]
@@ -279,11 +358,11 @@ function Assert-VersionTxt {
             -Why '--version prints these lines, and the exe reports "release metadata incomplete" when the tag is missing.' `
             -Fix 'Never edit VERSION.txt; package again with build\Build-PluginArchive.ps1, which writes it with Write-VersionTxt (build\PluginStaging.psm1).'
     }
-    foreach ($key in @('tag', 'version', 'commit')) {
+    foreach ($key in @('tag', 'version', 'commit', 'arch')) {
         if (-not [string]::Equals($values[$key], $Expected[$key], [StringComparison]::Ordinal)) {
             Write-BuildFailure -What "VERSION.txt says $key '$($values[$key])' but '$($Expected[$key])' was requested." `
                 -Why 'The archive would name a different release than the one being built.' `
-                -Fix 'Package again with build\Build-PluginArchive.ps1 and the -Version, -Tag and -Commit you mean.'
+                -Fix 'Package again with build\Build-PluginArchive.ps1 and the -Version, -Tag, -Commit and -Architecture you mean.'
         }
     }
 }
@@ -371,8 +450,12 @@ function Assert-ClaudeMdGenerated {
 # ----------------------------------------------------------------------------
 $script:Generators = @{
     Manifest = @{
-        Write  = { param($Entry, $Context) Write-StampedManifest -SourcePath $Context.Sources.PluginJson -DestPath (Join-Path $Context.StageDir $Entry.Path) -Version $Context.Release.version }
-        Assert = { param($Entry, $Context) Assert-StampedManifest -SourcePath $Context.Sources.PluginJson -StagedPath (Join-Path $Context.StageDir $Entry.Path) -Version $Context.Release.version }
+        Write  = { param($Entry, $Context) Write-StampedManifest -SourcePath $Context.Sources.PluginJson -DestPath (Join-Path $Context.StageDir $Entry.Path) -Version $Context.Release.version -Identity $Context.Identity }
+        Assert = { param($Entry, $Context) Assert-StampedManifest -SourcePath $Context.Sources.PluginJson -StagedPath (Join-Path $Context.StageDir $Entry.Path) -Version $Context.Release.version -Identity $Context.Identity }
+    }
+    HooksJson = @{
+        Write  = { param($Entry, $Context) [IO.File]::WriteAllText((Join-Path $Context.StageDir $Entry.Path), (New-HooksJsonText $Context.RepoRoot $Context.Identity), (Get-Utf8NoBomEncoding)) }
+        Assert = { param($Entry, $Context) Assert-HooksJsonGenerated -Path (Join-Path $Context.StageDir $Entry.Path) -RepoRoot $Context.RepoRoot -Identity $Context.Identity }
     }
     VersionTxt = @{
         Write  = { param($Entry, $Context) Write-VersionTxt -Path (Join-Path $Context.StageDir $Entry.Path) -Values $Context.Release }
@@ -394,7 +477,7 @@ function New-StagingContext {
     return [pscustomobject]@{
         RepoRoot = $RepoRoot; PublishDir = $PublishDir; StageDir = $StageDir; Layout = $Layout; Release = $Release
         Sources = $sources
-        Identity = (Get-PluginIdentity -PluginJsonPath $sources.PluginJson -McpJsonPath $sources.McpJson)
+        Identity = (Get-PluginIdentity -PluginJsonPath $sources.PluginJson -McpJsonPath $sources.McpJson -Architecture $Release.arch)
     }
 }
 
@@ -402,7 +485,7 @@ function New-StagingContext {
 #  Stage
 # ----------------------------------------------------------------------------
 # Builds the archive's directory tree from the publish output and the repository.
-# $Release: the VERSION.txt values (tag, version, commit, built, run).
+# $Release: the VERSION.txt values (tag, version, commit, arch, built, run); arch picks the plugin identity.
 function New-StagedPlugin {
     [CmdletBinding()]
     param(
@@ -511,6 +594,7 @@ function Assert-StagedPlugin {
     $context = New-StagingContext $RepoRoot $PublishDir $StageDir $Layout $Release
     $table = @(Get-StagingTable -RepoRoot $RepoRoot -Layout $Layout -PublishDir $PublishDir)
     foreach ($entry in $table) { Assert-StagingEntry $entry $table $context }
+    Assert-NoForeignIdentity -StageDir $StageDir -Context $context
 }
 
 # ----------------------------------------------------------------------------

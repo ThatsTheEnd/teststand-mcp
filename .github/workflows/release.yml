@@ -27,7 +27,10 @@
 #     was added, replaced or removed between the verification and the recheck stops the release before it
 #     goes live. One that changes AFTER that recheck is only noticed once the release is live: the
 #     AfterPublish check then fails the run and prints the rollback, it cannot prevent it.
-#   * The fixed asset name teststand-mcp.zip is what users fetch from releases/latest/download/.
+#   * One tag releases BOTH plugins: the package job builds every architecture of build\PluginIdentity.psm1
+#     (teststand-mcp for x86, teststand-mcp-x64 for x64), and each plugin's four assets are verified on
+#     their own. The fixed names teststand-mcp.zip and teststand-mcp-x64.zip are what users fetch from
+#     releases/latest/download/.
 #   * Tag names, inputs and refs are user input: they reach `run:` only through env, never inline.
 #   * Every run queues per ref (`release-<ref>`) and a running release is never cancelled, so two runs of
 #     one tag never overlap. Different tags may overlap, and the one that finishes last would otherwise
@@ -44,8 +47,9 @@
 #
 # A manual run is a DRY RUN: it packages, creates a draft under the rehearsal tag
 # v<X.Y.Z>-rehearsal, verifies it through the API, then deletes the draft it created (by its id) and
-# the rehearsal tag. It never publishes. `inject_fault: corrupt-zip` replaces the uploaded zip with
-# corrupt bytes: the run must fail at the verification, publish nothing, and still clean up. This is
+# the rehearsal tag. It never publishes. `inject_fault: corrupt-zip` replaces the uploaded x86 zip with
+# corrupt bytes (`corrupt-zip-x64` the x64 zip): the run must fail at the verification, publish nothing,
+# and still clean up. This is
 # also how the fork rehearsal exercises the whole path before the first real tag.
 name: release
 
@@ -70,6 +74,7 @@ on:
         options:
           - none
           - corrupt-zip
+          - corrupt-zip-x64
         default: none
 
 # Nothing by default; every job states what it needs.
@@ -101,13 +106,14 @@ defaults:
 jobs:
   package:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     permissions:
       contents: read
     outputs:
       tag: ${{ steps.gate.outputs.tag }}
       version: ${{ steps.gate.outputs.version }}
       rehearsal: ${{ steps.gate.outputs.rehearsal }}
+      asset_prefixes: ${{ steps.package.outputs.asset_prefixes }}
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -139,14 +145,24 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
-      - name: Package the plugin archive
+      - name: Package the plugin archive of every architecture
+        id: package
         env:
           RELEASE_VERSION: ${{ steps.gate.outputs.version }}
           RELEASE_TAG: ${{ steps.gate.outputs.tag }}
-        timeout-minutes: 30
+        timeout-minutes: 55
         run: |
-          & .\build\Build-PluginArchive.ps1 -Version $env:RELEASE_VERSION -Tag $env:RELEASE_TAG -OutDir $env:OUT_DIR
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Each architecture into its own folder, then every plugin's assets side by side in OUT_DIR, the
+          # one folder the draft is created from. asset_prefixes tells the release job which plugins they are.
+          Import-Module .\build\BuildCommon.psm1 -Force
+          Import-Module .\build\PluginIdentity.psm1 -Force
+          foreach ($architecture in (Get-PluginArchitectures)) {
+            $dir = Join-Path $env:OUT_DIR $architecture
+            & .\build\Build-PluginArchive.ps1 -Version $env:RELEASE_VERSION -Tag $env:RELEASE_TAG -Architecture $architecture -OutDir $dir
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Get-ChildItem -LiteralPath $dir -File -Filter 'teststand-mcp*' | Copy-Item -Destination $env:OUT_DIR
+          }
+          Add-GitHubOutput -Name 'asset_prefixes' -Value ((Get-PluginAssetPrefixes) -join ',')
 
       # The files are already compressed archives: store them as they are.
       - name: Keep the release assets for the release job
@@ -166,6 +182,7 @@ jobs:
       contents: write   # create, edit and delete releases, upload their assets, delete the rehearsal tag
     env:
       RELEASE_TAG: ${{ needs.package.outputs.tag }}
+      ASSET_PREFIXES: ${{ needs.package.outputs.asset_prefixes }}
     steps:
       # The repository at the tagged commit: only the verifier and gate scripts are used from it.
       - name: Check out the repository
@@ -190,19 +207,22 @@ jobs:
           # Deletes a leftover draft of this tag first, refuses a published release of it, and writes the id
           # of the draft it creates to the step output release_id (the dry run's cleanup deletes that id only).
           $dryRun = ($env:DRY_RUN -eq 'true')
-          & .\build\New-ReleaseDraft.ps1 -Repo $env:REPO -Tag $env:RELEASE_TAG -AssetDir $env:OUT_DIR -Target $env:TARGET_SHA -DryRun:$dryRun
+          & .\build\New-ReleaseDraft.ps1 -Repo $env:REPO -Tag $env:RELEASE_TAG -AssetDir $env:OUT_DIR -AssetPrefixes $env:ASSET_PREFIXES -Target $env:TARGET_SHA -DryRun:$dryRun
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Corrupt the uploaded zip (dry run only, to prove a bad draft is never published)
-        if: env.DRY_RUN == 'true' && env.INJECT_FAULT == 'corrupt-zip'
+      - name: Corrupt an uploaded zip (dry run only, to prove a bad draft is never published)
+        if: env.DRY_RUN == 'true' && (env.INJECT_FAULT == 'corrupt-zip' || env.INJECT_FAULT == 'corrupt-zip-x64')
         env:
           GH_TOKEN: ${{ github.token }}
         timeout-minutes: 10
         run: |
           Import-Module .\build\ReleaseAssets.psm1 -Force
+          Import-Module .\build\PluginIdentity.psm1 -Force
+          $archive = $ReleaseArchiveName
+          if ($env:INJECT_FAULT -eq 'corrupt-zip-x64') { $archive = (Get-PluginAssetNames -Prefix (Get-PluginIdentity -Architecture 'x64').assetPrefix -Version '0.0.0').Archive }
           $folder = Join-Path $env:RUNNER_TEMP 'corrupt-zip'
           [void](New-Item -ItemType Directory -Path $folder -Force)
-          $corrupt = Join-Path $folder $ReleaseArchiveName
+          $corrupt = Join-Path $folder $archive
           [IO.File]::WriteAllBytes($corrupt, [byte[]](80, 75, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 255, 254, 253))
           gh release upload $env:RELEASE_TAG $corrupt --clobber --repo $env:REPO
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -214,7 +234,7 @@ jobs:
         timeout-minutes: 30
         run: |
           $rehearsal = ($env:DRY_RUN -eq 'true')
-          & .\build\Assert-PublishedRelease.ps1 -Repo $env:REPO -Tag $env:RELEASE_TAG -Token $env:GH_TOKEN -OwnDownloadsPath $env:OWN_DOWNLOADS_FILE -Rehearsal:$rehearsal
+          & .\build\Assert-PublishedRelease.ps1 -Repo $env:REPO -Tag $env:RELEASE_TAG -Token $env:GH_TOKEN -AssetPrefixes $env:ASSET_PREFIXES -OwnDownloadsPath $env:OWN_DOWNLOADS_FILE -Rehearsal:$rehearsal
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Check that the draft still holds exactly the verified assets
@@ -255,20 +275,20 @@ jobs:
           & .\build\Assert-ReleaseAssetSet.ps1 -Repo $env:REPO -ExpectedAssetIds $env:ASSET_IDS -ReleaseId $env:RELEASE_ID -Stage AfterPublish
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Fetch releases/latest as users do and compare it with the verified archive
+      - name: Fetch releases/latest as users do and compare it with the verified archives
         id: latest
         if: env.DRY_RUN != 'true' && steps.publish.outcome == 'success' && steps.recheck_after.outcome == 'success' && steps.publish.outputs.make_latest == 'true'
         env:
-          ARCHIVE_SHA256: ${{ steps.verify.outputs.archive_sha256 }}
+          ARCHIVE_HASHES: ${{ steps.verify.outputs.archive_hashes }}
         timeout-minutes: 15
         run: |
-          # An unset output must stop here: an empty digest would turn the check into the weaker one that
-          # accepts the previous release too.
-          if ($env:ARCHIVE_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
-            Write-Host '::error::The verification did not report the SHA-256 of the archive it verified, so releases/latest cannot be compared with it.'
+          # An unset output must stop here: without the hashes the check would be the weaker one that
+          # accepts the previous release too. The verifier refuses a map that lacks a plugin's 64-digit hash.
+          if ([string]::IsNullOrWhiteSpace($env:ARCHIVE_HASHES)) {
+            Write-Host '::error::The verification did not report the SHA-256 of the archives it verified, so releases/latest cannot be compared with them.'
             exit 1
           }
-          & .\build\Assert-PublishedRelease.ps1 -Latest -Repo $env:REPO -ExpectedArchiveSha256 $env:ARCHIVE_SHA256 -OwnDownloadsPath $env:OWN_DOWNLOADS_FILE
+          & .\build\Assert-PublishedRelease.ps1 -Latest -Repo $env:REPO -AssetPrefixes $env:ASSET_PREFIXES -ExpectedArchiveHashes $env:ARCHIVE_HASHES -OwnDownloadsPath $env:OWN_DOWNLOADS_FILE
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Delete the rehearsal draft and its tag (dry run only)

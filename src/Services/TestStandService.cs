@@ -4860,9 +4860,12 @@ public sealed class TestStandService : ITestStandService
             Log("Saved project not found — using minimal template");
             // productversion is cosmetic file metadata; compatibleversion + the namespace govern
             // parsing. Stamp the connected engine's version when known, else the compatible baseline.
+            // buildversion is mandatory: without it the engine rejects the file as "not a property
+            // object file" (-17100) and AnalyzerApp blocks on a modal dialog (measured 2026-10-25 on
+            // both bitnesses; 23.0.0.49152 is the value AnalyzerApp itself writes).
             string headerVersion = string.IsNullOrEmpty(productVersion) ? "23.0.0.0" : productVersion;
             projectXml = $@"<?xml version=""1.0"" encoding=""UTF-8""?>
-<teststandfileheader type='SequenceAnalyzerProjectFile' fileversion='1022' productname='TestStand' productversion='{headerVersion}' compatibleversion='23.0.0.0' xmlns:xsi=""http://www.w3.org/2001/XMLSchema-instance"" xmlns=""http://www.ni.com/TestStand/23.0.0/PropertyObjectFile"">
+<teststandfileheader type='SequenceAnalyzerProjectFile' fileversion='1022' productname='TestStand' productversion='{headerVersion}' compatibleversion='23.0.0.0' buildversion='23.0.0.49152' xmlns:xsi=""http://www.w3.org/2001/XMLSchema-instance"" xmlns=""http://www.ni.com/TestStand/23.0.0/PropertyObjectFile"">
  <typelist/>
  <Data classname='Obj'><subprops><data classname='Obj'><subprops>
   <Files classname='Strs'><value lbound='[0]' ubound='[]'/></Files>

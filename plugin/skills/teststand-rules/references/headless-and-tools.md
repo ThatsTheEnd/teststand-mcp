@@ -15,6 +15,10 @@
 - Call `save_sequence_file` after every sequence change, and verify persistence by reopening the file with `open_sequence_file` and reading back.
 - New tool names and new parameters appear only in a FRESH MCP session after the server was updated; the client caches the tool catalog at session start.
 
+## Bitness
+
+- Each plugin drives only the TestStand of its own bitness: the x86 plugin the 32-bit engine, the x64 plugin the 64-bit engine. The code modules a sequence calls (DLLs, .NET assemblies, LabVIEW, Python) must match that engine's bitness; a 32-bit DLL does not load into the 64-bit engine and the other way round. `get_engine_paths` reports which engine you are on (`versionString` ends in `32-bit` or `64-bit`).
+
 ## Expressions
 
 - `check_expression` effectively needs a loaded file as context. Pass `sequence_file_path` of an open file; without it even a valid expression can fail to validate.

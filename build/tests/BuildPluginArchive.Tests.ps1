@@ -99,6 +99,7 @@ try {
     Import-Module (Join-Path $BuildDir 'ReleaseAssets.psm1') -Force
     Import-Module (Join-Path $BuildDir 'ToolClassification.psm1') -Force
     Import-Module (Join-Path $BuildDir 'SkillSources.psm1') -Force
+    Import-Module (Join-Path $BuildDir 'PluginIdentity.psm1') -Force
     Import-Module (Join-Path $BuildDir 'PluginStaging.psm1') -Force
     Import-Module (Join-Path $BuildDir 'PluginArchive.psm1') -Force
     Import-Module (Join-Path $BuildDir 'PluginSmoke.psm1') -Force
@@ -252,6 +253,8 @@ try {
         Assert-Equal 'v1.9.0,1.9.0,local' ("$($record.tag),$($record.version),$($record.run)") 'values'
         Assert-Equal $SampleCommit $record.commit 'commit'
         Assert-True ($record.built -cmatch '\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\z') "built was [$($record.built)]"
+        Assert-Equal 'x86' $record.arch 'the default architecture'
+        Assert-Equal 'x64' (New-ReleaseRecord -Tag 'v1.9.0' -Version '1.9.0' -Commit $SampleCommit -Architecture 'x64').arch 'the x64 architecture'
     }
 
     Invoke-Case 'commit time: the timestamp of a commit of this checkout, and a clear fix for one that is not' {
@@ -378,13 +381,15 @@ try {
         $emptyRepo = New-TempDir
         $publishDir = Join-Path (New-TempDir) 'publish'
         Assert-FailsWith { Publish-PluginExe -RepoRoot $emptyRepo -Layout 'folder' -Version $SampleVersion -Commit $SampleCommit -PublishDir $publishDir } `
-            @('dotnet publish failed', 'exit code') -Fix @('dotnet publish TestStandMCP.csproj')
+            @('dotnet publish failed', 'exit code') -Fix @('dotnet publish TestStandMCP.csproj -c Release -p:Platform=x86 -r win-x86')
+        Assert-FailsWith { Publish-PluginExe -RepoRoot $emptyRepo -Layout 'folder' -Version $SampleVersion -Commit $SampleCommit -PublishDir $publishDir -Architecture 'x64' } `
+            @('dotnet publish failed') -Fix @('-p:Platform=x64 -r win-x64')
     }
 
     # ======================================================================
     #  Staging: a tiny fake publish output, the real repository sources
     # ======================================================================
-    $Release = @{ tag = "v$SampleVersion"; version = $SampleVersion; commit = $SampleCommit; built = '2026-10-24T12:00:00Z'; run = 'local' }
+    $Release = @{ tag = "v$SampleVersion"; version = $SampleVersion; commit = $SampleCommit; arch = 'x86'; built = '2026-10-24T12:00:00Z'; run = 'local' }
     $FolderLayout = Get-ArchiveLayout 'folder'
 
     # What dotnet publish leaves: the exe and runtime files, plus the files the csproj copies into every
@@ -402,10 +407,23 @@ try {
     }
 
     function New-StageFrom {
-        param([string]$PublishDir, $Layout = $FolderLayout, [string]$Root = $RepoRoot)
+        param([string]$PublishDir, $Layout = $FolderLayout, [string]$Root = $RepoRoot, [hashtable]$StageRelease = $Release)
         $stage = Join-Path (New-TempDir) 'stage'
-        New-StagedPlugin -RepoRoot $Root -PublishDir $PublishDir -StageDir $stage -Layout $Layout -Release $Release
+        New-StagedPlugin -RepoRoot $Root -PublishDir $PublishDir -StageDir $stage -Layout $Layout -Release $StageRelease
         return $stage
+    }
+
+    # The x64 plugin: the same release, its own identity.
+    $ReleaseX64 = $Release.Clone(); $ReleaseX64.arch = 'x64'
+    $IdentityX86 = Get-PluginIdentity -Architecture 'x86'
+    $IdentityX64 = Get-PluginIdentity -Architecture 'x64'
+
+    # Every staged text file (not the fake bin/ binaries) that contains the term.
+    function Get-StagedFilesContaining {
+        param([string]$StageDir, [string]$Term)
+        return @(foreach ($name in (Get-RelativeFileList $StageDir)) {
+            if ($name -notlike 'bin/*.dll' -and $name -notlike 'bin/*.exe' -and (Read-Utf8Text (Join-Path $StageDir $name)).IndexOf($Term, [StringComparison]::Ordinal) -ge 0) { $name }
+        })
     }
 
     # One staged tree is built once; every fault case works on its own copy.
@@ -500,9 +518,44 @@ try {
         Assert-StampedManifest -SourcePath $sourcePath -StagedPath $stagedPath -Version '1.9.0-rc.1'
     }
 
-    Invoke-Case 'staging: VERSION.txt carries tag, version, commit, built and run, one per line, in the format the exe reads' {
+    Invoke-Case 'staging x64: plugin.json, hooks.json and the agents carry the x64 identity, and the tree passes every assertion' {
+        $publish = New-FakePublishDir
+        $stage = New-StageFrom -PublishDir $publish -StageRelease $ReleaseX64
+        Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -PublishDir $publish -Layout $FolderLayout -Release $ReleaseX64
+        $manifest = (Read-Utf8Text (Join-Path $stage '.claude-plugin\plugin.json')) | ConvertFrom-Json
+        foreach ($field in @('name', 'displayName', 'description')) { Assert-Equal $IdentityX64.$field $manifest.$field "plugin.json $field" }
+        Assert-Equal $SampleVersion $manifest.version 'plugin.json version'
+        $matcher = ((Read-Utf8Text (Join-Path $stage 'hooks\hooks.json')) | ConvertFrom-Json).hooks.PreToolUse[0].matcher
+        $entries = @($matcher -split '\|')
+        Assert-True ($entries.Count -gt 10) 'the matcher lists the allow-listed tools'
+        Assert-Equal 0 @($entries | Where-Object { -not $_.StartsWith($IdentityX64.pluginToolPrefix, [StringComparison]::Ordinal) }).Count 'matcher entries without the x64 prefix'
+        $agents = @(Get-ChildItem -LiteralPath (Join-Path $stage 'agents') -File)
+        Assert-True (@($agents | Where-Object { (Read-Utf8Text $_.FullName).Contains($IdentityX64.pluginToolPrefix) }).Count -gt 0) 'an agent references the x64 tool prefix'
+        Assert-Equal '' ((Get-StagedFilesContaining $stage $IdentityX86.pluginToolPrefix) -join ', ') 'staged files naming the x86 tool prefix'
+        Assert-Contains (Read-Utf8Text (Join-Path $stage 'VERSION.txt')) 'arch: x64' 'VERSION.txt'
+    }
+
+    Invoke-Case 'staging x86: the tree is the committed plugin and names no x64 plugin' {
+        $stage = New-StagedCopy
+        Assert-Equal (Read-Utf8Text (Join-Path $RepoRoot 'plugin\hooks\hooks.json')) (Read-Utf8Text (Join-Path $stage 'hooks\hooks.json')) 'hooks.json equals the committed one'
+        Assert-Equal '' ((Get-StagedFilesContaining $stage $IdentityX64.name) -join ', ') 'staged files naming the x64 plugin'
+    }
+
+    Invoke-Case 'fault: a staged x64 file names the x86 tool prefix' {
+        $publish = New-FakePublishDir
+        $stage = New-StageFrom -PublishDir $publish -StageRelease $ReleaseX64
+        [IO.File]::AppendAllText((Join-Path $stage 'skills\teststand-rules\SKILL.md'), "`nCall $($IdentityX86.pluginToolPrefix)get_steps.`n")
+        Assert-FailsWith { Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -PublishDir $publish -Layout $FolderLayout -Release $ReleaseX64 } `
+            @('skills/teststand-rules/SKILL.md', $IdentityX86.pluginToolPrefix, 'another plugin') -Fix @('plugin.json')
+    }
+
+    Invoke-Case 'fault: the staged hooks.json is not the committed one with the plugin''s prefix' {
+        Assert-StageFault { param($stage) [IO.File]::AppendAllText((Join-Path $stage 'hooks\hooks.json'), ' ') } @('hooks/hooks.json is not plugin/hooks/hooks.json') -Fix @('New-HooksJson.ps1')
+    }
+
+    Invoke-Case 'staging: VERSION.txt carries tag, version, commit, arch, built and run, one per line, in the format the exe reads' {
         $text = [IO.File]::ReadAllText((Join-Path (New-StagedCopy) 'VERSION.txt'))
-        Assert-Equal "tag: v1.9.0`nversion: 1.9.0`ncommit: $SampleCommit`nbuilt: 2026-10-24T12:00:00Z`nrun: local`n" $text 'VERSION.txt'
+        Assert-Equal "tag: v1.9.0`nversion: 1.9.0`ncommit: $SampleCommit`narch: x86`nbuilt: 2026-10-24T12:00:00Z`nrun: local`n" $text 'VERSION.txt'
     }
 
     Invoke-Case 'staging: bin/CLAUDE.md is the user rules only: a header, then the skill files in the import order, no developer section' {
@@ -647,8 +700,8 @@ try {
         Assert-StageFault { param($stage) [IO.File]::WriteAllText((Join-Path $stage 'bin\CLAUDE.md'), "# TestStand MCP rules`n") } @('not what the skill files generate')
     }
 
-    Invoke-Case 'fault: VERSION.txt lacks one of tag, version, commit, built, run' {
-        foreach ($key in @('tag', 'version', 'commit', 'built', 'run')) {
+    Invoke-Case 'fault: VERSION.txt lacks one of tag, version, commit, arch, built, run' {
+        foreach ($key in @('tag', 'version', 'commit', 'arch', 'built', 'run')) {
             Assert-StageFault {
                 param($stage)
                 $path = Join-Path $stage 'VERSION.txt'
@@ -659,7 +712,11 @@ try {
     }
 
     Invoke-Case 'fault: VERSION.txt names another version than the one built' {
-        Assert-StageFault { param($stage) Write-TextFile (Join-Path $stage 'VERSION.txt') "tag: v1.9.0`nversion: 1.8.0`ncommit: $SampleCommit`nbuilt: x`nrun: local`n" } @("version '1.8.0'", "'1.9.0' was requested")
+        Assert-StageFault { param($stage) Write-TextFile (Join-Path $stage 'VERSION.txt') "tag: v1.9.0`nversion: 1.8.0`ncommit: $SampleCommit`narch: x86`nbuilt: x`nrun: local`n" } @("version '1.8.0'", "'1.9.0' was requested")
+    }
+
+    Invoke-Case 'fault: VERSION.txt names another architecture than the one built' {
+        Assert-StageFault { param($stage) Write-TextFile (Join-Path $stage 'VERSION.txt') "tag: v1.9.0`nversion: 1.9.0`ncommit: $SampleCommit`narch: x64`nbuilt: x`nrun: local`n" } @("arch 'x64'", "'x86' was requested")
     }
 
     Invoke-Case 'fault: the staged plugin.json differs from the source in more than the version' {
@@ -771,30 +828,35 @@ try {
     # ======================================================================
     #  Smoke tests of the staged exe (PluginSmoke): fake exes are .cmd files
     # ======================================================================
-    $VersionLines = @('echo TestStand MCP Server 1.9.0', 'echo   tag:     v1.9.0', "echo   commit:  $SampleCommit", 'echo   built:   2026-10-24T12:00:00Z', 'echo   run:     local')
+    $VersionLines = @('echo TestStand MCP Server 1.9.0', 'echo   tag:     v1.9.0', "echo   commit:  $SampleCommit", 'echo   arch:    x86', 'echo   built:   2026-10-24T12:00:00Z', 'echo   run:     local')
 
     Invoke-Case 'smoke --version: the version, the tag and the commit on stdout with exit 0 pass' {
-        Assert-VersionOutput -ExePath (New-FakeExe $VersionLines) -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit
+        Assert-VersionOutput -ExePath (New-FakeExe $VersionLines) -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit -Arch 'x86'
     }
 
     Invoke-Case 'fault: --version names another version' {
-        $exe = New-FakeExe (@('echo TestStand MCP Server 1.8.0') + $VersionLines[1..4])
-        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @("its first line ends with '1.8.0', not '1.9.0'", '--version output is wrong') -Fix @('VERSION.txt')
+        $exe = New-FakeExe (@('echo TestStand MCP Server 1.8.0') + $VersionLines[1..5])
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit -Arch 'x86' } @("its first line ends with '1.8.0', not '1.9.0'", '--version output is wrong') -Fix @('VERSION.txt')
+    }
+
+    Invoke-Case 'fault: --version names another architecture than the archive' {
+        $exe = New-FakeExe $VersionLines
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit -Arch 'x64' } @("reports arch 'x86' but the archive is for 'x64'") -Fix @('-Architecture')
     }
 
     Invoke-Case 'fault: --version lacks the tag (an untagged or unreadable VERSION.txt)' {
         $exe = New-FakeExe @('echo TestStand MCP Server 1.9.0', "echo   commit:  $SampleCommit", 'echo   note:    release metadata incomplete: no tag')
-        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @("does not name 'v1.9.0'", 'release-metadata note')
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit -Arch 'x86' } @("does not name 'v1.9.0'", 'release-metadata note')
     }
 
     Invoke-Case 'fault: --version reports an untagged -dev build' {
         $exe = New-FakeExe @('echo TestStand MCP Server 1.9.0-dev', 'echo   tag:     v1.9.0', "echo   commit:  $SampleCommit")
-        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @("untagged build ('-dev')")
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit -Arch 'x86' } @("untagged build ('-dev')")
     }
 
     Invoke-Case 'fault: --version exits non-zero' {
         $exe = New-FakeExe @('echo broken', 'exit /b 3')
-        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit } @('failed (exit code 3)', 'broken') -Fix @('Run it by hand')
+        Assert-FailsWith { Assert-VersionOutput -ExePath $exe -Version $SampleVersion -Tag "v$SampleVersion" -Commit $SampleCommit -Arch 'x86' } @('failed (exit code 3)', 'broken') -Fix @('Run it by hand')
     }
 
     # tool list: a classification of get_a, get_b (allow) and set_c (prompt) over a three-tool registry
@@ -989,6 +1051,33 @@ try {
         Assert-FailsWith { Assert-LocalRelease -OutDir $outDir -Version '1.9.0' } @('release verifier', $ReleaseDigestName) -Fix @('Fix what the verifier reports')
     }
 
+    Invoke-Case 'assets x64: the four assets carry the x64 prefix, its verifier accepts them and the x86 one finds its own missing' {
+        $prefix = (Get-PluginIdentity -Architecture 'x64').assetPrefix
+        $names = Get-PluginAssetNames -Prefix $prefix -Version '1.9.0'
+        $stage = New-SmallStage
+        $outDir = New-TempDir
+        $zipPath = Join-Path $outDir $names.Archive
+        New-PluginZip -StageDir $stage -ZipPath $zipPath -Timestamp $FixedTimestamp
+        Write-ReleaseAssets -ZipPath $zipPath -ManifestText (Get-StageSnapshot -StageDir $stage) -Version '1.9.0' -Prefix $prefix
+        Assert-Equal ((@($names.Archive, $names.Digest, $names.Manifest, $names.Versioned) | Sort-Object) -join ',') ((@(Get-ChildItem -LiteralPath $outDir -File | ForEach-Object { $_.Name }) | Sort-Object) -join ',') 'the written assets'
+        Assert-Equal 'teststand-mcp-x64-v1.9.0.zip' $names.Versioned 'the versioned name'
+        Assert-Contains (Read-Utf8Text (Join-Path $outDir $names.Digest)) "  $($names.Archive)" 'the digest names the x64 archive'
+        Assert-LocalRelease -OutDir $outDir -Version '1.9.0' -Prefix $prefix
+        Assert-FailsWith { Assert-LocalRelease -OutDir $outDir -Version '1.9.0' } @('release verifier', "the plugin archive $ReleaseArchiveName is missing") -Fix @('Fix what the verifier reports')
+    }
+
+    Invoke-Case 'fault x64: a digest that does not match the x64 archive is named with the x64 names' {
+        $prefix = (Get-PluginIdentity -Architecture 'x64').assetPrefix
+        $names = Get-PluginAssetNames -Prefix $prefix -Version '1.9.0'
+        $stage = New-SmallStage
+        $outDir = New-TempDir
+        $zipPath = Join-Path $outDir $names.Archive
+        New-PluginZip -StageDir $stage -ZipPath $zipPath -Timestamp $FixedTimestamp
+        Write-ReleaseAssets -ZipPath $zipPath -ManifestText (Get-StageSnapshot -StageDir $stage) -Version '1.9.0' -Prefix $prefix
+        Write-TextFile (Join-Path $outDir $names.Digest) (('0' * 64) + "  $($names.Archive)`n")
+        Assert-FailsWith { Assert-LocalRelease -OutDir $outDir -Version '1.9.0' -Prefix $prefix } @("the plugin archive $($names.Archive) does not match the archive digest $($names.Digest)") -Fix @('Fix what the verifier reports')
+    }
+
     # ======================================================================
     #  The script itself
     # ======================================================================
@@ -998,6 +1087,16 @@ try {
         Assert-Equal 1 $result.ExitCode 'exit code'
         Assert-ThreePartFailure $result.Stdout
         Assert-Contains $result.Stdout "'one.nine'" 'output'
+        Assert-True (-not (Test-Path -LiteralPath $outDir)) 'nothing may be created for a refused input'
+    }
+
+    Invoke-Case 'script: an unknown architecture stops it with exit code 1, naming x86 and x64, before anything is built' {
+        $outDir = Join-Path (New-TempDir) 'out'
+        $result = Invoke-BuildScript -ScriptPath $ScriptPath -TimeoutSeconds 120 -ArgumentList @('-Version', $SampleVersion, '-Commit', $SampleCommit, '-OutDir', $outDir, '-Architecture', 'arm64')
+        Assert-Equal 1 $result.ExitCode 'exit code'
+        Assert-ThreePartFailure $result.Stdout
+        Assert-Contains $result.Stdout "Unknown architecture 'arm64'" 'output'
+        Assert-Contains $result.Stdout 'x86 and x64' 'the allowed values'
         Assert-True (-not (Test-Path -LiteralPath $outDir)) 'nothing may be created for a refused input'
     }
 

@@ -8,6 +8,8 @@
 #    - the draft is created and ITS id is written as the step output release_id (also when the creation
 #      failed half-way), so the dry run's cleanup deletes exactly that draft.
 #    -Repo owner/name   -Tag vX.Y.Z (or v<X.Y.Z>-rehearsal with -DryRun)   -AssetDir <folder>
+#    -AssetPrefixes     the plugins the release carries (comma-separated; default teststand-mcp alone);
+#                       the folder must hold exactly their four assets each.
 #    -DryRun            the tag is a rehearsal tag that does not exist: the draft names it and points at
 #                       -Target (a commit SHA); without -DryRun the pushed tag must exist (--verify-tag).
 #  Test seam: -Gh (a scriptblock, see ReleaseDraft.psm1). The parameters are not Mandatory on purpose: an
@@ -19,6 +21,7 @@ param(
     [string]$Tag = '',
     [string]$AssetDir = '',
     [string]$Target = '',
+    [string[]]$AssetPrefixes,
     [switch]$DryRun,
     [scriptblock]$Gh
 )
@@ -32,7 +35,7 @@ try {
     if ([string]::IsNullOrWhiteSpace($AssetDir)) {
         Write-BuildFailure -What 'No asset folder was given.' -Why 'It holds the files that become the assets of the release.' -Fix 'Pass -AssetDir with the folder the package job wrote the assets to.'
     }
-    [void](New-ReleaseDraft -Repo $Repo -Tag $Tag -AssetDir $AssetDir -Target $Target -DryRun:$DryRun -Gh $Gh)
+    [void](New-ReleaseDraft -Repo $Repo -Tag $Tag -AssetDir $AssetDir -Target $Target -DryRun:$DryRun -Gh $Gh -AssetPrefixes (ConvertTo-AssetPrefixList $AssetPrefixes))
     exit 0
 } catch {
     Write-Host (Get-ScriptFailureText -ErrorRecord $_)

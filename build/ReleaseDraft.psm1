@@ -159,7 +159,7 @@ function New-ReleaseDraft {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Repo, [Parameter(Mandatory)][AllowEmptyString()][string]$Tag, [Parameter(Mandatory)][AllowEmptyString()][string]$AssetDir,
-        [string]$Target = '', [switch]$DryRun, [scriptblock]$Gh
+        [string]$Target = '', [switch]$DryRun, [scriptblock]$Gh, [string[]]$AssetPrefixes = @($ReleaseAssetPrefix)
     )
     Assert-RepoSlug $Repo
     $parsed = ConvertFrom-ReleaseTag -Tag $Tag -AllowRehearsal:$DryRun
@@ -174,7 +174,7 @@ function New-ReleaseDraft {
     if ($DryRun -and $Target -cnotmatch $ReleaseCommitPattern) {
         Write-BuildFailure -What "A dry run needs the full 40-character commit SHA to point its draft at, and got '$(Get-PrintableTag $Target)'." -Why 'The rehearsal tag does not exist, so the draft names it and targets this commit; an abbreviation or a branch name could resolve to another commit.' -Fix 'Pass -Target with the commit SHA of the run (github.sha).'
     }
-    Assert-ReleaseAssetFiles -Directory $AssetDir -Version $parsed.Version
+    Assert-ReleaseAssetFiles -Directory $AssetDir -Version $parsed.Version -Prefixes $AssetPrefixes
 
     [void](Clear-StaleDrafts -Repo $Repo -Tag $Tag -Gh $Gh)
 

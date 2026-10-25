@@ -13,16 +13,20 @@
 #  ("pathArguments" in tool-classes.json) is a .seq file on a local drive inside the
 #  session's project folder (the hook input's "cwd"). Anything else keeps the prompt.
 #
-#  The tool prefix below is the one deliberate copy of the plugin identity in shipped
-#  code: this script has no build step to derive it. PluginHooks tests pin it to
-#  build/PluginIdentity.psm1.
+#  The tool prefix is this plugin's own (mcp__plugin_<name>_teststand__), with the name read
+#  from the installed plugin.json: each plugin (one per TestStand bitness) allows only its own
+#  tools. An unreadable plugin.json leaves no prefix, so nothing is allowed. AllowHook tests pin
+#  the format to build/PluginIdentity.psm1.
 # ============================================================================
 Set-StrictMode -Version 2.0
 
 try { . (Join-Path $PSScriptRoot 'hook-common.ps1') } catch { exit 0 }
 
 $script:AllowReason = 'no TestStand file is modified'
-$script:PluginToolPrefix = 'mcp__plugin_teststand-mcp_teststand__'
+$script:PluginToolPrefixFormat = 'mcp__plugin_{0}_teststand__'
+$script:PluginToolPrefix = $null
+$pluginName = Get-HookPluginName
+if ($null -ne $pluginName) { $script:PluginToolPrefix = $script:PluginToolPrefixFormat -f $pluginName }
 $script:ToolClassesFileName = 'tool-classes.json'
 $script:AllowedFileExtension = '.seq'
 $script:DirectorySeparator = '\'
@@ -37,7 +41,7 @@ $script:IllegalPathCharacterPattern = '[<>"|*?\x00-\x1f]'   # wildcards and the 
 # server, a non-string).
 function Get-ShortToolName {
     param($ToolName)
-    if ($ToolName -isnot [string]) { return $null }
+    if ($ToolName -isnot [string] -or $null -eq $script:PluginToolPrefix) { return $null }
     if (-not $ToolName.StartsWith($script:PluginToolPrefix, [StringComparison]::Ordinal)) { return $null }
     return $ToolName.Substring($script:PluginToolPrefix.Length)
 }

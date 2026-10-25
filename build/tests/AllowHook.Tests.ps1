@@ -18,9 +18,11 @@ $ExpectedToolPrefix = 'mcp__plugin_teststand-mcp_teststand__'
 $ProjectDir = 'C:\Work\Proj'
 
 
+# The hook reads its plugin name from the installed plugin.json: by default the repository's plugin/ (the
+# folder above the script), with -PluginRoot a fixture's.
 function Invoke-AllowHookProcess {
-    param([AllowEmptyString()][string]$Stdin)
-    return Invoke-HookScript -ScriptPath $AllowHookPath -StdinText $Stdin -EnvOverrides @{ TESTSTAND_MCP_STATE_DIR = (New-TempDir) }
+    param([AllowEmptyString()][string]$Stdin, [string]$PluginRoot = $null, [string]$ScriptPath = $AllowHookPath)
+    return Invoke-HookScript -ScriptPath $ScriptPath -StdinText $Stdin -EnvOverrides @{ TESTSTAND_MCP_STATE_DIR = (New-TempDir); CLAUDE_PLUGIN_ROOT = $PluginRoot }
 }
 
 function Assert-AllowDecision {
@@ -51,14 +53,34 @@ function Test-CallAllowed {
 try {
     Import-Module (Join-Path $RepoRoot 'build\ToolClassification.psm1') -Force   # Read-ToolClasses
 
-    # --- the prefix is a deliberate copy of the plugin identity: pinned in two places --------------
+    # --- the prefix is the installed plugin's own: the format is pinned to the identity table -----
     Invoke-Case 'prefix: the identity module still derives the literal prefix the hook uses' {
         Assert-Equal $ExpectedToolPrefix $IdentityPrefix 'PluginIdentity prefix'
     }
 
-    Invoke-Case 'prefix: the hook constant equals the identity prefix (drift test)' {
+    Invoke-Case 'prefix: the hook builds every plugin''s identity prefix from its name (drift test)' {
         . $AllowHookPath
-        Assert-Equal $IdentityPrefix $script:PluginToolPrefix 'allow-readonly.ps1 prefix'
+        Assert-Equal $IdentityPrefix $script:PluginToolPrefix 'allow-readonly.ps1 prefix of the repository plugin'
+        foreach ($architecture in (Get-PluginArchitectures)) {
+            $identity = Get-PluginIdentity -Architecture $architecture
+            Assert-Equal $identity.pluginToolPrefix ($script:PluginToolPrefixFormat -f $identity.name) "$architecture prefix"
+        }
+    }
+
+    Invoke-Case 'allow hook: under the x64 plugin its own read-only tool is allowed, the x86 one and a mutating one are not' {
+        $x64 = Get-PluginIdentity -Architecture 'x64'
+        $root = New-PluginRootFixture $x64.name
+        Assert-AllowDecision (Invoke-AllowHookProcess (ConvertTo-HookInput ($x64.pluginToolPrefix + 'get_station_info')) -PluginRoot $root)
+        Assert-AllowDecision (Invoke-AllowHookProcess (ConvertTo-HookInput ($x64.pluginToolPrefix + 'get_steps') @{ sequence_file_path = 'C:\Work\Proj\a.seq' } $ProjectDir) -PluginRoot $root)
+        Assert-NoDecision (Invoke-AllowHookProcess (ConvertTo-HookInput ($IdentityPrefix + 'get_station_info')) -PluginRoot $root)
+        Assert-NoDecision (Invoke-AllowHookProcess (ConvertTo-HookInput ($x64.pluginToolPrefix + 'insert_step')) -PluginRoot $root)
+    }
+
+    Invoke-Case 'allow hook: a missing, unreadable or odd plugin name allows nothing' {
+        $roots = @((New-TempDir), (New-PluginRootFixture -RawJson '{ "name": '), (New-PluginRootFixture -Name '..\evil'), (New-PluginRootFixture -Name 'Teststand-MCP'))
+        foreach ($root in $roots) {
+            Assert-NoDecision (Invoke-AllowHookProcess (ConvertTo-HookInput ($IdentityPrefix + 'get_station_info')) -PluginRoot $root)
+        }
     }
 
     # --- a decision for a tool name -----------------------------------------------------------------
@@ -103,20 +125,20 @@ try {
 
     Invoke-Case 'allow hook: a missing tool-classes.json next to the script prints nothing and exits 0' {
         $dir = New-HooksCopy -Without 'tool-classes.json'
-        $result = Invoke-HookScript -ScriptPath (Join-Path $dir 'allow-readonly.ps1') -StdinText (ConvertTo-HookInput ($IdentityPrefix + 'get_station_info')) -EnvOverrides @{ TESTSTAND_MCP_STATE_DIR = (New-TempDir) }
+        $result = Invoke-AllowHookProcess (ConvertTo-HookInput ($IdentityPrefix + 'get_station_info')) -PluginRoot (Join-Path $RepoRoot 'plugin') -ScriptPath (Join-Path $dir 'allow-readonly.ps1')
         Assert-NoDecision $result
     }
 
     Invoke-Case 'allow hook: a corrupt tool-classes.json prints nothing and exits 0' {
         $dir = New-HooksCopy -Without 'tool-classes.json'
         [IO.File]::WriteAllText((Join-Path $dir 'tool-classes.json'), '{ "allow": [ "get_station_info" ', $Utf8NoBom)
-        $result = Invoke-HookScript -ScriptPath (Join-Path $dir 'allow-readonly.ps1') -StdinText (ConvertTo-HookInput ($IdentityPrefix + 'get_station_info')) -EnvOverrides @{ TESTSTAND_MCP_STATE_DIR = (New-TempDir) }
+        $result = Invoke-AllowHookProcess (ConvertTo-HookInput ($IdentityPrefix + 'get_station_info')) -PluginRoot (Join-Path $RepoRoot 'plugin') -ScriptPath (Join-Path $dir 'allow-readonly.ps1')
         Assert-NoDecision $result
     }
 
     Invoke-Case 'allow hook: a missing hook-common.ps1 prints nothing and exits 0' {
         $dir = New-HooksCopy -Without 'hook-common.ps1'
-        $result = Invoke-HookScript -ScriptPath (Join-Path $dir 'allow-readonly.ps1') -StdinText (ConvertTo-HookInput ($IdentityPrefix + 'get_station_info')) -EnvOverrides @{ TESTSTAND_MCP_STATE_DIR = (New-TempDir) }
+        $result = Invoke-AllowHookProcess (ConvertTo-HookInput ($IdentityPrefix + 'get_station_info')) -PluginRoot (Join-Path $RepoRoot 'plugin') -ScriptPath (Join-Path $dir 'allow-readonly.ps1')
         Assert-NoDecision $result
     }
 

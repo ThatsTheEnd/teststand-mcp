@@ -184,21 +184,33 @@ class SiteSeries(unittest.TestCase):
         module = (REPO_ROOT / "build" / "ReleaseAssets.psm1").read_text(encoding="utf-8")
         prefix = re.search(r"-Name ReleaseAssetPrefix -Value '([^']+)'", module).group(1)
         archive = re.search(r'-Name ReleaseArchiveName -Value "\$ReleaseAssetPrefix([^"]+)"', module).group(1)
-        versioned = re.search(r'\$script:VersionedArchiveFormat = "\$ReleaseAssetPrefix([^"]+)"', module).group(1)
+        versioned = re.search(r'Versioned = "\$Prefix-v\$Version([^"]+)"', module).group(1)
         self.assertEqual(site.PLUGIN_ARCHIVE_NAME, prefix + archive)
-        self.assertEqual(site.VERSIONED_ARCHIVE_FORMAT.replace("{}", "{0}"), prefix + versioned)
+        self.assertEqual(site.VERSIONED_ARCHIVE_FORMAT, prefix + "-v{}" + versioned)
+        identity = (REPO_ROOT / "build" / "PluginIdentity.psm1").read_text(encoding="utf-8")
+        self.assertEqual(site.X64_NAME_SUFFIX, re.search(r"x64 = @\{ NameSuffix = '([^']+)'", identity).group(1))
+        self.assertEqual(site.X64_ARCHIVE_NAME, "teststand-mcp-x64.zip")
 
     def test_only_a_versioned_archive_name_joins_the_versioned_series(self):
         pattern = site.VERSIONED_ARCHIVE_PATTERN
         self.assertTrue(pattern.fullmatch("teststand-mcp-v1.9.0.zip"))
-        for name in (ZIP, "teststand-mcp-v1.9.0.zip.sha", "teststand-mcp-vX.zip", "xteststand-mcp-v1.9.0.zip", "teststand-mcp.sha256"):
+        self.assertTrue(pattern.fullmatch("teststand-mcp-x64-v1.9.0.zip"))
+        for name in (ZIP, "teststand-mcp-x64.zip", "teststand-mcp-arm64-v1.9.0.zip", "teststand-mcp-v1.9.0.zip.sha", "teststand-mcp-vX.zip", "xteststand-mcp-v1.9.0.zip", "teststand-mcp.sha256"):
             self.assertFalse(pattern.fullmatch(name), name)
 
     def test_install_series_sum_versioned_archives_and_ignore_other_assets(self):
         installs = {d("2026-08-21"): {ZIP: 4, "teststand-mcp-v1.9.0.zip": 2, "teststand-mcp-v1.9.1.zip": 1, "teststand-mcp.sha256": 9}}
-        latest, versioned = site.install_series(installs)
+        latest, latest64, versioned = site.install_series(installs)
         self.assertEqual(dict(latest.values), {d("2026-08-21"): 4})
+        self.assertEqual(dict(latest64.values), {d("2026-08-21"): 0})
         self.assertEqual(dict(versioned.values), {d("2026-08-21"): 3})
+
+    def test_each_plugin_has_its_own_series_and_both_versioned_archives_are_summed(self):
+        installs = {d("2026-08-21"): {ZIP: 4, "teststand-mcp-x64.zip": 7, "teststand-mcp-v1.9.0.zip": 2, "teststand-mcp-x64-v1.9.0.zip": 5,
+                                     "teststand-mcp-x64.sha256": 9}}
+        latest, latest64, versioned = site.install_series(installs)
+        self.assertEqual(latest64.style.label, "teststand-mcp-x64.zip")
+        self.assertEqual((latest.values[d("2026-08-21")], latest64.values[d("2026-08-21")], versioned.values[d("2026-08-21")]), (4, 7, 7))
 
     def test_the_chart_runs_from_the_first_data_point_to_the_last_day_and_is_bounded(self):
         series = [site.Series(site.INSTALL_STYLES["latest"], {d("2026-08-20"): 1})]
@@ -251,7 +263,7 @@ class SitePage(unittest.TestCase):
     def test_own_downloads_are_subtracted_on_the_page_by_the_contract(self):
         parts = PageParts(page_of(TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR))
         row = next(r for r in parts.table_rows if r and r[0] == "2026-08-21")
-        self.assertEqual(row, ["2026-08-21", "12", "0"])
+        self.assertEqual(row, ["2026-08-21", "12", "0", "0"])
 
     def test_the_draft_switch_changes_what_is_subtracted(self):
         page = page_of(TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR, subtract_drafts=False)
@@ -286,7 +298,7 @@ class SitePage(unittest.TestCase):
             self.assertTrue(parts.texts[desc_id].strip())
         installs_desc = parts.texts[parts.svgs[0]["aria-labelledby"].split()[1]]
         self.assertIn("12 in total", installs_desc)
-        self.assertEqual(parts.direct_labels, [ZIP, "Versioned archives", "Views", "Clones"])
+        self.assertEqual(parts.direct_labels, [ZIP, "teststand-mcp-x64.zip", "Versioned archives", "Views", "Clones"])
 
     def test_every_series_has_a_marker_element_in_the_markup(self):
         parts = PageParts(page_of(TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR, traffic=TRAFFIC_ROWS))
@@ -297,7 +309,7 @@ class SitePage(unittest.TestCase):
     def test_a_visible_table_of_the_daily_counts_follows_each_chart(self):
         parts = PageParts(page_of(TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR, traffic=TRAFFIC_ROWS))
         self.assertEqual(parts.order, ["figure", "svg", "table", "figure", "svg", "table"])
-        self.assertEqual(parts.column_headers[:3], ["Date (UTC)", ZIP, "Versioned archives"])
+        self.assertEqual(parts.column_headers[:4], ["Date (UTC)", ZIP, "teststand-mcp-x64.zip", "Versioned archives"])
 
     def test_no_table_or_chart_is_hidden_from_sighted_users(self):
         page = page_of(TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR, traffic=TRAFFIC_ROWS)
@@ -327,7 +339,7 @@ class SitePage(unittest.TestCase):
     def test_each_series_is_drawn_with_its_own_dash_pattern(self):
         parts = PageParts(page_of(TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR))
         dashes = [line.get("stroke-dasharray", "") for line in parts.polylines]
-        self.assertEqual(len(dashes), 2)
+        self.assertEqual(len(dashes), 3)
         self.assertEqual(len(set(dashes)), len(dashes))
 
     def test_no_data_shows_an_empty_state_instead_of_an_empty_chart(self):

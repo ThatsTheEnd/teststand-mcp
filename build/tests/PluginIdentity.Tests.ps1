@@ -82,6 +82,7 @@ function New-IdentityFiles {
 
 try {
     Import-Module $ModulePath -Force
+    Import-Module (Join-Path $RepoRoot 'build\ReleaseAssets.psm1') -Force
 
     # --- Scenario: The tool prefix is derived, not retyped --------------------
     Invoke-Case 'identity: tool prefix is derived from plugin.json and .mcp.json' {
@@ -90,6 +91,33 @@ try {
         Assert-Equal 'teststand' $identity.serverKey 'serverKey'
         Assert-Equal $ExpectedPluginToolPrefix $identity.pluginToolPrefix 'pluginToolPrefix'
         Assert-Equal $DirectToolPrefix $identity.directToolPrefix 'directToolPrefix'
+    }
+
+    # --- Scenario: one identity table for the x86 and x64 plugins ------------
+    Invoke-Case 'identity table: the x86 row is the committed plugin, the x64 row its 64-bit sibling' {
+        $expected = @{
+            x86 = @{ name = 'teststand-mcp';     displayName = 'TestStand MCP (32-bit)'; assetPrefix = 'teststand-mcp';     runtimeIdentifier = 'win-x86'; buildPlatform = 'x86'; bits = 32; pluginToolPrefix = 'mcp__plugin_teststand-mcp_teststand__' }
+            x64 = @{ name = 'teststand-mcp-x64'; displayName = 'TestStand MCP (64-bit)'; assetPrefix = 'teststand-mcp-x64'; runtimeIdentifier = 'win-x64'; buildPlatform = 'x64'; bits = 64; pluginToolPrefix = 'mcp__plugin_teststand-mcp-x64_teststand__' }
+        }
+        Assert-Equal 'x86,x64' ((Get-PluginArchitectures) -join ',') 'architectures'
+        foreach ($architecture in $expected.Keys) {
+            $identity = Get-PluginIdentity -Architecture $architecture
+            foreach ($field in $expected[$architecture].Keys) { Assert-Equal $expected[$architecture][$field] $identity.$field "$architecture $field" }
+            Assert-Equal 'teststand' $identity.serverKey "$architecture serverKey"
+            Assert-Contains $identity.description "For $($expected[$architecture].bits)-bit NI TestStand" "$architecture description"
+        }
+    }
+
+    Invoke-Case 'identity table: an unknown architecture fails naming the allowed values' {
+        $message = try { [void](Get-PluginIdentity -Architecture 'arm64'); '(nothing thrown)' } catch { $_.Exception.Message }
+        Assert-Contains $message "Unknown architecture 'arm64'" 'the value'
+        Assert-Contains $message 'x86 and x64' 'the allowed values'
+    }
+
+    Invoke-Case 'plugin.json: name, displayName and description are the x86 row of the identity table' {
+        $manifest = Read-JsonFile $PluginJsonPath
+        $identity = Get-PluginIdentity -Architecture 'x86'
+        foreach ($field in @('name', 'displayName', 'description')) { Assert-Equal $identity.$field $manifest.$field $field }
     }
 
     Invoke-Case 'identity: a different plugin name and server key change the prefix' {
@@ -145,29 +173,41 @@ try {
     }
 
     # --- Scenario: The marketplace points at the fixed latest URL -------------
-    Invoke-Case 'marketplace: one plugin teststand-mcp with the fixed latest archive URL' {
+    Invoke-Case 'marketplace: teststand-mcp first, with the fixed latest archive URL' {
         $marketplace = Read-JsonFile $MarketplacePath
         Assert-Equal 'zuehlke-teststand' $marketplace.name 'marketplace name'
-        Assert-Equal 1 @($marketplace.plugins).Count 'plugin count'
         $plugin = $marketplace.plugins[0]
         Assert-Equal 'teststand-mcp' $plugin.name 'plugin name'
         Assert-Equal 'archive' $plugin.source.source 'source kind'
         Assert-Equal $ExpectedArchiveUrl $plugin.source.url 'archive url'
     }
 
-    Invoke-Case 'marketplace: the plugin name equals the identity read from plugin.json' {
-        Assert-Equal (Get-PluginIdentity).name (Read-JsonFile $MarketplacePath).plugins[0].name 'marketplace plugin name'
+    Invoke-Case 'marketplace: one entry per row of the identity table, each with its own latest archive and bitness' {
+        $entries = @((Read-JsonFile $MarketplacePath).plugins)
+        $architectures = @(Get-PluginArchitectures)
+        Assert-Equal $architectures.Count $entries.Count 'plugin count'
+        for ($index = 0; $index -lt $architectures.Count; $index++) {
+            $identity = Get-PluginIdentity -Architecture $architectures[$index]
+            $entry = $entries[$index]
+            Assert-Equal $identity.name $entry.name "$($identity.architecture) name"
+            Assert-Equal 'archive' $entry.source.source "$($identity.name) source kind"
+            Assert-Equal (Get-LatestDownloadUrl -AssetName "$($identity.assetPrefix).zip") $entry.source.url "$($identity.name) archive url"
+            Assert-Equal $identity.description $entry.description "$($identity.name) description"
+            Assert-Contains $entry.description "For $($identity.bits)-bit NI TestStand" "$($identity.name) description"
+        }
     }
 
-    Invoke-Case 'marketplace and plugin.json repeat the same descriptive fields' {
-        $entry = (Read-JsonFile $MarketplacePath).plugins[0]
+    Invoke-Case 'marketplace: every entry repeats the descriptive fields of plugin.json' {
         $manifest = Read-JsonFile $PluginJsonPath
-        Assert-Equal $manifest.description $entry.description 'description'
-        Assert-Equal $manifest.author.name $entry.author.name 'author.name'
-        Assert-Equal $manifest.homepage $entry.homepage 'homepage'
-        Assert-Equal $manifest.repository $entry.repository 'repository'
-        Assert-Equal $manifest.license $entry.license 'license'
-        Assert-Equal ($manifest.keywords -join ',') ($entry.keywords -join ',') 'keywords'
+        Assert-Equal $manifest.description (Read-JsonFile $MarketplacePath).plugins[0].description 'the x86 description'
+        foreach ($entry in @((Read-JsonFile $MarketplacePath).plugins)) {
+            Assert-Equal $manifest.author.name $entry.author.name "$($entry.name) author.name"
+            Assert-Equal $manifest.homepage $entry.homepage "$($entry.name) homepage"
+            Assert-Equal $manifest.repository $entry.repository "$($entry.name) repository"
+            Assert-Equal $manifest.license $entry.license "$($entry.name) license"
+            Assert-Equal ($manifest.keywords -join ',') ($entry.keywords -join ',') "$($entry.name) keywords"
+            Assert-Equal 'development' $entry.category "$($entry.name) category"
+        }
     }
 
     Invoke-Case 'plugin.json: carries the version placeholder 0.0.0 as a literal line' {

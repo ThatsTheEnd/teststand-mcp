@@ -5,7 +5,9 @@
 #  Windows PowerShell 5.1 and PowerShell 7. Never blocks: it prints one JSON object
 #  and exits 0, and every failure is silent.
 #
-#    - TestStand missing: warned EVERY time (the server cannot work without it).
+#    - TestStand missing: warned EVERY time (the server cannot work without it). Only the TestStand
+#      of the plugin's own bitness counts (the x86 plugin drives 32-bit, the x64 plugin 64-bit);
+#      when only the other one is installed, the warning names the plugin that drives it.
 #    - Python, python-docx, Pillow, Edge/Chrome missing: OPTIONAL (only the doc and
 #      presentation agents need them). They are probed at most once per 24 hours; the
 #      outcome (the missing set, possibly empty) is cached with its time in
@@ -26,6 +28,15 @@ $script:TestStandVendorFolder = 'National Instruments'
 $script:BrowserRelativePaths = @('Microsoft\Edge\Application\msedge.exe', 'Google\Chrome\Application\chrome.exe')
 $script:BrowserCommandNames = @('msedge', 'chrome')
 $script:ProgramFilesVariables = @('ProgramW6432', 'ProgramFiles', 'ProgramFiles(x86)')
+$script:MarketplaceName = 'zuehlke-teststand'
+# The TestStand bitness each plugin drives, with that bitness's Program Files root and the environment
+# variable its TestStand sets. A plugin's name is the base name plus the row's suffix (the NameSuffix of
+# build/PluginIdentity.psm1; PlatformGuard tests pin this copy), so neither archive spells the other's name.
+# The suffixed row comes first: every name ends in the empty suffix.
+$script:PluginBitness = @(
+    @{ Suffix = '-x64'; Bits = 64; RootVariable = 'ProgramW6432';      EnvVariable = 'TestStand64' }
+    @{ Suffix = '';     Bits = 32; RootVariable = 'ProgramFiles(x86)'; EnvVariable = 'TestStand' }
+)
 
 # Probe budget. The hook timeout in hooks.json is 10 s. Worst case: a PowerShell start of about
 # 0.6 s, then two interpreters that both hang, each cut off after 3 s plus up to 1 s to kill its
@@ -49,6 +60,7 @@ $script:RulesContext = 'TestStand MCP: before any TestStand work in this session
 $script:MessageHeader = 'TestStand MCP: this station needs attention.'
 $script:TestStandFix = 'install NI TestStand 2019 or later, or start Claude Code where TestStand is installed'
 $script:TestStandText = "NI TestStand was not detected. Fix: $($script:TestStandFix)."
+$script:OtherBitnessText = 'NI TestStand {0}-bit was not detected, but {1}-bit TestStand is installed, and this plugin ({2}) drives {0}-bit TestStand only. Fix: for the {1}-bit TestStand install the {3} plugin (claude plugin install {3}@{4}), or install {0}-bit NI TestStand 2019 or later.'
 $script:PythonText = 'Python was not found (neither "py -3" nor "python" answered). Fix: install Python 3 from python.org, then run: py -m pip install python-docx pillow'
 $script:DocxText = 'python-docx is not installed. Fix: {0}'
 $script:PillowText = 'Pillow is not installed. Fix: {0}'
@@ -69,15 +81,31 @@ function Get-ProgramFilesRoots {
     return $roots
 }
 
+# A TestStand of one bitness: its environment variable, or a TestStand folder under its own Program Files root.
 function Test-TestStandDetected {
-    if ($null -ne (Get-HookEnvironmentText 'TestStand')) { return $true }
-    foreach ($root in (Get-ProgramFilesRoots)) {
-        $vendorDir = Join-Path $root $script:TestStandVendorFolder
-        if (-not (Test-Path -LiteralPath $vendorDir -PathType Container)) { continue }
-        $installs = @(Get-ChildItem -LiteralPath $vendorDir -Directory -Filter $script:TestStandFolderFilter -ErrorAction SilentlyContinue)
-        if ($installs.Count -gt 0) { return $true }
+    param([Parameter(Mandatory)]$Bitness)
+    if ($null -ne (Get-HookEnvironmentText $Bitness.EnvVariable)) { return $true }
+    $root = Get-HookEnvironmentText $Bitness.RootVariable
+    if ($null -eq $root) { return $false }
+    $vendorDir = Join-Path $root $script:TestStandVendorFolder
+    if (-not (Test-Path -LiteralPath $vendorDir -PathType Container)) { return $false }
+    return (@(Get-ChildItem -LiteralPath $vendorDir -Directory -Filter $script:TestStandFolderFilter -ErrorAction SilentlyContinue).Count -gt 0)
+}
+
+# The TestStand warning for this plugin, or $null when its own TestStand is there. An unreadable plugin
+# name counts as the default plugin.
+function Get-TestStandWarning {
+    $ownName = Get-HookPluginName
+    if ($null -eq $ownName) { $ownName = $script:DefaultPluginName }
+    $own = @($script:PluginBitness | Where-Object { $ownName.EndsWith($_.Suffix, [StringComparison]::Ordinal) })[0]
+    if (Test-TestStandDetected $own) { return $null }
+    $baseName = $ownName.Substring(0, $ownName.Length - $own.Suffix.Length)
+    foreach ($other in $script:PluginBitness) {
+        if ($other.Bits -ne $own.Bits -and (Test-TestStandDetected $other)) {
+            return ($script:OtherBitnessText -f $own.Bits, $other.Bits, $ownName, ($baseName + $other.Suffix), $script:MarketplaceName)
+        }
     }
-    return $false
+    return $script:TestStandText
 }
 
 function Test-BrowserInstalled {
@@ -172,11 +200,11 @@ function New-Finding {
     return [pscustomobject]@{ Id = $Id; IsOptional = $IsOptional; Text = $Text }
 }
 
-# $Facts: HasTestStand, and Optional = $null (not probed) or @{ Python = $null | @{ Command; HasDocx; HasPillow }; HasBrowser }.
+# $Facts: TestStandWarning ($null when TestStand is fine), and Optional = $null (not probed) or @{ Python = $null | @{ Command; HasDocx; HasPillow }; HasBrowser }.
 function Get-Findings {
     param([Parameter(Mandatory)]$Facts)
     $findings = @()
-    if (-not $Facts.HasTestStand) { $findings += New-Finding 'teststand' $false $script:TestStandText }
+    if ($null -ne $Facts.TestStandWarning) { $findings += New-Finding 'teststand' $false $Facts.TestStandWarning }
     if ($null -eq $Facts.Optional) { return $findings }
     $python = $Facts.Optional.Python
     if ($null -eq $python) {
@@ -232,14 +260,14 @@ function Get-OptionalFacts {
 }
 
 # A detection that throws counts as "detected": a warning must be about something observed.
-function Get-HasTestStand {
-    try { return (Test-TestStandDetected) } catch { return $true }
+function Get-SafeTestStandWarning {
+    try { return (Get-TestStandWarning) } catch { return $null }
 }
 
 function Invoke-PlatformGuard {
     $nowEpoch = (Get-HookNow).ToUnixTimeSeconds()
     $isOptionalDue = Test-OptionalProbeDue (Read-HookState $script:GuardStateFile) $nowEpoch (Test-HookFlag $script:OptOutVariable)
-    $facts = @{ HasTestStand = (Get-HasTestStand); Optional = $null }
+    $facts = @{ TestStandWarning = (Get-SafeTestStandWarning); Optional = $null }
     if ($isOptionalDue) { $facts.Optional = Get-OptionalFacts }
     $allFindings = @(Get-Findings $facts)
     $shown = @(Select-DueFindings $allFindings $isOptionalDue)
