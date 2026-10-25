@@ -80,6 +80,16 @@ class NetInstalls(unittest.TestCase):
         result = net_installs.installs_per_day({d("2026-08-20"): before, d("2026-08-21"): after}, [])
         self.assertEqual(result[d("2026-08-21")][ZIP], 10)
 
+    def test_both_plugins_archives_are_counted_and_their_own_downloads_subtracted_per_asset(self):
+        x64 = "teststand-mcp-x64.zip"
+        before = {("v1.9.0", ZIP): 50, ("v1.9.0", x64): 20}
+        after = {("v1.9.0", ZIP): 60, ("v1.9.0", x64): 29}
+        records = [own("1", "2026-08-21", ZIP, 1, 2), own("1", "2026-08-21", x64, 1, 1)]
+        result = net_installs.installs_per_day({d("2026-08-20"): before, d("2026-08-21"): after}, records)
+        self.assertEqual(result[d("2026-08-21")], {ZIP: 7, x64: 7})
+        counts, warnings = net_installs.asset_counts_from_releases([release("v1.9.0", {ZIP: 60, x64: 29})])
+        self.assertEqual((sorted(c.asset for c in counts), warnings), (sorted([ZIP, x64]), []))
+
     def test_a_release_that_disappeared_does_not_make_installs_negative(self):
         before = {("v1.8.0", ZIP): 50, ("v1.9.0", ZIP): 5}
         after = {("v1.9.0", ZIP): 8}

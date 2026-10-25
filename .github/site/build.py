@@ -27,11 +27,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "stats"))
 import net_installs as domain  # noqa: E402
 import stats_csv  # noqa: E402  (the CSV schema constants live there)
 
-# The asset names of build/ReleaseAssets.psm1; test_collect.py greps them out of it.
+# The asset names of build/ReleaseAssets.psm1; test_site_build.py greps them out of it. They are the x86
+# plugin's; the x64 plugin's insert build/PluginIdentity.psm1's NameSuffix after the prefix.
 PLUGIN_ARCHIVE_NAME = "teststand-mcp.zip"
 VERSIONED_ARCHIVE_FORMAT = "teststand-mcp-v{}.zip"
+X64_NAME_SUFFIX = "-x64"
+_PREFIX = PLUGIN_ARCHIVE_NAME.removesuffix(".zip")
+X64_ARCHIVE_NAME = _PREFIX + X64_NAME_SUFFIX + ".zip"
 _VERSIONED_PREFIX, _VERSIONED_SUFFIX = VERSIONED_ARCHIVE_FORMAT.split("{}")
-VERSIONED_ARCHIVE_PATTERN = re.compile(re.escape(_VERSIONED_PREFIX) + r"\d+\.\d+\.\d+" + re.escape(_VERSIONED_SUFFIX))
+# Either plugin's versioned archive: teststand-mcp-v1.9.0.zip or teststand-mcp-x64-v1.9.0.zip.
+VERSIONED_ARCHIVE_PATTERN = re.compile(re.escape(_PREFIX) + f"(?:{re.escape(X64_NAME_SUFFIX)})?"
+                                       + re.escape(_VERSIONED_PREFIX.removeprefix(_PREFIX)) + r"\d+\.\d+\.\d+" + re.escape(_VERSIONED_SUFFIX))
 
 MAX_CHART_DAYS = 366
 MAX_Y_TICKS = 5
@@ -45,17 +51,17 @@ MARKER_RADIUS = 4
 # WCAG contrast ratios of every text and series colour against the background it sits on,
 # computed with the formula test_collect.py uses (it fails below 4.5):
 #   light  text/bg 17.4  muted/bg 10.37  text/note 15.68  muted/note 9.34
-#          latest 8.35  versioned 6.18  views 6.12  clones 7.34   (on bg)
+#          latest 8.35  latest64 7.72  versioned 6.18  views 6.12  clones 7.34   (on bg)
 #   dark   text/bg 15.86  muted/bg 10.74  text/note 14.11  muted/note 9.56
-#          latest 8.41  versioned 9.01  views 9.83  clones 8.7    (on bg)
+#          latest 8.41  latest64 8.65  versioned 9.01  views 9.83  clones 8.7    (on bg)
 PALETTE = {
     "light": {"bg": "#ffffff", "text": "#1a1a1a", "muted": "#404040", "note": "#f3f3f3", "grid": "#c8c8c8", "border": "#8a8a8a",
-              "latest": "#00508a", "versioned": "#a64200", "views": "#00704f", "clones": "#8e3568"},
+              "latest": "#00508a", "latest64": "#5b3fa8", "versioned": "#a64200", "views": "#00704f", "clones": "#8e3568"},
     "dark": {"bg": "#121212", "text": "#ececec", "muted": "#c4c4c4", "note": "#1e1e1e", "grid": "#444444", "border": "#8a8a8a",
-             "latest": "#6cb4f0", "versioned": "#f0a35e", "views": "#5fd0a0", "clones": "#e59ac4"},
+             "latest": "#6cb4f0", "latest64": "#b9a4f5", "versioned": "#f0a35e", "views": "#5fd0a0", "clones": "#e59ac4"},
 }
 TEXT_PAIRS = (("text", "bg"), ("muted", "bg"), ("text", "note"), ("muted", "note"),
-              ("latest", "bg"), ("versioned", "bg"), ("views", "bg"), ("clones", "bg"))
+              ("latest", "bg"), ("latest64", "bg"), ("versioned", "bg"), ("views", "bg"), ("clones", "bg"))
 
 
 @dataclass(frozen=True)
@@ -84,6 +90,7 @@ class Chart:
 
 INSTALL_STYLES = {
     "latest": SeriesStyle(PLUGIN_ARCHIVE_NAME, "latest", "", "circle"),
+    "latest64": SeriesStyle(X64_ARCHIVE_NAME, "latest64", "6 2 1 2", "down"),
     "versioned": SeriesStyle("Versioned archives", "versioned", "8 4", "square"),
 }
 TRAFFIC_STYLES = {
@@ -97,13 +104,14 @@ TRAFFIC_STYLES = {
 # --------------------------------------------------------------------------
 
 def install_series(installs: Mapping[date, Mapping[str, int]]) -> list[Series]:
-    """Net installs per day: the latest-archive asset, and every versioned archive summed."""
+    """Net installs per day: each plugin's latest-archive asset, and every versioned archive of both summed."""
     latest = {day: assets.get(PLUGIN_ARCHIVE_NAME, 0) for day, assets in installs.items()}
+    latest64 = {day: assets.get(X64_ARCHIVE_NAME, 0) for day, assets in installs.items()}
     versioned = {
         day: sum(count for asset, count in assets.items() if VERSIONED_ARCHIVE_PATTERN.fullmatch(asset))
         for day, assets in installs.items()
     }
-    return [Series(INSTALL_STYLES["latest"], latest), Series(INSTALL_STYLES["versioned"], versioned)]
+    return [Series(INSTALL_STYLES["latest"], latest), Series(INSTALL_STYLES["latest64"], latest64), Series(INSTALL_STYLES["versioned"], versioned)]
 
 
 def traffic_series(rows: Iterable[Mapping[str, str]]) -> list[Series]:
@@ -171,6 +179,7 @@ def marker_svg(style: SeriesStyle, x: float, y: float) -> str:
     outline = {
         "triangle": [(x, y - r - 1), (x + r + 1, y + r), (x - r - 1, y + r)],
         "diamond": [(x, y - r - 1), (x + r + 1, y), (x, y + r + 1), (x - r - 1, y)],
+        "down": [(x, y + r + 1), (x + r + 1, y - r), (x - r - 1, y - r)],
     }[style.marker]
     points = " ".join(f"{px:.1f},{py:.1f}" for px, py in outline)
     return f'<polygon points="{points}" {css}/>'
@@ -271,7 +280,7 @@ figure {{ margin: 0; }}
 .grid {{ stroke: var(--grid); stroke-width: 1; }}
 .tick {{ font-size: 11px; fill: var(--muted); }}
 .label {{ font-size: 12px; font-weight: 600; }}
-.s-latest {{ --c: var(--latest); }} .s-versioned {{ --c: var(--versioned); }}
+.s-latest {{ --c: var(--latest); }} .s-latest64 {{ --c: var(--latest64); }} .s-versioned {{ --c: var(--versioned); }}
 .s-views {{ --c: var(--views); }} .s-clones {{ --c: var(--clones); }}
 .line {{ fill: none; stroke: var(--c); stroke-width: 2; }}
 .marker {{ fill: var(--c); stroke: var(--bg); stroke-width: 1; }}
