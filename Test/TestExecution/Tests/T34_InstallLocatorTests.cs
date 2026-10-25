@@ -6,7 +6,7 @@ using Microsoft.Win32;
 using NUnit.Framework;
 using TestStandMCP.Services;
 
-namespace TestStandMCP.IntegrationTests.Tests;
+namespace TestStandMCP.UnitTests;
 
 /// <summary>
 /// Pure (engine-free) tests for <see cref="TestStandInstallLocator"/> and the child-environment
@@ -21,7 +21,7 @@ namespace TestStandMCP.IntegrationTests.Tests;
 ///      registration was invisible.
 /// The fix for (1)-(3) then crossed bitness (an x86 host launched 64-bit tools), so resolution is
 /// now same-bitness only: the connected engine's Bin, else the process's own root and view.
-/// Does NOT inherit TestBase, so no TestStand engine is connected.
+/// Outside the TestStandMCP.IntegrationTests namespace, so the assembly SetUpFixture connects no engine.
 /// </summary>
 [TestFixture]
 [Category("PureLogic")]
