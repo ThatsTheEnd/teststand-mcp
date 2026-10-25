@@ -31,14 +31,7 @@ public class ServerInfoVersionTests
 
         Assert.That(serverInfo.Name, Is.EqualTo(VersionInfo.ProductName));
         Assert.That(serverInfo.Version, Is.EqualTo(VersionInfo.Current.Version));
-        Assert.That(serverInfo.Version, Is.Not.Empty);
-    }
-
-    [Test]
-    public void McpServerInfo_Default_IsANeutralDataHolderWithoutAVersion()
-    {
-        var serverInfo = new McpServerInfo();
-
-        Assert.That(serverInfo.Version, Is.Empty);
+        Assert.That(serverInfo.Version, Is.Not.EqualTo("0.0.0-dev"), "an unstamped build must never present itself as a release");
+        Assert.That(serverInfo.Version, Does.Match(@"^\d+\.\d+\.\d+"), "a version a client can compare");
     }
 }

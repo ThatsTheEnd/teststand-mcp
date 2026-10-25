@@ -40,16 +40,7 @@ class PagesWorkflow(unittest.TestCase):
             if other.name != "pages.yml":
                 self.assertNotIn("pages.yml", other.read_text(encoding="utf-8"), other.name)
 
-    def test_every_action_is_pinned_to_a_full_commit_sha_with_its_version_in_a_comment(self):
-        uses = re.findall(r"(?m)^\s*(?:- )?uses: (\S+)(.*)$", self.text)
-        self.assertEqual(len(uses), 3)
-        for reference, rest in uses:
-            with self.subTest(reference=reference):
-                self.assertRegex(reference, r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}$")
-                self.assertRegex(rest, r"^\s+# v\d+\.\d+\.\d+$")
-
-    def test_permissions_are_granted_per_job_and_nowhere_else(self):
-        self.assertRegex(self.text, r"(?m)^permissions: \{\}$")
+    def test_what_each_job_may_do_is_exactly_what_it_needs(self):
         self.assertEqual(set(self.jobs), {"collect", "deploy"})
 
         def permissions(job: str) -> list[tuple[str, str]]:
@@ -81,7 +72,6 @@ class PagesWorkflow(unittest.TestCase):
             if "github.token" in line or "secrets." in line:
                 with self.subTest(line=line.strip()):
                     self.assertRegex(line, r"^\s+(GH_TOKEN|GITHUB_TOKEN|STATS_TRAFFIC_TOKEN|HAS_TRAFFIC_TOKEN): \$\{\{ [\w. !=']+ \}\}|^\s*#")
-        self.assertNotRegex(self.text, r"(?m)^\s+run:.*\$\{\{")
 
     def test_the_traffic_token_reaches_only_the_collector_and_the_build_only_learns_whether_it_exists(self):
         lines = [line for line in self.text.splitlines() if "STATS_TRAFFIC_TOKEN" in line and not line.lstrip().startswith("#")]

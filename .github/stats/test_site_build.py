@@ -124,6 +124,35 @@ TWO_RUNS_OF_FOUR = csv_text(HEADER["own"], f"1,2026-08-21,{ZIP},3,1", f"2,2026-0
 TRAFFIC_ROWS = csv_text(HEADER["traffic"], "2026-08-20,views,7,3", "2026-08-20,clones,2,1", "2026-08-21,views,4,2")
 
 
+def parse_css(text: str, media: str | None = None) -> list[tuple[str | None, str, dict[str, str]]]:
+    """The rules of a stylesheet as (media query, selector, declarations); one level of @media is enough here."""
+    rules: list[tuple[str | None, str, dict[str, str]]] = []
+    position = 0
+    while (opening := text.find("{", position)) >= 0:
+        head = text[position:opening].strip()
+        depth, end = 1, opening + 1
+        while depth:
+            depth += {"{": 1, "}": -1}.get(text[end], 0)
+            end += 1
+        body = text[opening + 1:end - 1]
+        if head.startswith("@media"):
+            rules.extend(parse_css(body, head[len("@media"):].strip()))
+        else:
+            declarations = {name.strip(): value.strip() for name, value in (part.split(":", 1) for part in body.split(";") if ":" in part)}
+            rules.extend((media, selector.strip(), declarations) for selector in head.split(","))
+        position = end
+    return rules
+
+
+def declared(selector: str, media: str | None = None) -> dict[str, str]:
+    """What the stylesheet of the page declares for exactly this selector (in the given media query)."""
+    merged: dict[str, str] = {}
+    for rule_media, rule_selector, declarations in parse_css(site.STYLE):
+        if rule_selector == selector and rule_media == media:
+            merged.update(declarations)
+    return merged
+
+
 def contrast(foreground: str, background: str) -> float:
     def luminance(color: str) -> float:
         channels = [int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
@@ -132,6 +161,22 @@ def contrast(foreground: str, background: str) -> float:
 
     lighter, darker = sorted((luminance(foreground), luminance(background)), reverse=True)
     return (lighter + 0.05) / (darker + 0.05)
+
+
+class CssReader(unittest.TestCase):
+    def test_the_reader_resolves_selectors_media_and_declarations(self):
+        rules = parse_css(":root { a: 1; --b: #fff } @media (x: y) { :root { --b: #000 } } h1, h2 { font-size: 2px; color: red; }")
+        self.assertEqual(rules, [
+            (None, ":root", {"a": "1", "--b": "#fff"}),
+            ("(x: y)", ":root", {"--b": "#000"}),
+            (None, "h1", {"font-size": "2px", "color": "red"}),
+            (None, "h2", {"font-size": "2px", "color": "red"}),
+        ])
+
+    def test_the_real_stylesheet_has_rules_for_what_the_page_tests_look_at(self):
+        for selector in (":root", "body", ".scroll", ".scroll:focus-visible"):
+            self.assertTrue(declared(selector), selector)
+        self.assertTrue(declared(":root", "(prefers-color-scheme: dark)"))
 
 
 class SiteSeries(unittest.TestCase):
@@ -189,9 +234,17 @@ class SiteSeries(unittest.TestCase):
                     self.assertGreaterEqual(contrast(colors[foreground], colors[background]), 4.5)
 
     def test_the_page_follows_the_preferred_colour_scheme(self):
-        self.assertIn("color-scheme: light dark", site.STYLE)
-        self.assertIn("@media (prefers-color-scheme: dark)", site.STYLE)
-        self.assertIn(site.PALETTE["dark"]["bg"], site.STYLE)
+        dark_query = "(prefers-color-scheme: dark)"
+        self.assertEqual(declared(":root")["color-scheme"], "light dark")
+        # The colours a reader gets: the light palette, overlaid by the dark one when the system prefers dark.
+        light = {name: value for name, value in declared(":root").items() if name.startswith("--")}
+        dark = {**light, **{name: value for name, value in declared(":root", dark_query).items() if name.startswith("--")}}
+        for name, value in site.PALETTE["light"].items():
+            self.assertEqual(light[f"--{name}"], value, f"light --{name}")
+        for name, value in site.PALETTE["dark"].items():
+            self.assertEqual(dark[f"--{name}"], value, f"dark --{name}")
+        self.assertEqual(declared("body")["background"], "var(--bg)")
+        self.assertEqual(declared("body")["color"], "var(--text)")
 
 
 class SitePage(unittest.TestCase):
@@ -257,12 +310,16 @@ class SitePage(unittest.TestCase):
         for region in parts.regions:
             self.assertEqual((region["tabindex"], region["role"]), ("0", "region"))
             self.assertTrue(region["aria-label"].strip())
-        self.assertIn(".scroll { overflow-x: auto; }", site.STYLE)
+        self.assertEqual(declared(".scroll").get("overflow-x"), "auto")
+        self.assertIn("outline", declared(".scroll:focus-visible"))   # a keyboard user sees which region has the focus
 
     def test_the_chart_keeps_its_natural_width_so_the_labels_stay_legible_on_a_narrow_screen(self):
         svg = PageParts(page_of(TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR)).svgs[0]
         self.assertEqual(svg["width"], str(site.WIDTH))
-        self.assertNotRegex(site.STYLE, r"\.chart[^}]*max-width")
+        for media, selector, declarations in parse_css(site.STYLE):
+            if ".chart" in selector:
+                self.assertNotIn("max-width", declarations, selector)
+                self.assertNotIn("width", declarations, selector)
 
     def test_a_chart_is_not_followed_by_a_caption_that_repeats_the_heading(self):
         self.assertNotIn("figcaption", page_of(TWO_SNAPSHOTS, TWO_RUNS_OF_FOUR, traffic=TRAFFIC_ROWS))

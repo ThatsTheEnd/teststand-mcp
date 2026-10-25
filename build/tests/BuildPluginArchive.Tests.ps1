@@ -460,7 +460,7 @@ try {
     Invoke-Case 'staging: the plugin agents are the converted source agents, the direct agents are unchanged and ship link-agents.bat' {
         $stage = New-StagedCopy
         $sources = @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot '.claude\agents') -File -Filter '*.md')
-        Assert-True ($sources.Count -ge 3) 'the repository should have its agents'
+        Assert-True ($sources.Count -gt 0) 'the repository has no agent, so the loop below would check nothing'
         Assert-Equal $sources.Count (Get-RelativeFileList (Join-Path $stage 'agents')).Count 'plugin agent count'
         foreach ($source in $sources) {
             $plugin = [IO.File]::ReadAllText((Join-Path $stage "agents\$($source.Name)"))
@@ -548,9 +548,11 @@ try {
             return @($items | ForEach-Object { ($_.Groups[1].Value -split '[\\/]')[0] } | Sort-Object -Unique | Where-Object { $handled -cnotcontains $_ })
         }
         $project = [IO.File]::ReadAllText((Join-Path $RepoRoot 'TestStandMCP.csproj'))
-        Assert-True ([regex]::Matches($project, 'CopyToOutputDirectory').Count -ge 4) 'the csproj should copy items to the output'
         Assert-Equal 0 (Get-UnhandledOutputItem $project).Count "csproj output items the staging table does not handle: $((Get-UnhandledOutputItem $project) -join ', ')"
+        # What the check can see is proved on a small fixture, not by counting things in the real csproj.
         Assert-Equal 'extras' ((Get-UnhandledOutputItem '<None Include="extras\**\*" CopyToOutputDirectory="PreserveNewest" />') -join ',') 'the drift check sees a new item'
+        Assert-Equal 'extras,more' ((Get-UnhandledOutputItem '<Content Include="more\a.txt" CopyToOutputDirectory="Always" /><None Update="extras\b" CopyToOutputDirectory="Always" /><None Include="scripts\x" CopyToOutputDirectory="Always" />') -join ',') 'both Include and Update, Content and None, and an item that is handled is not reported'
+        Assert-Equal 0 (Get-UnhandledOutputItem '<None Include="scripts\x.ps1" />').Count 'an item that is not copied to the output is not looked at'
     }
 
     # ---- the Outline rows of slice 5.2, one fixture each ------------------
@@ -910,7 +912,6 @@ try {
         $second = Join-Path (New-TempDir) 'b.zip'
         New-PluginZip -StageDir $stage -ZipPath $first -Timestamp $FixedTimestamp
         (Get-Item -LiteralPath (Join-Path $stage 'VERSION.txt')).LastWriteTime = [DateTime]::new(2020, 1, 2, 3, 4, 6)
-        Start-Sleep -Milliseconds 2100
         New-PluginZip -StageDir $stage -ZipPath $second -Timestamp $FixedTimestamp
         Assert-Equal (Get-FileSha256 $first) (Get-FileSha256 $second) 'the two archives'
         $zip = [IO.Compression.ZipFile]::OpenRead($first)

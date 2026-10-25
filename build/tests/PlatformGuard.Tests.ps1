@@ -265,18 +265,33 @@ try {
 
     # --- a failing probe must not cost the TestStand warning or the rules pointer -----------------------
     Invoke-Case 'guard: a probe that throws is "not probed": the TestStand warning and the rules pointer are still printed, no state is recorded' {
-        $dir = New-HooksCopy
-        $scriptPath = Join-Path $dir 'platform-guard.ps1'
-        $text = [IO.File]::ReadAllText($scriptPath, $Utf8NoBom)
-        Assert-Contains $text 'function Find-Python {' 'the function to break'
-        [IO.File]::WriteAllText($scriptPath, $text.Replace('function Find-Python {', "function Find-Python {`n    throw 'injected probe failure'"), $Utf8NoBom)
         $fixture = New-GuardFixture -NoTestStand
-        $result = Invoke-Guard $fixture -ScriptPath $scriptPath
+        $result = Invoke-Guard $fixture -Extra @{ TESTSTAND_MCP_HOOK_SIMULATE = 'python-probe' }
         Assert-GuardClean $result
         Assert-Contains $result.Message 'NI TestStand was not detected' 'warning'
         Assert-NotContains $result.Message 'Python' 'no optional finding from a failed probe'
         Assert-Contains $result.Context 'teststand-rules' 'the rules pointer'
         Assert-True (-not (Test-Path -LiteralPath $fixture.State)) 'no state is recorded for a failed probe'
+    }
+
+    Invoke-Case 'guard: the simulated failure is ignored without TESTSTAND_MCP_STATE_DIR, so production cannot trip it' {
+        $fixture = New-GuardFixture -NoTestStand -PyOut '1 0'
+        $pluginData = Join-Path $fixture.Root 'plugin-data'
+        $result = Invoke-Guard $fixture -Extra @{ TESTSTAND_MCP_HOOK_SIMULATE = 'python-probe'; TESTSTAND_MCP_STATE_DIR = $null; CLAUDE_PLUGIN_DATA = $pluginData }
+        Assert-GuardClean $result
+        Assert-Contains $result.Message 'Pillow' 'the probe ran and found the missing optional package: the failure was never raised'
+    }
+
+    Invoke-Case 'hooks (pure): Invoke-HookSimulation throws for its name only, and only when the state directory is set' {
+        . (Join-Path $HooksDir 'hook-common.ps1')
+        Use-Environment @{ TESTSTAND_MCP_STATE_DIR = 'C:\Temp\state'; TESTSTAND_MCP_HOOK_SIMULATE = 'a' } {
+            Invoke-HookSimulation 'b'
+            $thrown = $null
+            try { Invoke-HookSimulation 'a' } catch { $thrown = $_.Exception.Message }
+            Assert-Equal 'simulated failure: a' $thrown 'the named failure'
+        }
+        Use-Environment @{ TESTSTAND_MCP_STATE_DIR = $null; TESTSTAND_MCP_HOOK_SIMULATE = 'a' } { Invoke-HookSimulation 'a' }
+        Use-Environment @{ TESTSTAND_MCP_STATE_DIR = 'C:\Temp\state'; TESTSTAND_MCP_HOOK_SIMULATE = $null } { Invoke-HookSimulation 'a' }
     }
 
     # --- pure decisions ----------------------------------------------------------------------------------

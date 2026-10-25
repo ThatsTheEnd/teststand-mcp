@@ -360,15 +360,17 @@ try {
 
     Invoke-ServerCase 'notify: a failing state write cannot cost the message (the output is written first)' {
         $fixture = New-NotifyFixture
-        $dir = New-HooksCopy
-        $scriptPath = Join-Path $dir 'update-notify.ps1'
-        $text = [IO.File]::ReadAllText($scriptPath, $Utf8NoBom)
-        Assert-Contains $text 'function New-AnnouncedState {' 'the function to break'
-        [IO.File]::WriteAllText($scriptPath, $text.Replace('function New-AnnouncedState {', "function New-AnnouncedState {`n    throw 'injected state failure'"), $Utf8NoBom)
-        $envOverrides = @{ CLAUDE_PLUGIN_ROOT = $fixture.PluginRoot; TESTSTAND_MCP_STATE_DIR = $fixture.State; TESTSTAND_MCP_NOW = $FixedNow.ToString('o'); TESTSTAND_MCP_NO_UPDATE_CHECK = $null }
-        $result = Invoke-HookScript -ScriptPath $scriptPath -StdinText '{}' -EnvOverrides $envOverrides
+        $result = Invoke-Notify $fixture -Extra @{ TESTSTAND_MCP_HOOK_SIMULATE = 'announced-state' }
         Assert-Equal 0 $result.ExitCode "exit code (stderr: $($result.Stderr))"
-        Assert-Contains $result.Stdout '1.10.0' 'the message was printed before the failure'
+        Assert-Contains $result.Message '1.10.0' 'the message was printed before the failure'
+    }
+
+    Invoke-ServerCase 'notify: the simulated failure is ignored without TESTSTAND_MCP_STATE_DIR, so production cannot trip it' {
+        $fixture = New-NotifyFixture
+        $pluginData = Join-Path (Split-Path -Parent $fixture.PluginRoot) 'plugin-data'
+        $result = Invoke-Notify $fixture -Extra @{ TESTSTAND_MCP_HOOK_SIMULATE = 'announced-state'; TESTSTAND_MCP_STATE_DIR = $null; CLAUDE_PLUGIN_DATA = $pluginData }
+        Assert-Contains $result.Message '1.10.0' 'the message'
+        Assert-True (Test-Path -LiteralPath (Join-Path $pluginData $NotifyStateFile)) 'the announcement was recorded: the failure was never raised'
     }
 
     # --- the pure decisions ------------------------------------------------------------------------------

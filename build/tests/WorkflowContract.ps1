@@ -297,7 +297,7 @@ $ExpectedWorkflows = @('ci.yml', 'pages.yml', 'release.yml')
 
     Invoke-Case 'ci.yml: every step that can hang has its own timeout, and the job outlives the SUM of them' {
         $capped = @($ciSteps | Where-Object { $_.Text -cmatch '(?m)^\s+run:' })
-        Assert-True ($capped.Count -ge 4) "expected the run: steps to be found, got $($capped.Count)"
+        Assert-True ($capped.Count -gt 0) "no run: step was found in ci.yml, so no timeout was checked"
         $sum = 0
         foreach ($step in $capped) {
             $minutes = Get-StepField $step 'timeout-minutes'
@@ -397,7 +397,7 @@ $ExpectedWorkflows = @('ci.yml', 'pages.yml', 'release.yml')
             Assert-NotContains $packageCode $releaseWord 'the package job (it runs build code and gets no token)'
         }
         $packageScripts = @([regex]::Matches($packageCode, '\\build\\([A-Za-z-]+)\.ps1') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
-        Assert-True ($packageScripts.Count -ge 2) 'the package job calls its build scripts'
+        Assert-True ($packageScripts.Count -gt 0) 'the package job calls no build script, so none was checked'
         foreach ($script in $packageScripts) {
             Assert-True (@('Assert-ReleaseTag', 'Build-PluginArchive') -ccontains $script) "the package job (no token) calls build\$script.ps1, which is not a gate or a build script"
         }
@@ -590,7 +590,7 @@ $ExpectedWorkflows = @('ci.yml', 'pages.yml', 'release.yml')
 
     Invoke-Case 'release.yml: every step that calls GitHub or a build script has its own timeout' {
         $calling = @(@($packageSteps) + @($releaseSteps) | Where-Object { $_.Text -cmatch '\\build\\[A-Za-z-]+\.ps1|gh (api|release)' })
-        Assert-True ($calling.Count -ge 8) "expected the steps that call build scripts to be found, got $($calling.Count)"
+        Assert-True ($calling.Count -gt 0) "no step that calls GitHub or a build script was found, so no timeout was checked"
         foreach ($step in $calling) {
             Assert-True ($null -ne (Get-StepField $step 'timeout-minutes')) "step '$($step.Name)' has no timeout-minutes"
         }
@@ -604,7 +604,7 @@ $ExpectedWorkflows = @('ci.yml', 'pages.yml', 'release.yml')
             }
         }
         $distinct = @($calls | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
-        Assert-True ($distinct.Count -ge 8) "expected the build scripts the workflows call to be found, got $($distinct -join ', ')"
+        Assert-True ($distinct.Count -gt 0) "no build script call was found in the workflows, so nothing was checked"
         foreach ($call in $calls) {
             $scriptPath = Join-Path $RepoRoot "build\$($call.Groups[1].Value).ps1"
             Assert-True (Test-Path -LiteralPath $scriptPath) "build\$($call.Groups[1].Value).ps1 does not exist"

@@ -39,9 +39,6 @@ internal class Program
 
     private const string LoadPrototypeWorkerFlag = "--load-prototype-worker";
     private const string SetupAgentsFlag         = "--setup-agents";
-    private const string VersionFlag   = "--version";
-    private const string ListToolsFlag = "--list-tools";
-    private const string JsonFlag      = "--json";
 
     static async Task<int> Main(string[] args)
     {
@@ -210,9 +207,8 @@ internal class Program
     /// </summary>
     private static int? TryRunInformationalCommand(string[] args)
     {
-        var isVersion   = args.Contains(VersionFlag);
-        var isListTools = args.Contains(ListToolsFlag);
-        if (!isVersion && !isListTools)
+        var command = InformationalCommands.Parse(args);
+        if (command == InformationalCommand.None)
             return null;
 
         // Its own UTF-8 (no BOM) writer instead of Console.Out: the console's code page (e.g. 850)
@@ -220,10 +216,10 @@ internal class Program
         // changing Console.OutputEncoding changes the code page of a real console as a side effect.
         using var stdout = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
 
-        if (isVersion)
+        if (command == InformationalCommand.Version)
             stdout.Write(VersionInfo.Current.FormatForCli());
         else
-            WriteToolList(stdout, asJson: args.Contains(JsonFlag));
+            WriteToolList(stdout, asJson: command == InformationalCommand.ListToolsJson);
         return 0;
     }
 

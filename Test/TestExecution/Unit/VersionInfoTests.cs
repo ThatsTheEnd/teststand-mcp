@@ -195,13 +195,45 @@ public class VersionInfoTests
         Assert.That(info.Note, Does.Contain("absent"));
     }
 
+    // File.Exists never throws: a path with a NUL, and a directory that is called VERSION.txt, are both "not a file",
+    // which a tagged build reports as absent. Neither reaches the catch block of ReadReleaseMetadata.
     [Test]
-    public void VersionTxt_PathThatCannotBeUsed_ReturnsTheVersionWithANoteInsteadOfThrowing()
+    public void VersionTxt_PathWithAnIllegalCharacter_IsReportedAsAbsent()
     {
-        var info = VersionInfo.Resolve(TaggedInformationalVersion, "C:\\bad\0name\\" + VersionTxtName);
+        var path = "C:\\bad\0name\\" + VersionTxtName;
+
+        var info = VersionInfo.Resolve(TaggedInformationalVersion, path);
 
         Assert.That(info.Version, Is.EqualTo("1.9.0"));
-        Assert.That(info.Note, Is.Not.Null);
+        Assert.That(info.Note, Is.EqualTo($"release metadata absent ({path} not found)"));
+    }
+
+    [Test]
+    public void VersionTxt_DirectoryCalledVersionTxt_IsReportedAsAbsent()
+    {
+        Directory.CreateDirectory(VersionTxtPath);
+
+        var info = VersionInfo.Resolve(TaggedInformationalVersion, VersionTxtPath);
+
+        Assert.That(info.Version, Is.EqualTo("1.9.0"));
+        Assert.That(info.Tag, Is.Null);
+        Assert.That(info.Note, Is.EqualTo($"release metadata absent ({VersionTxtPath} not found)"));
+    }
+
+    // The real exception path: the file exists, but opening it for reading fails (another process holds it
+    // exclusively). The failure becomes a note naming the problem; the version survives.
+    [Test]
+    public void VersionTxt_FileHeldExclusivelyByAnotherProcess_ReturnsTheVersionWithAnUnreadableNoteInsteadOfThrowing()
+    {
+        var path = WriteVersionTxt(Lines("tag: v1.9.0"));
+        using var exclusive = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+
+        var info = VersionInfo.Resolve(TaggedInformationalVersion, path);
+
+        Assert.That(info.Version, Is.EqualTo("1.9.0"));
+        Assert.That(info.Commit, Is.EqualTo("abc123"));
+        Assert.That(info.Tag, Is.Null, "nothing could be read from the locked file");
+        Assert.That(info.Note, Does.StartWith("release metadata unreadable ("));
     }
 
     [TestCase("")]

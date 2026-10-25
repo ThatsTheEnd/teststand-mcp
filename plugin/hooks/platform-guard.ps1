@@ -147,6 +147,7 @@ function Invoke-Probe {
 
 # The first interpreter that answers the probe: @{ Command; HasDocx; HasPillow }, or $null.
 function Find-Python {
+    Invoke-HookSimulation 'python-probe'
     foreach ($candidate in $script:PythonCandidates) {
         $application = Get-Command -Name $candidate.Command -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -eq $application) { continue }

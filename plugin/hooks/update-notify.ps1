@@ -193,6 +193,7 @@ function Resolve-LatestVersion {
 # The state after an announcement: the lookup that produced the version, plus what was announced when.
 function New-AnnouncedState {
     param($State, [version]$Latest, [long]$NowEpoch)
+    Invoke-HookSimulation 'announced-state'
     return @{
         lookupEpoch      = (ConvertTo-EpochOrZero (Get-HookProperty $State 'lookupEpoch'))
         lookupOk         = $true

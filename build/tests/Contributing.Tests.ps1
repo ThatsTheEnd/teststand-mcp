@@ -139,11 +139,25 @@ try {
         Assert-Equal 0 $real.Problems.Count "problems:`n$($real.Problems -join "`n")"
     }
 
-    Invoke-Case 'CONTRIBUTING: the check looked at something (scripts, parameters, workflow inputs, messages)' {
-        Assert-True ($real.Seen.Scripts -ge 6) "only $($real.Seen.Scripts) script reference(s) were seen"
-        Assert-True ($real.Seen.Parameters -ge 8) "only $($real.Seen.Parameters) parameter(s) were seen"
-        Assert-True ($real.Seen.Inputs -ge 3) "only $($real.Seen.Inputs) workflow input(s) were seen"
-        Assert-True ($real.Seen.Messages -ge 10) "only $($real.Seen.Messages) quoted message line(s) were seen"
+    # What the check counts is proved on a small fixture with a known number of each, so a check that silently
+    # stopped looking cannot pass; on the real text it only has to have looked at all four kinds.
+    Invoke-Case 'CONTRIBUTING: the check counts exactly what a small fixture holds (scripts, parameters, workflow inputs, messages)' {
+        $fixture = @(
+            'powershell.exe -NoProfile -File build\Build-PluginArchive.ps1 -Version 0.0.0-ci -OutDir x'
+            'gh workflow run release.yml -f tag=v1.9.2-rehearsal -f dry_run=true'
+            '> The version ''<...>'' is not X.Y.Z (or X.Y.Z-suffix).'
+            '> The commit ''<...>'' is not a full 40-character SHA.'
+        ) -join "`n"
+        $found = Get-ContributingFindings -Text $fixture -Corpus $corpus
+        Assert-Equal 0 $found.Problems.Count "problems:`n$($found.Problems -join "`n")"
+        Assert-Equal 1 $found.Seen.Scripts 'script references'
+        Assert-Equal 4 $found.Seen.Parameters 'parameters of the script line: -NoProfile and -File (host flags, counted), -Version and -OutDir (the 0.0.0-ci suffix is no parameter)'
+        Assert-Equal 2 $found.Seen.Inputs 'workflow inputs'
+        Assert-Equal 2 $found.Seen.Messages 'quoted messages'
+    }
+
+    Invoke-Case 'CONTRIBUTING: the real text has scripts, parameters, workflow inputs and quoted messages, and the check saw each kind' {
+        foreach ($kind in @('Scripts', 'Parameters', 'Inputs', 'Messages')) { Assert-True ($real.Seen[$kind] -gt 0) "the check saw no $kind in CONTRIBUTING.md" }
     }
 
     # A doctored copy: the real text plus one bad line. Each case adds exactly one fault, so a check that

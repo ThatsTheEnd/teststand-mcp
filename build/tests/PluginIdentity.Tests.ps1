@@ -209,6 +209,30 @@ try {
         Assert-True ($null -eq $env.PSObject.Properties[$MachineEnvironmentVariable]) "$MachineEnvironmentVariable must not be written: an empty plugin value would mask a machine-wide setting"
     }
 
+    # The name of the environment variable is a convention of the configuration builder: the prefix given to
+    # AddEnvironmentVariables, then the key with every ':' written as '__'. If either side is renamed, the value a
+    # user types into the plugin would silently reach nobody.
+    function Get-EnvironmentNameOfPluginKey {
+        param([string]$ProgramText)
+        $prefix = [regex]::Match($ProgramText, 'AddEnvironmentVariables\("([^"]+)"\)')
+        $key = [regex]::Match($ProgramText, 'EnvironmentPathSetting\.Resolve\(config\["([^"]+)"\]')
+        Assert-True ($prefix.Success -and $key.Success) 'Program.cs no longer has the AddEnvironmentVariables prefix or the EnvironmentPathSetting.Resolve call this test reads'
+        return ($prefix.Groups[1].Value + $key.Groups[1].Value.Replace(':', '__'))
+    }
+
+    Invoke-Case '.mcp.json: the environment variable of tsenv_path is the prefix and the configuration key Program.cs reads' {
+        $programText = [IO.File]::ReadAllText((Join-Path $RepoRoot 'Program.cs'), $Utf8NoBom)
+        $expected = Get-EnvironmentNameOfPluginKey $programText
+        Assert-Equal 'TESTSTAND_MCP_TestStand__PluginEnvironmentPath' $expected 'the name derived from Program.cs'
+        $env = (Read-JsonFile $McpJsonPath).mcpServers.teststand.env
+        $names = @($env.PSObject.Properties | Where-Object { $_.Value -ceq '${user_config.tsenv_path}' } | ForEach-Object { $_.Name })
+        Assert-Equal $expected ($names -join ',') 'the variable that carries ${user_config.tsenv_path}'
+        $renamedKey = $programText.Replace('config["TestStand:PluginEnvironmentPath"]', 'config["TestStand:PluginTsenv"]')
+        Assert-True ((Get-EnvironmentNameOfPluginKey $renamedKey) -cne $names[0]) 'a renamed configuration key must make the check fail'
+        $renamedPrefix = $programText.Replace('AddEnvironmentVariables("TESTSTAND_MCP_")', 'AddEnvironmentVariables("TSMCP_")')
+        Assert-True ((Get-EnvironmentNameOfPluginKey $renamedPrefix) -cne $names[0]) 'a renamed prefix must make the check fail'
+    }
+
     Invoke-Case '.mcp.json: every ${user_config.KEY} it uses is declared in plugin.json userConfig' {
         $text = [IO.File]::ReadAllText($McpJsonPath, $Utf8NoBom)
         $declared = @((Read-JsonFile $PluginJsonPath).userConfig.PSObject.Properties | ForEach-Object { $_.Name })
