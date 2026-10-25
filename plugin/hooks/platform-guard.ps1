@@ -6,7 +6,7 @@
 #  and exits 0, and every failure is silent.
 #
 #    - TestStand missing: warned EVERY time (the server cannot work without it). Only the TestStand
-#      of the plugin's own bitness counts (teststand-mcp drives 32-bit, teststand-mcp-x64 64-bit);
+#      of the plugin's own bitness counts (the x86 plugin drives 32-bit, the x64 plugin 64-bit);
 #      when only the other one is installed, the warning names the plugin that drives it.
 #    - Python, python-docx, Pillow, Edge/Chrome missing: OPTIONAL (only the doc and
 #      presentation agents need them). They are probed at most once per 24 hours; the
@@ -30,11 +30,13 @@ $script:BrowserCommandNames = @('msedge', 'chrome')
 $script:ProgramFilesVariables = @('ProgramW6432', 'ProgramFiles', 'ProgramFiles(x86)')
 $script:MarketplaceName = 'zuehlke-teststand'
 # The TestStand bitness each plugin drives, with that bitness's Program Files root and the environment
-# variable its TestStand sets. The names are build/PluginIdentity.psm1's; PlatformGuard tests pin this copy.
-$script:PluginBitness = [ordered]@{
-    'teststand-mcp'     = @{ Bits = 32; RootVariable = 'ProgramFiles(x86)'; EnvVariable = 'TestStand' }
-    'teststand-mcp-x64' = @{ Bits = 64; RootVariable = 'ProgramW6432';      EnvVariable = 'TestStand64' }
-}
+# variable its TestStand sets. A plugin's name is the base name plus the row's suffix (the NameSuffix of
+# build/PluginIdentity.psm1; PlatformGuard tests pin this copy), so neither archive spells the other's name.
+# The suffixed row comes first: every name ends in the empty suffix.
+$script:PluginBitness = @(
+    @{ Suffix = '-x64'; Bits = 64; RootVariable = 'ProgramW6432';      EnvVariable = 'TestStand64' }
+    @{ Suffix = '';     Bits = 32; RootVariable = 'ProgramFiles(x86)'; EnvVariable = 'TestStand' }
+)
 
 # Probe budget. The hook timeout in hooks.json is 10 s. Worst case: a PowerShell start of about
 # 0.6 s, then two interpreters that both hang, each cut off after 3 s plus up to 1 s to kill its
@@ -94,13 +96,13 @@ function Test-TestStandDetected {
 # name counts as the default plugin.
 function Get-TestStandWarning {
     $ownName = Get-HookPluginName
-    if ($null -eq $ownName -or -not $script:PluginBitness.Contains($ownName)) { $ownName = $script:DefaultPluginName }
-    $own = $script:PluginBitness[$ownName]
+    if ($null -eq $ownName) { $ownName = $script:DefaultPluginName }
+    $own = @($script:PluginBitness | Where-Object { $ownName.EndsWith($_.Suffix, [StringComparison]::Ordinal) })[0]
     if (Test-TestStandDetected $own) { return $null }
-    foreach ($otherName in $script:PluginBitness.Keys) {
-        $other = $script:PluginBitness[$otherName]
-        if ($otherName -cne $ownName -and (Test-TestStandDetected $other)) {
-            return ($script:OtherBitnessText -f $own.Bits, $other.Bits, $ownName, $otherName, $script:MarketplaceName)
+    $baseName = $ownName.Substring(0, $ownName.Length - $own.Suffix.Length)
+    foreach ($other in $script:PluginBitness) {
+        if ($other.Bits -ne $own.Bits -and (Test-TestStandDetected $other)) {
+            return ($script:OtherBitnessText -f $own.Bits, $other.Bits, $ownName, ($baseName + $other.Suffix), $script:MarketplaceName)
         }
     }
     return $script:TestStandText

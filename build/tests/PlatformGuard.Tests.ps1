@@ -85,12 +85,14 @@ try {
     Invoke-Case 'guard: the bitness table names the two plugins of the identity table, 32-bit and 64-bit' {
         . $GuardPath
         Import-Module (Join-Path $RepoRoot 'build\PluginIdentity.psm1') -Force
+        $base = (Get-PluginIdentity -Architecture 'x86').name
         foreach ($architecture in (Get-PluginArchitectures)) {
             $identity = Get-PluginIdentity -Architecture $architecture
-            Assert-True $script:PluginBitness.Contains($identity.name) "the guard has no row for $($identity.name)"
-            Assert-Equal $identity.bits $script:PluginBitness[$identity.name].Bits "$($identity.name) bits"
+            $rows = @($script:PluginBitness | Where-Object { ($base + $_.Suffix) -ceq $identity.name })
+            Assert-Equal 1 $rows.Count "the guard rows for $($identity.name)"
+            Assert-Equal $identity.bits $rows[0].Bits "$($identity.name) bits"
         }
-        Assert-Equal 2 $script:PluginBitness.Count 'rows'
+        Assert-Equal 2 @($script:PluginBitness).Count 'rows'
     }
 
     Invoke-Case 'guard: the x64 plugin with a 64-bit TestStand reports no TestStand problem' {
