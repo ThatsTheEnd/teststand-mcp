@@ -527,7 +527,8 @@ function Assert-StageUnchanged {
     if ([string]::Equals($now, $Snapshot, [StringComparison]::Ordinal)) { return }
     $before = @($Snapshot -split "`n" | Where-Object { $_ })
     $after = @($now -split "`n" | Where-Object { $_ })
-    $changed = @(($before | Where-Object { $after -cnotcontains $_ }) + ($after | Where-Object { $before -cnotcontains $_ }) | ForEach-Object { ($_ -split '  ', 2)[1] } | Sort-Object -Unique | Select-Object -First 5)
+    # Each side is wrapped before the '+': one changed file is ONE old line and ONE new line, and two bare strings would be glued together.
+    $changed = @((@($before | Where-Object { $after -cnotcontains $_ }) + @($after | Where-Object { $before -cnotcontains $_ })) | ForEach-Object { ($_ -split '  ', 2)[1] } | Sort-Object -Unique | Select-Object -First 5)
     Write-BuildFailure -What "The staged tree changed after it was asserted: $($changed -join ', ')" `
         -Why 'Only the asserted tree may be zipped; a file added or changed since (by the smoke run, or anything else writing into the stage folder) was never checked.' `
         -Fix 'Find what writes into the stage folder (the staged exe run by PluginSmoke.psm1 writes nothing next to itself by design), then package again.'

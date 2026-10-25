@@ -748,6 +748,20 @@ try {
         Assert-FailsWith { Assert-StageUnchanged -StageDir $stage -Snapshot $snapshot } @('hooks/hooks.json')
     }
 
+    Invoke-Case 'snapshot: ONE changed file is named by its path alone, never glued to its hash (a changed file is one old and one new line)' {
+        $stage = New-StagedCopy
+        $snapshot = Get-StageSnapshot -StageDir $stage
+        $oldHash = (@($snapshot -split "`n" | Where-Object { $_.EndsWith('  hooks/hooks.json') })[0] -split '  ')[0]
+        [IO.File]::AppendAllText((Join-Path $stage 'hooks\hooks.json'), ' ')
+        $newHash = (@((Get-StageSnapshot -StageDir $stage) -split "`n" | Where-Object { $_.EndsWith('  hooks/hooks.json') })[0] -split '  ')[0]
+        Assert-True ($oldHash -cne $newHash -and $oldHash.Length -eq 64 -and $newHash.Length -eq 64) 'the fixture must change the hash'
+        $message = Get-ThrownMessage { Assert-StageUnchanged -StageDir $stage -Snapshot $snapshot }
+        Assert-Contains $message 'changed after it was asserted: hooks/hooks.json' 'the changed path'
+        Assert-NotContains $message $oldHash 'the message (the old hash)'
+        Assert-NotContains $message $newHash 'the message (the new hash)'
+        Assert-Equal 1 ([regex]::Matches($message, [regex]::Escape('hooks/hooks.json'))).Count 'the path is named once, not once per line of the diff'
+    }
+
     # ======================================================================
     #  Smoke tests of the staged exe (PluginSmoke): fake exes are .cmd files
     # ======================================================================

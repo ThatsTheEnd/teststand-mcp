@@ -78,7 +78,7 @@ function Get-ClassifiedToolNames {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ClassesPath)
     $classes = Read-ToolClasses -Path $ClassesPath
-    return @((Get-ClassList $classes 'allow') + (Get-ClassList $classes 'prompt'))
+    return @(@(Get-ClassList $classes 'allow') + @(Get-ClassList $classes 'prompt'))
 }
 
 function New-Violation {
@@ -185,8 +185,8 @@ function Get-ToolClassificationViolation {
         [Parameter(Mandatory)][string[]]$RegisteredTools,
         $ToolParameters = $null
     )
-    $allow = Get-ClassList $Classes 'allow'
-    $prompt = Get-ClassList $Classes 'prompt'
+    $allow = @(Get-ClassList $Classes 'allow')
+    $prompt = @(Get-ClassList $Classes 'prompt')
     $violations = @()
     $violations += @(Test-CoverageRules $allow $prompt $RegisteredTools)
     $violations += @(Test-AllowEntryRules $allow $RegisteredTools (Get-JsonProperty $Classes 'neverAllow'))

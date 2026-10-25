@@ -213,11 +213,13 @@ function Get-AssetSizes {
     return $sizes
 }
 
-# The GitHub releases-list JSON: a decoy plus one release carrying the tag.
+# The GitHub releases-list JSON: a decoy plus one release carrying the tag; -NoDecoy lists that one release alone
+# (a one-element list is the shape that breaks code which forgets that a single item is still a list).
 function New-ReleaseJsonText {
     param(
         [string]$Tag, [string[]]$AssetNames, [hashtable]$UploaderByAsset = @{}, [bool]$IsDraft = $true,
-        [hashtable]$SizeByAsset = @{}, [hashtable]$IdByAsset = @{}, [string[]]$NoUploaderFor = @()
+        [hashtable]$SizeByAsset = @{}, [hashtable]$IdByAsset = @{}, [string[]]$NoUploaderFor = @(),
+        [switch]$NoDecoy, $ReleaseNumber = $ReleaseId   # not $Id: the asset loop below has a variable of that name (PowerShell names are case-insensitive)
     )
     $assets = @()
     for ($index = 0; $index -lt $AssetNames.Count; $index++) {
@@ -232,17 +234,18 @@ function New-ReleaseJsonText {
         $assets += $asset
     }
     $decoy = @{ id = 1; tag_name = 'v0.0.1'; draft = $false; assets = @() }
-    $release = @{ id = $ReleaseId; tag_name = $Tag; draft = $IsDraft; assets = $assets }
-    return (ConvertTo-Json -InputObject @($decoy, $release) -Depth 6)
+    $release = @{ id = $ReleaseNumber; tag_name = $Tag; draft = $IsDraft; assets = $assets }
+    $releases = if ($NoDecoy) { @($release) } else { @($decoy, $release) }
+    return (ConvertTo-Json -InputObject $releases -Depth 6)
 }
 
 function Invoke-LocalVerify {
-    param($Fixture, [hashtable]$UploaderByAsset = @{}, [switch]$NoReleaseJson, [hashtable]$Extra = @{}, [string[]]$ListedNames = @())
+    param($Fixture, [hashtable]$UploaderByAsset = @{}, [switch]$NoReleaseJson, [hashtable]$Extra = @{}, [string[]]$ListedNames = @(), [switch]$NoDecoy, [switch]$ListNothing)
     $arguments = @{ Tag = $Fixture.Tag; LocalDir = $Fixture.Dir }
     if (-not $NoReleaseJson) {
-        $names = if ($ListedNames.Count -gt 0) { $ListedNames } else { @(Get-RequiredAssetNames -Version $Fixture.Version) }
+        $names = if ($ListNothing) { @() } elseif ($ListedNames.Count -gt 0) { $ListedNames } else { @(Get-RequiredAssetNames -Version $Fixture.Version) }
         $jsonPath = Join-Path (New-TempDir) 'release.json'
-        Write-TextFile $jsonPath (New-ReleaseJsonText -Tag $Fixture.Tag -AssetNames $names -UploaderByAsset $UploaderByAsset)
+        Write-TextFile $jsonPath (New-ReleaseJsonText -Tag $Fixture.Tag -AssetNames $names -UploaderByAsset $UploaderByAsset -NoDecoy:$NoDecoy)
         $arguments.ReleaseJson = $jsonPath
     }
     foreach ($key in $Extra.Keys) { $arguments[$key] = $Extra[$key] }
@@ -1169,10 +1172,27 @@ try {
     # ============================================================================================
     Invoke-Case 'verify api: a repository whose only release is the draft is read, exit 0' {
         $fixture = New-ReleaseFixture
-        $full = New-ReleaseJsonText -Tag $fixture.Tag -AssetNames @(Get-RequiredAssetNames -Version $fixture.Version) -SizeByAsset (Get-AssetSizes $fixture)
-        $only = @($full | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $_.tag_name -ceq $fixture.Tag })
-        $run = Invoke-ApiVerify $fixture (New-FakeApi $fixture -Pages @{ 1 = (ConvertTo-Json -InputObject $only -Depth 6) })
+        $only = New-ReleaseJsonText -Tag $fixture.Tag -AssetNames @(Get-RequiredAssetNames -Version $fixture.Version) -SizeByAsset (Get-AssetSizes $fixture) -NoDecoy
+        Assert-Equal 1 @($only | ConvertFrom-Json | ForEach-Object { $_ }).Count 'the fixture lists exactly one release'
+        $run = Invoke-ApiVerify $fixture (New-FakeApi $fixture -Pages @{ 1 = $only })
         Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+    }
+
+    Invoke-Case 'verify local: a release json that lists ONE release (and a release with ONE asset, or NONE) is read as a list' {
+        $fixture = New-ReleaseFixture
+        $alone = Invoke-LocalVerify $fixture -NoDecoy
+        Assert-Equal 0 $alone.ExitCode "exit code for a one-release list. Output was:`n$($alone.Output)"
+        $oneAsset = Invoke-LocalVerify $fixture -NoDecoy -ListedNames @('teststand-mcp.zip')
+        Assert-Equal 1 $oneAsset.ExitCode 'exit code for a release with one listed asset'
+        foreach ($name in @('teststand-mcp.sha256', 'teststand-mcp.manifest.sha256', 'teststand-mcp-v1.9.0.zip')) {
+            Assert-Contains $oneAsset.Output "$name was uploaded by '(unknown)'" "the asset the release does not list: $name"
+        }
+        Assert-NotContains $oneAsset.Output 'Unexpected error' 'a one-asset list must not break the reader'
+        $none = Invoke-LocalVerify $fixture -NoDecoy -ListNothing
+        Assert-Equal 1 $none.ExitCode 'exit code for a release without assets'
+        Assert-Contains $none.Output "the plugin archive teststand-mcp.zip was uploaded by '(unknown)'" 'every asset is unlisted'
+        Assert-Contains $none.Output "the versioned archive teststand-mcp-v1.9.0.zip was uploaded by '(unknown)'" 'every asset is unlisted'
+        Assert-NotContains $none.Output 'Unexpected error' 'an empty asset list must not break the reader'
     }
 
     Invoke-Case 'verify api: reads the draft with the token, downloads four assets, exit 0, writes release_id and asset_ids' {
@@ -1294,6 +1314,46 @@ try {
         $listings = @($api.State.Calls | Where-Object { $_.Uri -match '/releases\?' })
         Assert-Equal 2 $listings.Count 'listing requests'
         Assert-Contains $listings[1].Uri 'page=2' 'second page'
+    }
+
+    Invoke-Case 'verify api: a second page that holds exactly ONE release (the one with the tag) is found' {
+        $fixture = New-ReleaseFixture
+        $real = New-ReleaseJsonText -Tag $fixture.Tag -AssetNames (Get-RequiredAssetNames -Version $fixture.Version) -SizeByAsset (Get-AssetSizes $fixture) -NoDecoy
+        $api = New-FakeApi $fixture -Pages @{ 1 = (New-FullPageJson); 2 = $real }
+        $run = Invoke-ApiVerify $fixture $api
+        Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-Equal 2 @($api.State.Calls | Where-Object { $_.Uri -match '/releases\?' }).Count 'listing requests (a full page, then the page of one)'
+    }
+
+    Invoke-Case 'verify api: a release with ONE listed asset, or NONE, reports the others as missing before any download' {
+        $fixture = New-ReleaseFixture
+        $one = New-FakeApi $fixture -ReleaseOptions @{ AssetNames = @('teststand-mcp.zip'); NoDecoy = $true }
+        $run = Invoke-ApiVerify $fixture $one
+        Assert-Equal 1 $run.ExitCode 'exit code for one asset'
+        Assert-Contains $run.Output 'the archive digest teststand-mcp.sha256 is missing from the release' 'missing asset'
+        Assert-NotContains $run.Output 'Unexpected error' 'a one-asset list must not break the reader'
+        Assert-Equal 0 (Get-AssetRequests $one).Count 'asset requests'
+        $none = New-FakeApi $fixture -ReleaseOptions @{ AssetNames = @(); NoDecoy = $true }
+        $run = Invoke-ApiVerify $fixture $none
+        Assert-Equal 1 $run.ExitCode 'exit code for no asset'
+        Assert-Contains $run.Output 'the plugin archive teststand-mcp.zip is missing from the release' 'missing asset'
+        Assert-NotContains $run.Output 'Unexpected error' 'an empty asset list must not break the reader'
+    }
+
+    Invoke-Case 'verify api: a release id and asset ids above 2^31 are read, downloaded by id and reported as numbers' {
+        $fixture = New-ReleaseFixture
+        $big = [int64]3000000001
+        $ids = @{ 'teststand-mcp.zip' = $big; 'teststand-mcp.sha256' = ($big + 1); 'teststand-mcp.manifest.sha256' = ($big + 2); 'teststand-mcp-v1.9.0.zip' = ($big + 3) }
+        $api = New-FakeApi $fixture -ReleaseOptions @{ ReleaseNumber = ($big + 10); IdByAsset = $ids }
+        $outFile = Join-Path (New-TempDir) 'github_output'
+        Use-Environment @{ GITHUB_OUTPUT = $outFile } { $script:BigRun = Invoke-ApiVerify $fixture $api }
+        Assert-Equal 0 $script:BigRun.ExitCode "exit code. Output was:`n$($script:BigRun.Output)"
+        Assert-True (@(Get-AssetRequests $api | Where-Object { $_.Uri.EndsWith("/$big") }).Count -eq 1) 'the archive is requested by its large id'
+        $lines = @([IO.File]::ReadAllText($outFile, $Utf8NoBom) -split "`n" | Where-Object { $_ })
+        Assert-Equal "release_id=$($big + 10)" $lines[0] 'release_id'
+        $reported = ($lines[1].Substring('asset_ids='.Length)) | ConvertFrom-Json
+        Assert-Equal "$big" "$($reported.'teststand-mcp.zip')" 'the archive id is reported as the number it is'
+        Assert-Equal "$($big + 3)" "$($reported.'teststand-mcp-v1.9.0.zip')" 'the versioned archive id'
     }
 
     Invoke-Case 'verify api: when the search runs out of pages the failure says so' {
@@ -1682,6 +1742,19 @@ try {
     }
 
     $ExpectedIdsJson = ConvertTo-Json -InputObject $VerifiedAssets -Compress
+
+    Invoke-Case 'asset set: release and asset ids above 2^31 compare as the numbers they are, and a replaced one is named with its id' {
+        $big = [int64]3000000001
+        $bigAssets = [ordered]@{ 'teststand-mcp.zip' = $big; 'teststand-mcp.sha256' = ($big + 1); 'teststand-mcp.manifest.sha256' = ($big + 2); 'teststand-mcp-v1.9.0.zip' = ($big + 3) }
+        $bigIds = ConvertTo-Json -InputObject $bigAssets -Compress
+        Assert-ReleaseAssetSet -ReleaseJson (New-AssetSetJson -Assets $bigAssets -Id ($big + 10)) -ExpectedAssetIds $bigIds -ReleaseId "$($big + 10)" -Stage BeforePublish
+        $replaced = Copy-AssetMap $bigAssets
+        $replaced['teststand-mcp.zip'] = ($big + 99)
+        $message = Get-AssetSetFailure @{ ReleaseJson = (New-AssetSetJson -Assets $replaced -Id ($big + 10)); ExpectedAssetIds = $bigIds; ReleaseId = "$($big + 10)"; Stage = 'BeforePublish' }
+        Assert-True ($null -ne $message) 'expected a failure'
+        Assert-Contains $message "teststand-mcp.zip (id $big) is missing" 'the verified id'
+        Assert-Contains $message "teststand-mcp.zip (id $($big + 99)) was not verified" 'the new id'
+    }
 
     Invoke-Case 'asset set: the verified assets of a draft, before publishing, pass' {
         Assert-ReleaseAssetSet -ReleaseJson (New-AssetSetJson) -ExpectedAssetIds $ExpectedIdsJson -ReleaseId "$ReleaseId" -Stage BeforePublish

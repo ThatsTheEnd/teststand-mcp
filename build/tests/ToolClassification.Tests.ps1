@@ -79,6 +79,40 @@ try {
     }
 
     # --- the classification rules, one defect per fixture ------------------------------------------
+    # --- one-entry and empty lists: a single item must stay a list (a bare one is a string, and '+' glues two strings) ---
+    function Get-ClassifiedNames {
+        param([string]$Json)
+        $path = Join-Path (New-TempDir) 'tool-classes.json'
+        Write-TextFile $path $Json
+        return @(Get-ClassifiedToolNames -ClassesPath $path)
+    }
+
+    Invoke-Case 'classified names: ONE allowed and ONE prompted tool are two names, not one glued string' {
+        $names = Get-ClassifiedNames '{"allow":["get_a"],"prompt":["set_c"]}'
+        Assert-Equal 2 $names.Count 'the number of names'
+        Assert-Equal 'get_a,set_c' ($names -join ',') 'names'
+    }
+
+    Invoke-Case 'classified names: a one-entry allow list with an EMPTY prompt list, and the other way round' {
+        Assert-Equal 'get_a' ((Get-ClassifiedNames '{"allow":["get_a"],"prompt":[]}') -join ',') 'one allowed, none prompted'
+        Assert-Equal 'set_c' ((Get-ClassifiedNames '{"allow":[],"prompt":["set_c"]}') -join ',') 'none allowed, one prompted'
+        Assert-Equal 0 (Get-ClassifiedNames '{"allow":[],"prompt":[]}').Count 'both empty'
+        Assert-Equal 'get_a' ((Get-ClassifiedNames '{"allow":["get_a"]}') -join ',') 'a missing prompt list'
+    }
+
+    Invoke-Case 'Get-ClassList: a one-entry list, an empty list and a missing list each give an array of the right length' {
+        $classes = [pscustomobject]@{ allow = @('get_a'); prompt = @() }
+        Assert-Equal 1 @(Get-ClassList $classes 'allow').Count 'one entry'
+        Assert-Equal 0 @(Get-ClassList $classes 'prompt').Count 'empty list'
+        Assert-Equal 0 @(Get-ClassList $classes 'neverThere').Count 'missing list'
+    }
+
+    Invoke-Case 'classification: a fixture with ONE allowed and ONE prompted tool is checked completely' {
+        Assert-Equal 0 @(Get-ToolClassificationViolation -Classes (New-FixtureClasses -Allow @('get_a') -Prompt @('set_c')) -RegisteredTools @('get_a', 'set_c')).Count 'violations'
+        Assert-OneViolation (New-FixtureClasses -Allow @('get_a') -Prompt @('get_a')) 'E_IN_BOTH_LISTS' 'get_a' @('get_a')
+        Assert-OneViolation (New-FixtureClasses -Allow @('get_a') -Prompt @()) 'E_UNCLASSIFIED' 'set_c' @('get_a', 'set_c')
+    }
+
     Invoke-Case 'classification: a well-formed fixture has no violations' {
         Assert-Equal 0 @(Get-ToolClassificationViolation -Classes (New-FixtureClasses) -RegisteredTools $FixtureTools).Count 'violations'
     }

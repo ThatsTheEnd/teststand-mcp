@@ -302,7 +302,10 @@ def artifact_url(run_id: int) -> str:
 
 
 class FakeApi:
-    """Canned API JSON by path and artifacts by URL. A failing path raises like the real client."""
+    """Canned API JSON by path and artifacts by URL. A failing path raises like the real client.
+
+    A list endpoint (releases, artifacts) honours `page` and `per_page` like GitHub: a collector that stops
+    after the first page, or reads one page too many, gets the wrong items from this fake."""
 
     def __init__(self, releases=(), artifacts=(), downloads=None, traffic=None, failing=(), runs=None):
         self.responses = {
@@ -322,7 +325,17 @@ class FakeApi:
         self.requested.append(path)
         if path in self.failing:
             raise stats_csv.CollectError(f"GET {path}: HTTP 403 rate limit exceeded")
-        return self.responses[path]
+        return self._page(self.responses[path], params or {})
+
+    @staticmethod
+    def _page(response, params):
+        start = (int(params.get("page", "1")) - 1) * int(params.get("per_page", str(collect.PAGE_SIZE)))
+        stop = start + int(params.get("per_page", str(collect.PAGE_SIZE)))
+        if isinstance(response, list):
+            return response[start:stop]
+        if isinstance(response, dict) and isinstance(response.get("artifacts"), list):
+            return {**response, "artifacts": response["artifacts"][start:stop]}
+        return response
 
     def download(self, url):
         self.requested.append(url)
@@ -420,6 +433,49 @@ class CollectRun(unittest.TestCase):
 
         with self.assertRaisesRegex(stats_csv.CollectError, "MAX_PAGES"):
             self.run_collect(Endless())
+
+
+class ListPagination(unittest.TestCase):
+    """Every list is read to its end, for the sizes where an off-by-one hides: one item, one full page, one more."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.stats = Path(directory.name) / "stats"
+
+    def collect(self, api):
+        return collect.collect(api, None, REPO, self.stats, d("2026-08-21"))
+
+    def test_the_fake_serves_the_pages_of_a_list_like_github(self):
+        api = FakeApi(releases=[release(f"v1.0.{i}", {}) for i in range(101)])
+        path = f"/repos/{REPO}/releases"
+        self.assertEqual(len(api.get_json(path, {"per_page": "100", "page": "1"})), 100)
+        self.assertEqual([r["tag_name"] for r in api.get_json(path, {"per_page": "100", "page": "2"})], ["v1.0.100"])
+        self.assertEqual(api.get_json(path, {"per_page": "100", "page": "3"}), [])
+        self.assertEqual(len(api.get_json(path, {"per_page": "30", "page": "2"})), 30)
+
+    def test_releases_are_all_read_for_every_size_around_a_page_boundary(self):
+        # size -> list requests: a short page ends the listing; a full page needs one more request to learn that it was the last
+        for count, requests in ((0, 1), (1, 1), (99, 1), (100, 2), (101, 2), (200, 3)):
+            with self.subTest(releases=count):
+                self.stats = self.stats.parent / f"stats-{count}"
+                api = FakeApi(releases=[release(f"v1.0.{i}", {ZIP: i + 1}) for i in range(count)])
+                self.collect(api)
+                rows = (self.stats / "downloads.csv").read_text(encoding="utf-8").splitlines()[1:]
+                self.assertEqual(len(rows), count)
+                self.assertEqual(api.requested.count(f"/repos/{REPO}/releases"), requests)
+
+    def test_artifacts_are_all_read_for_every_size_around_a_page_boundary(self):
+        for count, requests in ((0, 1), (1, 1), (100, 2), (101, 2)):
+            with self.subTest(artifacts=count):
+                self.stats = self.stats.parent / f"stats-{count}"
+                found = [artifact(run_id) for run_id in range(1, count + 1)]
+                downloads = {artifact_url(run_id): artifact_zip({"run_id": str(run_id), "counts": {}}) for run_id in range(1, count + 1)}
+                api = FakeApi(artifacts=found, downloads=downloads)
+                self.collect(api)
+                rows = (self.stats / "own-downloads.csv").read_text(encoding="utf-8").splitlines()[1:]
+                self.assertEqual(len(rows), count)
+                self.assertEqual(api.requested.count(f"/repos/{REPO}/actions/artifacts"), requests)
 
 
 class OwnDownloadArtifacts(unittest.TestCase):
