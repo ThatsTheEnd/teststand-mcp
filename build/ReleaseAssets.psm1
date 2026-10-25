@@ -47,6 +47,26 @@ function Get-PluginAssetNames {
     }
 }
 
+# The prefixes a script was given (-AssetPrefixes): split at commas, since powershell -File passes an array
+# as one string, and refused unless each is a plugin name. None given: the x86 plugin alone.
+function ConvertTo-AssetPrefixList {
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][AllowNull()][string[]]$Prefixes)
+    $list = @($Prefixes | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($list.Count -eq 0) { return , [string[]]@($ReleaseAssetPrefix) }
+    foreach ($prefix in $list) {
+        if ($prefix -cnotmatch $script:AssetPrefixPattern) {
+            Write-BuildFailure -What "The asset prefix '$prefix' is not a plugin name (lowercase letters, digits and dashes)." `
+                -Why 'Each prefix names the assets of one plugin and becomes part of file names and download URLs.' `
+                -Fix 'Pass the plugin names, for example -AssetPrefixes teststand-mcp,teststand-mcp-x64 (Get-PluginAssetPrefixes in build\PluginIdentity.psm1 lists them).'
+        }
+    }
+    if (@($list | Select-Object -Unique).Count -ne $list.Count) {
+        Write-BuildFailure -What "The asset prefixes $($list -join ', ') name a plugin twice." -Why 'Each plugin is one set of four assets.' -Fix 'Name each plugin once.'
+    }
+    return , [string[]]$list
+}
+
 function Get-VersionedArchiveName {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Version, [string]$Prefix = $ReleaseAssetPrefix)
@@ -514,7 +534,7 @@ function Add-OwnDownload {
 
 Export-ModuleMember -Variable ReleaseRepoSlug, ReleaseAssetPrefix, ReleaseArchiveName, ReleaseDigestName, ReleaseManifestName, ReleaseUploaderLogin, ArchiveProblemKinds,
     ReleaseRehearsalSuffix, ReleaseCommitPattern, OwnDownloadPhases
-Export-ModuleMember -Function Get-PluginAssetNames, Get-VersionedArchiveName, Get-RequiredAssetNames, Assert-ReleaseAssetFiles, Assert-RepoSlug, Get-LatestDownloadUrl,
+Export-ModuleMember -Function Get-PluginAssetNames, ConvertTo-AssetPrefixList, Get-VersionedArchiveName, Get-RequiredAssetNames, Assert-ReleaseAssetFiles, Assert-RepoSlug, Get-LatestDownloadUrl,
     Get-FileSha256, Get-StreamSha256, Format-HashLine, ConvertFrom-HashLines,
     ConvertFrom-ReleaseTag, Get-TagRejection, Get-PrintableTag, New-OrdinalOrderedMap,
     New-ArchiveDigest, ConvertFrom-DigestText, New-ArchiveManifest, Compare-ArchiveManifest,

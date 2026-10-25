@@ -111,6 +111,13 @@ function Get-PluginIdentity {
     }
 }
 
+# Every plugin's asset prefix, x86 first: the plugins one release carries.
+function Get-PluginAssetPrefixes {
+    [CmdletBinding()]
+    param()
+    return [string[]]@(foreach ($architecture in (Get-PluginArchitectures)) { (Get-PluginIdentity -Architecture $architecture).assetPrefix })
+}
+
 # ----------------------------------------------------------------------------
 #  Agent conversion: direct flavour (committed source) <-> plugin flavour
 #  (generated while staging). ONE mapping table drives both directions and is
@@ -193,4 +200,4 @@ function ConvertFrom-PluginAgent {
     return Invoke-AgentConversion -Path $Path -Direction FromPlugin -Identity $Identity
 }
 
-Export-ModuleMember -Function Get-PluginIdentity, Get-PluginArchitectures, Get-PluginSourcePath, ConvertTo-PluginAgent, ConvertFrom-PluginAgent
+Export-ModuleMember -Function Get-PluginIdentity, Get-PluginArchitectures, Get-PluginAssetPrefixes, Get-PluginSourcePath, ConvertTo-PluginAgent, ConvertFrom-PluginAgent

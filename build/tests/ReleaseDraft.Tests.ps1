@@ -107,9 +107,9 @@ function New-Release {
 
 # A folder with the four assets of a version (any bytes: the draft code only needs the names).
 function New-AssetFolder {
-    param([string]$Version = '1.9.0', [string[]]$Extra = @(), [string[]]$Without = @())
+    param([string]$Version = '1.9.0', [string[]]$Extra = @(), [string[]]$Without = @(), [string[]]$Prefixes = @($ReleaseAssetPrefix))
     $dir = Join-Path (New-TempDir) 'assets'
-    foreach ($name in @(Get-RequiredAssetNames -Version $Version) + $Extra) {
+    foreach ($name in @(Get-RequiredAssetNames -Version $Version -Prefixes $Prefixes) + $Extra) {
         if ($Without -notcontains $name) { Write-TextFile (Join-Path $dir $name) $name }
     }
     if (-not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir) }
@@ -251,6 +251,19 @@ try {
         $one = New-FakeGh -Releases @((New-Release 400 'v1.9.0'))
         [void](New-ReleaseDraft -Repo $Repo -Tag 'v1.9.0' -AssetDir (New-AssetFolder) -Gh $one.Gh)
         Assert-Equal 1 @($one.State.Releases | Where-Object { $_.Tag -ceq 'v1.9.0' }).Count 'drafts of the tag after replacing the single one'
+    }
+
+    Invoke-Case 'draft: with -AssetPrefixes the eight assets of both plugins are uploaded, and one missing x64 asset fails before gh' {
+        $both = @('teststand-mcp', 'teststand-mcp-x64')
+        $fake = New-FakeGh
+        [void](New-ReleaseDraft -Repo $Repo -Tag 'v1.9.0' -AssetDir (New-AssetFolder -Prefixes $both) -AssetPrefixes $both -Gh $fake.Gh)
+        $create = @($fake.State.Creates[0])
+        foreach ($name in (Get-RequiredAssetNames -Version '1.9.0' -Prefixes $both)) { Assert-True (@($create | Where-Object { $_ -like "*\$name" }).Count -eq 1) "asset $name is not an argument of gh release create" }
+        $idle = New-FakeGh
+        $failure = Get-Failure { New-ReleaseDraft -Repo $Repo -Tag 'v1.9.0' -AssetDir (New-AssetFolder -Prefixes $both -Without @('teststand-mcp-x64.sha256')) -AssetPrefixes $both -Gh $idle.Gh }
+        Assert-ThreePartFailure $failure
+        Assert-Contains $failure 'teststand-mcp-x64.sha256' 'the failure names the missing asset'
+        Assert-Equal 0 $idle.State.Calls.Count 'gh calls'
     }
 
     Invoke-Case 'draft: a folder with a missing or an extra asset fails before gh is called at all' {

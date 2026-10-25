@@ -697,6 +697,59 @@ try {
         Assert-Equal "archive_sha256=$expected" $lines[2] 'archive_sha256 line'
     }
 
+    Invoke-Case 'both plugins: a release with all eight assets passes and archive_hashes names each archive with its hash' {
+        $fixture = Add-PluginAssets (New-ReleaseFixture)
+        $outFile = Join-Path (New-TempDir) 'github_output'
+        Use-Environment @{ GITHUB_OUTPUT = $outFile } { $script:BothRun = Invoke-ApiVerify $fixture (New-FakeApi $fixture) -Extra @{ AssetPrefixes = 'teststand-mcp,teststand-mcp-x64' } }
+        Assert-Equal 0 $script:BothRun.ExitCode "exit code. Output was:`n$($script:BothRun.Output)"
+        $line = @([IO.File]::ReadAllText($outFile, $Utf8NoBom) -split "`n" | Where-Object { $_ -like 'archive_hashes=*' })
+        Assert-Equal 1 $line.Count 'one archive_hashes line'
+        $hashes = $line[0].Substring('archive_hashes='.Length) | ConvertFrom-Json
+        foreach ($archive in @('teststand-mcp.zip', 'teststand-mcp-x64.zip')) {
+            $expected = (Get-FileHash -LiteralPath (Join-Path $fixture.Dir $archive) -Algorithm SHA256).Hash.ToLowerInvariant()
+            Assert-Equal $expected $hashes.$archive "hash of $archive"
+        }
+    }
+
+    Invoke-Case 'both plugins: a missing x64 asset, or an x64 archive that differs from its digest, fails naming that asset' {
+        $missing = Add-PluginAssets (New-ReleaseFixture)
+        Remove-Item -LiteralPath (Join-Path $missing.Dir 'teststand-mcp-x64.manifest.sha256')
+        $run = Invoke-LocalVerify $missing -ListedNames @(Get-ChildItem -LiteralPath $missing.Dir -File | ForEach-Object { $_.Name }) -Extra @{ AssetPrefixes = 'teststand-mcp,teststand-mcp-x64' }
+        Assert-Equal 1 $run.ExitCode 'exit code for a missing asset'
+        Assert-Contains $run.Output 'teststand-mcp-x64.manifest.sha256' 'the failure names the missing asset'
+        $tampered = Add-PluginAssets (New-ReleaseFixture)
+        Write-TextFile (Join-Path $tampered.Dir 'teststand-mcp-x64.sha256') ($ZeroHash + '  teststand-mcp-x64.zip' + "`n")
+        $run = Invoke-ApiVerify $tampered (New-FakeApi $tampered) -Extra @{ AssetPrefixes = 'teststand-mcp,teststand-mcp-x64' }
+        Assert-Equal 1 $run.ExitCode 'exit code for a digest mismatch'
+        Assert-Contains $run.Output 'teststand-mcp-x64.zip' 'the failure names the x64 archive'
+    }
+
+    Invoke-Case 'both plugins: -ExpectedArchiveHashes checks each latest download, and a stale x64 one fails naming it' {
+        $fixture = Add-PluginAssets (New-ReleaseFixture)
+        $hash = (Get-FileHash -LiteralPath (Join-Path $fixture.Dir 'teststand-mcp.zip') -Algorithm SHA256).Hash.ToLowerInvariant()
+        $both = @{ AssetPrefixes = 'teststand-mcp,teststand-mcp-x64' }
+        $good = $both + @{ ExpectedArchiveHashes = (ConvertTo-Json -Compress @{ 'teststand-mcp.zip' = $hash; 'teststand-mcp-x64.zip' = $hash }) }
+        $run = Invoke-LatestVerify (New-FakeApi $fixture) -Extra $good
+        Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+        Assert-Contains $run.Output 'latest download of teststand-mcp-x64.zip' 'the x64 archive is checked'
+        $stale = $both + @{ PropagationAttempts = 2; ExpectedArchiveHashes = (ConvertTo-Json -Compress @{ 'teststand-mcp.zip' = $hash; 'teststand-mcp-x64.zip' = $ZeroHash }) }
+        $run = Invoke-LatestVerify (New-FakeApi $fixture) -Extra $stale
+        Assert-Equal 1 $run.ExitCode 'exit code for a stale x64 download'
+        Assert-Contains $run.Output 'not the archive of the release that was just verified' 'the fault'
+    }
+
+    Invoke-Case 'both plugins: -ExpectedArchiveHashes without an entry per plugin, not JSON, or next to -ExpectedArchiveSha256 is refused' {
+        $fixture = Add-PluginAssets (New-ReleaseFixture)
+        $hash = (Get-FileHash -LiteralPath (Join-Path $fixture.Dir 'teststand-mcp.zip') -Algorithm SHA256).Hash.ToLowerInvariant()
+        foreach ($bad in @((ConvertTo-Json -Compress @{ 'teststand-mcp.zip' = $hash }), 'not json', '')) {
+            $run = Invoke-LatestVerify (New-FakeApi $fixture) -Extra @{ AssetPrefixes = 'teststand-mcp,teststand-mcp-x64'; ExpectedArchiveHashes = $bad }
+            Assert-Equal 1 $run.ExitCode "exit code for '$bad'"
+            Assert-Contains $run.Output 'ExpectedArchiveHashes' 'the failure names the parameter'
+        }
+        $run = Invoke-LatestVerify (New-FakeApi $fixture) -Extra @{ ExpectedArchiveSha256 = $hash; ExpectedArchiveHashes = (ConvertTo-Json -Compress @{ 'teststand-mcp.zip' = $hash }) }
+        Assert-Equal 1 $run.ExitCode 'exit code for both expectations'
+    }
+
     Invoke-Case 'own-downloads: run_id is a JSON string even when the run id is all digits (the collector compares strings)' {
         $fixture = New-ReleaseFixture
         $recordPath = Join-Path (New-TempDir) 'own-downloads.json'

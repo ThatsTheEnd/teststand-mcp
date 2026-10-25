@@ -46,9 +46,11 @@
 #                                              check is tried up to -PropagationAttempts times,
 #                                              -PropagationDelaySeconds apart; every try is a
 #                                              recorded download.
-#  -AssetPrefixes names the plugins whose assets the release (or -LocalDir) carries, each judged on its own
-#  (default teststand-mcp; teststand-mcp-x64 for the 64-bit plugin). A comma-separated value is split, since
-#  powershell -File passes an array as one string. -Latest checks the x86 plugin.
+#  -AssetPrefixes names the plugins whose assets the release (or -LocalDir, or releases/latest) carries, each
+#  judged on its own (default teststand-mcp alone; the release workflow passes every plugin). A
+#  comma-separated value is split, since powershell -File passes an array as one string.
+#  -ExpectedArchiveHashes <json> is -ExpectedArchiveSha256 for several plugins: {"<plugin archive>": "<hex>"}
+#  with one entry per plugin, as the draft verification writes it to its step output archive_hashes.
 #  -Rehearsal accepts the dry-run tag v<X.Y.Z>-rehearsal.
 #  -OwnDownloadsPath records every download in own-downloads.json (see ReleaseAssets.psm1)
 #  immediately BEFORE its request. The phase comes from the release's own draft flag; -Draft
@@ -69,6 +71,7 @@ param(
     [string[]]$AssetPrefixes,
     [switch]$Latest,
     [string]$ExpectedArchiveSha256,
+    [string]$ExpectedArchiveHashes,
     [int]$PropagationAttempts = 6,
     [int]$PropagationDelaySeconds = 15,
     [switch]$Rehearsal,
@@ -86,6 +89,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 # A bound but empty -ExpectedArchiveSha256 (an unset workflow output) is refused, never read as "not given".
 $ExpectedHashGiven = $PSBoundParameters.ContainsKey('ExpectedArchiveSha256')
+$ExpectedHashesGiven = $PSBoundParameters.ContainsKey('ExpectedArchiveHashes')
 
 $MaxAttempts = 2                           # the first try and one retry
 $AssetIdPattern = '\A[0-9]+\z'
@@ -161,10 +165,41 @@ function Assert-SourceChoice {
                 -Fix 'Pass the archive_sha256 output of the draft verification step, or omit the parameter.'
         }
     }
+    if ($ExpectedHashesGiven) {
+        if (-not $Latest -or $ExpectedHashGiven) {
+            Write-BuildFailure -What '-ExpectedArchiveHashes was given without -Latest, or together with -ExpectedArchiveSha256.' `
+                -Why 'It holds the hashes the public latest downloads must serve, one per plugin; the single hash is the same check for one plugin.' `
+                -Fix 'Use it only with -Latest, and without -ExpectedArchiveSha256.'
+        }
+    }
     if ($Repo) { Assert-RepoSlug $Repo }
     if ($LocalDir -and -not (Test-Path -LiteralPath (Resolve-BuildPath $LocalDir) -PathType Container)) {
         Write-BuildFailure -What "The directory $LocalDir does not exist." -Why 'It should hold the release assets.' -Fix 'Pass the directory the build wrote the assets to.'
     }
+}
+
+# Archive name -> the hash its latest download must have ($null entries: no expectation). An expectation that
+# is given but unusable is refused: an empty value would silently accept the previous release.
+function Get-ExpectedArchiveHashes {
+    $expected = @{}
+    $archives = @(foreach ($prefix in $AssetPrefixes) { (Get-PluginAssetNames -Prefix $prefix -Version '0.0.0').Archive })
+    if ($ExpectedHashGiven) { $expected[$archives[0]] = $ExpectedArchiveSha256 }
+    if (-not $ExpectedHashesGiven) { return $expected }
+    $fail = {
+        param($Reason)
+        Write-BuildFailure -What "-ExpectedArchiveHashes is unusable: $Reason." `
+            -Why 'It holds the hash of every archive that was just verified; without one, releases/latest cannot be compared with it, and a gap would silently accept the previous release.' `
+            -Fix 'Pass the archive_hashes output of the draft verification step, with the same -AssetPrefixes.'
+    }
+    $json = $null
+    try { $json = $ExpectedArchiveHashes | ConvertFrom-Json } catch { & $fail 'it is not valid JSON' }
+    if ($null -eq $json) { & $fail 'the value is empty' }
+    foreach ($archive in $archives) {
+        $hash = [string](Get-JsonProperty $json $archive)
+        if ($hash -cnotmatch $Sha256Pattern) { & $fail "the hash of $archive is '$hash', not 64 lower-case hex digits" }
+        $expected[$archive] = $hash
+    }
+    return $expected
 }
 
 function New-DownloadRecorder {
@@ -178,7 +213,7 @@ function New-DownloadRecorder {
 }
 
 function Write-StepOutputs {
-    param($Release, [object[]]$Assets, [string[]]$RequiredNames, [string]$ArchiveSha256)
+    param($Release, [object[]]$Assets, [string[]]$RequiredNames, [string]$ArchiveSha256, $ArchiveHashes)
     $releaseId = [string](Get-JsonProperty $Release 'id')
     if ($releaseId -cmatch $AssetIdPattern) { Add-GitHubOutput -Name 'release_id' -Value $releaseId }
     $ids = [ordered]@{}
@@ -188,15 +223,20 @@ function Write-StepOutputs {
     }
     Add-GitHubOutput -Name 'asset_ids' -Value (ConvertTo-Json -InputObject $ids -Compress)
     Add-GitHubOutput -Name 'archive_sha256' -Value $ArchiveSha256
+    Add-GitHubOutput -Name 'archive_hashes' -Value (ConvertTo-Json -InputObject $ArchiveHashes -Compress)
 }
 
-# ONE fetch of the public latest download and its judgement. Throws a build failure; $Totals counts the requests.
+# ONE fetch of the public latest downloads (each plugin's archive and digest) and their judgement. Throws a
+# build failure; $Totals counts the requests. $ExpectedByArchive: Get-ExpectedArchiveHashes.
 function Test-LatestOnce {
-    param($Connection, [string]$DestDir, [string]$ExpectedHash, [int]$DownloadAttempts, $Totals)
+    param($Connection, [string]$DestDir, $ExpectedByArchive, [int]$DownloadAttempts, $Totals)
     $transfer = [pscustomobject]@{ Requested = 0; Saved = @{} }
     $latestRepo = if ($Repo) { $Repo } else { $ReleaseRepoSlug }
-    $requests = @(foreach ($name in @($ReleaseArchiveName, $ReleaseDigestName)) {
-        New-DownloadRequest -Name $name -Uri (Get-LatestDownloadUrl -AssetName $name -Repo $latestRepo) -Accept $ReleaseBinaryAccept -UseToken $false -Size $null
+    $plugins = @(foreach ($prefix in $AssetPrefixes) { Get-PluginAssetNames -Prefix $prefix -Version '0.0.0' })
+    $requests = @(foreach ($names in $plugins) {
+        foreach ($name in @($names.Archive, $names.Digest)) {
+            New-DownloadRequest -Name $name -Uri (Get-LatestDownloadUrl -AssetName $name -Repo $latestRepo) -Accept $ReleaseBinaryAccept -UseToken $false -Size $null
+        }
     })
     $recorder = New-DownloadRecorder -Phase $PublishedPhase
     [void](New-Item -ItemType Directory -Path $DestDir -Force)
@@ -208,19 +248,22 @@ function Test-LatestOnce {
     }
     Assert-DownloadsSucceeded $outcome 'The latest release'
 
-    try {
-        $digest = ConvertFrom-DigestText -Text (Read-Utf8Text $transfer.Saved[$ReleaseDigestName])
-    } catch {
-        Assert-ReleaseFailure 'The latest release' @(New-Problem 'digest-malformed' @($_.Exception.Message)) 'ApiPublished'
+    foreach ($names in $plugins) {
+        try {
+            $digest = ConvertFrom-DigestText -Text (Read-Utf8Text $transfer.Saved[$names.Digest])
+        } catch {
+            Assert-ReleaseFailure 'The latest release' @(New-Problem 'digest-malformed' @($_.Exception.Message)) 'ApiPublished'
+        }
+        $archiveHash = Get-FileSha256 $transfer.Saved[$names.Archive]
+        if ($digest.Name -cne $names.Archive) { Assert-ReleaseFailure 'The latest release' @(New-Problem 'digest-name' @($digest.Name, $names.Archive)) 'ApiPublished' }
+        if ($digest.Hash -cne $archiveHash) { Assert-ReleaseFailure 'The latest release' @(New-Problem 'latest-mismatch' @($archiveHash, $digest.Hash)) 'ApiPublished' }
+        $expectedHash = $ExpectedByArchive[$names.Archive]
+        if ($expectedHash -and $archiveHash -cne $expectedHash) {
+            Assert-ReleaseFailure 'The latest release' @(New-Problem 'latest-not-verified' @($archiveHash, $expectedHash)) 'ApiPublished'
+        }
+        $claim = if ($expectedHash) { 'matches the published archive digest and is the archive of the verified release' } else { 'matches the published archive digest' }
+        Write-Host "The latest download of $($names.Archive) $claim ($archiveHash)."
     }
-    $archiveHash = Get-FileSha256 $transfer.Saved[$ReleaseArchiveName]
-    if ($digest.Name -cne $ReleaseArchiveName) { Assert-ReleaseFailure 'The latest release' @(New-Problem 'digest-name' @($digest.Name, $ReleaseArchiveName)) 'ApiPublished' }
-    if ($digest.Hash -cne $archiveHash) { Assert-ReleaseFailure 'The latest release' @(New-Problem 'latest-mismatch' @($archiveHash, $digest.Hash)) 'ApiPublished' }
-    if ($ExpectedHash -and $archiveHash -cne $ExpectedHash) {
-        Assert-ReleaseFailure 'The latest release' @(New-Problem 'latest-not-verified' @($archiveHash, $ExpectedHash)) 'ApiPublished'
-    }
-    $claim = if ($ExpectedHash) { 'matches the published archive digest and is the archive of the verified release' } else { 'matches the published archive digest' }
-    Write-Host "The latest download of $ReleaseArchiveName $claim ($archiveHash)."
 }
 
 # Without an expected hash: one try (a download error is retried once). With one, releases/latest may still serve the
@@ -228,12 +271,14 @@ function Test-LatestOnce {
 # is tried again, -PropagationDelaySeconds apart, up to -PropagationAttempts times; the last failure is the report.
 function Test-LatestDownload {
     param($Connection, [string]$TempRoot)
-    $tries = if ($ExpectedHashGiven) { [Math]::Max(1, $PropagationAttempts) } else { 1 }
-    $downloadAttempts = if ($ExpectedHashGiven) { 1 } else { $MaxAttempts }
+    $expectedByArchive = Get-ExpectedArchiveHashes
+    $expecting = ($ExpectedHashGiven -or $ExpectedHashesGiven)
+    $tries = if ($expecting) { [Math]::Max(1, $PropagationAttempts) } else { 1 }
+    $downloadAttempts = if ($expecting) { 1 } else { $MaxAttempts }
     $totals = [pscustomobject]@{ Requested = 0 }
     for ($try = 1; $try -le $tries; $try++) {
         try {
-            Test-LatestOnce -Connection $Connection -DestDir (Join-Path $TempRoot "latest-$try") -ExpectedHash $ExpectedArchiveSha256 -DownloadAttempts $downloadAttempts -Totals $totals
+            Test-LatestOnce -Connection $Connection -DestDir (Join-Path $TempRoot "latest-$try") -ExpectedByArchive $expectedByArchive -DownloadAttempts $downloadAttempts -Totals $totals
             break
         } catch {
             if ($try -ge $tries) { throw }
@@ -274,7 +319,12 @@ function Test-ApiRelease {
     foreach ($asset in $listedAssets) { if ($transfer.Saved.ContainsKey($asset.Name)) { $asset.Path = $transfer.Saved[$asset.Name] } }
     Assert-ReleaseFailure "Release $Tag" @(Get-ReleaseProblems -Assets $listedAssets -Version $ReleaseVersion -Scope Content -Prefixes $AssetPrefixes) $failureMode
 
-    Write-StepOutputs -Release $release -Assets $listedAssets -RequiredNames $requiredNames -ArchiveSha256 (Get-FileSha256 $transfer.Saved[$requiredNames[0]])
+    $archiveHashes = [ordered]@{}
+    foreach ($prefix in $AssetPrefixes) {
+        $archive = (Get-PluginAssetNames -Prefix $prefix -Version $ReleaseVersion).Archive
+        $archiveHashes[$archive] = Get-FileSha256 $transfer.Saved[$archive]
+    }
+    Write-StepOutputs -Release $release -Assets $listedAssets -RequiredNames $requiredNames -ArchiveSha256 $archiveHashes[0] -ArchiveHashes $archiveHashes
     Write-Host "Release $Tag verified: the $($requiredNames.Count) required assets match (digest, manifest, versioned archive), every asset uploaded by $ReleaseUploaderLogin."
     Write-Host "Requested $($transfer.Requested) asset download(s) in $($outcome.Attempts) attempt(s)."
 }
@@ -295,8 +345,7 @@ function Test-LocalRelease {
 try {
     Import-Module (Join-Path $PSScriptRoot 'ReleaseAssets.psm1') -Force
     Import-Module (Join-Path $PSScriptRoot 'ReleaseVerdict.psm1') -Force
-    $AssetPrefixes = if ($AssetPrefixes) { @($AssetPrefixes | ForEach-Object { $_ -split ',' } | Where-Object { $_ }) } else { @($ReleaseAssetPrefix) }
-    foreach ($prefix in $AssetPrefixes) { [void](Get-PluginAssetNames -Prefix $prefix -Version '0.0.0') }   # refuses a prefix that is not a plugin name
+    $AssetPrefixes = ConvertTo-AssetPrefixList $AssetPrefixes
 
     Assert-SourceChoice
     $connection = New-Connection -Token $Token -HttpGet $HttpGet -TimeoutSeconds $TimeoutSeconds -ApiBaseUrl $ApiBaseUrl

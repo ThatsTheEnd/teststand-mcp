@@ -140,7 +140,22 @@ function New-ReleaseFixture {
     Write-TextFile (Join-Path $dir 'teststand-mcp.sha256') (New-ArchiveDigest -ArchivePath $zip)
     Write-TextFile (Join-Path $dir 'teststand-mcp.manifest.sha256') (New-ArchiveManifest -StagedDir $staged)
     Copy-Item -LiteralPath $zip -Destination (Join-Path $dir "teststand-mcp-v$Version.zip")
-    return @{ Dir = $dir; Version = $Version; Tag = "v$Version"; Staged = $staged }
+    return @{ Dir = $dir; Version = $Version; Tag = "v$Version"; Staged = $staged; Prefixes = @($ReleaseAssetPrefix) }
+}
+
+# A second plugin's four assets next to the fixture's (the x64 plugin by default), so one release carries
+# eight: the same archive bytes under the other plugin's names, with a digest that names its own archive.
+function Add-PluginAssets {
+    param($Fixture, [string]$Prefix = 'teststand-mcp-x64')
+    $own = Get-PluginAssetNames -Prefix $ReleaseAssetPrefix -Version $Fixture.Version
+    $other = Get-PluginAssetNames -Prefix $Prefix -Version $Fixture.Version
+    $zip = Join-Path $Fixture.Dir $other.Archive
+    Copy-Item -LiteralPath (Join-Path $Fixture.Dir $own.Archive) -Destination $zip
+    Copy-Item -LiteralPath $zip -Destination (Join-Path $Fixture.Dir $other.Versioned)
+    Copy-Item -LiteralPath (Join-Path $Fixture.Dir $own.Manifest) -Destination (Join-Path $Fixture.Dir $other.Manifest)
+    Write-TextFile (Join-Path $Fixture.Dir $other.Digest) (New-ArchiveDigest -ArchivePath $zip)
+    $Fixture.Prefixes = @($Fixture.Prefixes) + $Prefix
+    return $Fixture
 }
 
 function Get-AssetSizes {
@@ -180,7 +195,7 @@ function Invoke-LocalVerify {
     param($Fixture, [hashtable]$UploaderByAsset = @{}, [switch]$NoReleaseJson, [hashtable]$Extra = @{}, [string[]]$ListedNames = @(), [switch]$NoDecoy, [switch]$ListNothing)
     $arguments = @{ Tag = $Fixture.Tag; LocalDir = $Fixture.Dir }
     if (-not $NoReleaseJson) {
-        $names = if ($ListNothing) { @() } elseif ($ListedNames.Count -gt 0) { $ListedNames } else { @(Get-RequiredAssetNames -Version $Fixture.Version) }
+        $names = if ($ListNothing) { @() } elseif ($ListedNames.Count -gt 0) { $ListedNames } else { @(Get-RequiredAssetNames -Version $Fixture.Version -Prefixes $Fixture.Prefixes) }
         $jsonPath = Join-Path (New-TempDir) 'release.json'
         Write-TextFile $jsonPath (New-ReleaseJsonText -Tag $Fixture.Tag -AssetNames $names -UploaderByAsset $UploaderByAsset -NoDecoy:$NoDecoy)
         $arguments.ReleaseJson = $jsonPath
@@ -197,7 +212,7 @@ function New-FakeApi {
         $Fixture, [scriptblock]$Plan = { param($Name, $Count) $null }, [string]$ReleasesFailure = $null,
         [hashtable]$Pages = $null, [hashtable]$ReleaseOptions = @{}
     )
-    $names = @(Get-RequiredAssetNames -Version $Fixture.Version)
+    $names = @(Get-RequiredAssetNames -Version $Fixture.Version -Prefixes $Fixture.Prefixes)
     if ($null -eq $Pages) {
         $options = @{ Tag = $Fixture.Tag; AssetNames = $names; SizeByAsset = (Get-AssetSizes $Fixture) }
         foreach ($key in $ReleaseOptions.Keys) { $options[$key] = $ReleaseOptions[$key] }
