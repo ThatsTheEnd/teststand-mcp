@@ -23,7 +23,6 @@ try { . (Join-Path $PSScriptRoot 'hook-common.ps1') } catch { exit 0 }
 
 $script:OptOutVariable = 'TESTSTAND_MCP_NO_UPDATE_CHECK'
 $script:BaseUrlVariable = 'TESTSTAND_MCP_RELEASES_BASE_URL'
-$script:PluginRootVariable = 'CLAUDE_PLUGIN_ROOT'
 $script:AllowedHttpsHost = 'github.com'
 $script:LatestReleasePath = '/releases/latest'
 $script:HttpTimeoutMilliseconds = 3000   # the hook timeout is 10 s: shell start plus this stays well inside it
@@ -31,7 +30,6 @@ $script:UserAgent = 'teststand-mcp-update-notify'
 $script:RedirectStatusCodes = @(301, 302, 303, 307, 308)
 $script:StateFile = 'update-notify.json'
 $script:PlaceholderVersion = [version]'0.0.0'
-$script:PluginJsonRelativePath = '.claude-plugin\plugin.json'
 $script:VersionPattern = '\A[vV]?(\d+\.\d+\.\d+)\z'
 $script:TagInLocationPattern = '/tag/([^/?#]+)(?:[?#].*)?\z'
 $script:MarketplaceName = 'zuehlke-teststand'
@@ -97,12 +95,6 @@ function Get-UpdateMessage {
 # ----------------------------------------------------------------------------
 function Enable-HookTls12 {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-}
-
-function Get-PluginRoot {
-    $fromEnvironment = Get-HookEnvironmentText $script:PluginRootVariable
-    if ($null -ne $fromEnvironment) { return $fromEnvironment }
-    return (Split-Path -Parent $PSScriptRoot)
 }
 
 # @{ Name; Version; RepositoryUrl } from plugin.json; $null when the file is missing or unreadable, or the

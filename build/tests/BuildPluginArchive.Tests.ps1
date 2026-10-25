@@ -99,6 +99,7 @@ try {
     Import-Module (Join-Path $BuildDir 'ReleaseAssets.psm1') -Force
     Import-Module (Join-Path $BuildDir 'ToolClassification.psm1') -Force
     Import-Module (Join-Path $BuildDir 'SkillSources.psm1') -Force
+    Import-Module (Join-Path $BuildDir 'PluginIdentity.psm1') -Force
     Import-Module (Join-Path $BuildDir 'PluginStaging.psm1') -Force
     Import-Module (Join-Path $BuildDir 'PluginArchive.psm1') -Force
     Import-Module (Join-Path $BuildDir 'PluginSmoke.psm1') -Force
@@ -402,10 +403,23 @@ try {
     }
 
     function New-StageFrom {
-        param([string]$PublishDir, $Layout = $FolderLayout, [string]$Root = $RepoRoot)
+        param([string]$PublishDir, $Layout = $FolderLayout, [string]$Root = $RepoRoot, [hashtable]$StageRelease = $Release)
         $stage = Join-Path (New-TempDir) 'stage'
-        New-StagedPlugin -RepoRoot $Root -PublishDir $PublishDir -StageDir $stage -Layout $Layout -Release $Release
+        New-StagedPlugin -RepoRoot $Root -PublishDir $PublishDir -StageDir $stage -Layout $Layout -Release $StageRelease
         return $stage
+    }
+
+    # The x64 plugin: the same release, its own identity.
+    $ReleaseX64 = $Release.Clone(); $ReleaseX64.arch = 'x64'
+    $IdentityX86 = Get-PluginIdentity -Architecture 'x86'
+    $IdentityX64 = Get-PluginIdentity -Architecture 'x64'
+
+    # Every staged text file (not the fake bin/ binaries) that contains the term.
+    function Get-StagedFilesContaining {
+        param([string]$StageDir, [string]$Term)
+        return @(foreach ($name in (Get-RelativeFileList $StageDir)) {
+            if ($name -notlike 'bin/*.dll' -and $name -notlike 'bin/*.exe' -and (Read-Utf8Text (Join-Path $StageDir $name)).IndexOf($Term, [StringComparison]::Ordinal) -ge 0) { $name }
+        })
     }
 
     # One staged tree is built once; every fault case works on its own copy.
@@ -498,6 +512,41 @@ try {
         Assert-True ($umlautAt -gt 0 -and $staged[$umlautAt] -eq 0xC3 -and $staged[$umlautAt + 1] -eq 0xBC) 'the two UTF-8 bytes of the u-umlaut are untouched'
         Assert-Equal 4 ([regex]::Matches([Text.Encoding]::UTF8.GetString($staged), "`r`n")).Count 'every CRLF is kept'
         Assert-StampedManifest -SourcePath $sourcePath -StagedPath $stagedPath -Version '1.9.0-rc.1'
+    }
+
+    Invoke-Case 'staging x64: plugin.json, hooks.json and the agents carry the x64 identity, and the tree passes every assertion' {
+        $publish = New-FakePublishDir
+        $stage = New-StageFrom -PublishDir $publish -StageRelease $ReleaseX64
+        Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -PublishDir $publish -Layout $FolderLayout -Release $ReleaseX64
+        $manifest = (Read-Utf8Text (Join-Path $stage '.claude-plugin\plugin.json')) | ConvertFrom-Json
+        foreach ($field in @('name', 'displayName', 'description')) { Assert-Equal $IdentityX64.$field $manifest.$field "plugin.json $field" }
+        Assert-Equal $SampleVersion $manifest.version 'plugin.json version'
+        $matcher = ((Read-Utf8Text (Join-Path $stage 'hooks\hooks.json')) | ConvertFrom-Json).hooks.PreToolUse[0].matcher
+        $entries = @($matcher -split '\|')
+        Assert-True ($entries.Count -gt 10) 'the matcher lists the allow-listed tools'
+        Assert-Equal 0 @($entries | Where-Object { -not $_.StartsWith($IdentityX64.pluginToolPrefix, [StringComparison]::Ordinal) }).Count 'matcher entries without the x64 prefix'
+        $agents = @(Get-ChildItem -LiteralPath (Join-Path $stage 'agents') -File)
+        Assert-True (@($agents | Where-Object { (Read-Utf8Text $_.FullName).Contains($IdentityX64.pluginToolPrefix) }).Count -gt 0) 'an agent references the x64 tool prefix'
+        Assert-Equal '' ((Get-StagedFilesContaining $stage $IdentityX86.pluginToolPrefix) -join ', ') 'staged files naming the x86 tool prefix'
+        Assert-Contains (Read-Utf8Text (Join-Path $stage 'VERSION.txt')) 'arch: x64' 'VERSION.txt'
+    }
+
+    Invoke-Case 'staging x86: the tree is the committed plugin and names no x64 plugin' {
+        $stage = New-StagedCopy
+        Assert-Equal (Read-Utf8Text (Join-Path $RepoRoot 'plugin\hooks\hooks.json')) (Read-Utf8Text (Join-Path $stage 'hooks\hooks.json')) 'hooks.json equals the committed one'
+        Assert-Equal '' ((Get-StagedFilesContaining $stage $IdentityX64.name) -join ', ') 'staged files naming the x64 plugin'
+    }
+
+    Invoke-Case 'fault: a staged x64 file names the x86 tool prefix' {
+        $publish = New-FakePublishDir
+        $stage = New-StageFrom -PublishDir $publish -StageRelease $ReleaseX64
+        [IO.File]::AppendAllText((Join-Path $stage 'skills\teststand-rules\SKILL.md'), "`nCall $($IdentityX86.pluginToolPrefix)get_steps.`n")
+        Assert-FailsWith { Assert-StagedPlugin -RepoRoot $RepoRoot -StageDir $stage -PublishDir $publish -Layout $FolderLayout -Release $ReleaseX64 } `
+            @('skills/teststand-rules/SKILL.md', $IdentityX86.pluginToolPrefix, 'another plugin') -Fix @('plugin.json')
+    }
+
+    Invoke-Case 'fault: the staged hooks.json is not the committed one with the plugin''s prefix' {
+        Assert-StageFault { param($stage) [IO.File]::AppendAllText((Join-Path $stage 'hooks\hooks.json'), ' ') } @('hooks/hooks.json is not plugin/hooks/hooks.json') -Fix @('New-HooksJson.ps1')
     }
 
     Invoke-Case 'staging: VERSION.txt carries tag, version, commit, arch, built and run, one per line, in the format the exe reads' {

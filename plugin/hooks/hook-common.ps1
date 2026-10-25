@@ -63,7 +63,9 @@ function Get-HookProperty {
 # ----------------------------------------------------------------------------
 $script:StateDirOverrideVariable = 'TESTSTAND_MCP_STATE_DIR'      # tests and unusual stations
 $script:PluginDataVariable = 'CLAUDE_PLUGIN_DATA'                 # survives plugin updates
-$script:LocalAppDataStateFolder = 'teststand-mcp'                 # %LOCALAPPDATA%\teststand-mcp
+$script:DefaultPluginName = 'teststand-mcp'                       # when the installed plugin.json is unreadable
+$script:PluginRootVariable = 'CLAUDE_PLUGIN_ROOT'
+$script:PluginJsonRelativePath = '.claude-plugin\plugin.json'
 $script:ClockOverrideVariable = 'TESTSTAND_MCP_NOW'               # an ISO 8601 instant, for the tests
 $script:FlagOnValue = '1'
 
@@ -73,6 +75,30 @@ function Get-HookEnvironmentText {
     $value = [Environment]::GetEnvironmentVariable($Name)
     if ([string]::IsNullOrWhiteSpace($value)) { return $null }
     return $value
+}
+
+# The plugin root: CLAUDE_PLUGIN_ROOT, else the folder above hooks/.
+function Get-PluginRoot {
+    $fromEnvironment = Get-HookEnvironmentText $script:PluginRootVariable
+    if ($null -ne $fromEnvironment) { return $fromEnvironment }
+    return (Split-Path -Parent $PSScriptRoot)
+}
+
+# The installed plugin.json as an object; $null when it is missing or unreadable.
+function Read-InstalledPluginJson {
+    try {
+        return ([IO.File]::ReadAllText((Join-Path (Get-PluginRoot) $script:PluginJsonRelativePath), $script:Utf8NoBom) | ConvertFrom-Json)
+    } catch {
+        return $null
+    }
+}
+
+# This plugin's name (there is one plugin per TestStand bitness); $null when unreadable or not a plugin name.
+function Get-HookPluginName {
+    $name = [string](Get-HookProperty (Read-InstalledPluginJson) 'name')
+    # It becomes a folder name and a tool prefix: a plugin name is lower case, digits and '-' only.
+    if ($name -cnotmatch '\A[a-z0-9][a-z0-9-]*\z') { return $null }
+    return $name
 }
 
 # A failure the tests can ask a hook for by name (TESTSTAND_MCP_HOOK_SIMULATE=<name>), to prove that the hook
@@ -128,15 +154,18 @@ $script:StateReplaceAttempts = 3
 $script:StateReplaceRetryMilliseconds = 50
 
 # Where the caches live: TESTSTAND_MCP_STATE_DIR (an absolute local path only), else
-# CLAUDE_PLUGIN_DATA, else %LOCALAPPDATA%\teststand-mcp; $null when none of them is usable.
+# CLAUDE_PLUGIN_DATA, else %LOCALAPPDATA%\<plugin name>, so the two plugins never share a cache;
+# $null when none of them is usable.
 function Get-HookStateDir {
     $override = Get-HookEnvironmentText $script:StateDirOverrideVariable
     if ($null -ne $override -and (Test-IsAbsoluteLocalPath $override)) { return $override }
     $pluginData = Get-HookEnvironmentText $script:PluginDataVariable
     if ($null -ne $pluginData) { return $pluginData }
     $localAppData = Get-HookEnvironmentText 'LOCALAPPDATA'
-    if ($null -ne $localAppData) { return (Join-Path $localAppData $script:LocalAppDataStateFolder) }
-    return $null
+    if ($null -eq $localAppData) { return $null }
+    $name = Get-HookPluginName
+    if ($null -eq $name) { $name = $script:DefaultPluginName }
+    return (Join-Path $localAppData $name)
 }
 
 # The state file as an object; $null when it is missing, unreadable or not JSON. Opened with

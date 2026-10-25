@@ -1,9 +1,9 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "teststand-mcp",
-  "displayName": "TestStand MCP",
+  "displayName": "TestStand MCP (32-bit)",
   "version": "0.0.0",
-  "description": "TestStand MCP: build, edit, run and document NI TestStand sequence files from an AI assistant, with bundled TestStand agents and usage rules. Windows x86, NI TestStand required.",
+  "description": "TestStand MCP: build, edit, run and document NI TestStand sequence files from an AI assistant, with bundled TestStand agents and usage rules. For 32-bit NI TestStand on Windows.",
   "author": {
     "name": "Zühlke Engineering AG"
   },

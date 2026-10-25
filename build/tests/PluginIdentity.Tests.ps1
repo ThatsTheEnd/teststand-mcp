@@ -92,6 +92,33 @@ try {
         Assert-Equal $DirectToolPrefix $identity.directToolPrefix 'directToolPrefix'
     }
 
+    # --- Scenario: one identity table for the x86 and x64 plugins ------------
+    Invoke-Case 'identity table: the x86 row is the committed plugin, the x64 row its 64-bit sibling' {
+        $expected = @{
+            x86 = @{ name = 'teststand-mcp';     displayName = 'TestStand MCP (32-bit)'; assetPrefix = 'teststand-mcp';     runtimeIdentifier = 'win-x86'; buildPlatform = 'x86'; bits = 32; pluginToolPrefix = 'mcp__plugin_teststand-mcp_teststand__' }
+            x64 = @{ name = 'teststand-mcp-x64'; displayName = 'TestStand MCP (64-bit)'; assetPrefix = 'teststand-mcp-x64'; runtimeIdentifier = 'win-x64'; buildPlatform = 'x64'; bits = 64; pluginToolPrefix = 'mcp__plugin_teststand-mcp-x64_teststand__' }
+        }
+        Assert-Equal 'x86,x64' ((Get-PluginArchitectures) -join ',') 'architectures'
+        foreach ($architecture in $expected.Keys) {
+            $identity = Get-PluginIdentity -Architecture $architecture
+            foreach ($field in $expected[$architecture].Keys) { Assert-Equal $expected[$architecture][$field] $identity.$field "$architecture $field" }
+            Assert-Equal 'teststand' $identity.serverKey "$architecture serverKey"
+            Assert-Contains $identity.description "For $($expected[$architecture].bits)-bit NI TestStand" "$architecture description"
+        }
+    }
+
+    Invoke-Case 'identity table: an unknown architecture fails naming the allowed values' {
+        $message = try { [void](Get-PluginIdentity -Architecture 'arm64'); '(nothing thrown)' } catch { $_.Exception.Message }
+        Assert-Contains $message "Unknown architecture 'arm64'" 'the value'
+        Assert-Contains $message 'x86 and x64' 'the allowed values'
+    }
+
+    Invoke-Case 'plugin.json: name, displayName and description are the x86 row of the identity table' {
+        $manifest = Read-JsonFile $PluginJsonPath
+        $identity = Get-PluginIdentity -Architecture 'x86'
+        foreach ($field in @('name', 'displayName', 'description')) { Assert-Equal $identity.$field $manifest.$field $field }
+    }
+
     Invoke-Case 'identity: a different plugin name and server key change the prefix' {
         $files = New-IdentityFiles '{"name":"other-plugin"}' '{"mcpServers":{"srv":{}}}'
         $identity = Get-PluginIdentity @files
