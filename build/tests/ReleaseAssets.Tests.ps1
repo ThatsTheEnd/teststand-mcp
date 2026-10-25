@@ -1159,6 +1159,14 @@ try {
     # ============================================================================================
     #  Verifier: API mode through a fake HTTP boundary
     # ============================================================================================
+    Invoke-Case 'verify api: a repository whose only release is the draft is read, exit 0' {
+        $fixture = New-ReleaseFixture
+        $full = New-ReleaseJsonText -Tag $fixture.Tag -AssetNames @(Get-RequiredAssetNames -Version $fixture.Version) -SizeByAsset (Get-AssetSizes $fixture)
+        $only = @($full | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $_.tag_name -ceq $fixture.Tag })
+        $run = Invoke-ApiVerify $fixture (New-FakeApi $fixture -Pages @{ 1 = (ConvertTo-Json -InputObject $only -Depth 6) })
+        Assert-Equal 0 $run.ExitCode "exit code. Output was:`n$($run.Output)"
+    }
+
     Invoke-Case 'verify api: reads the draft with the token, downloads four assets, exit 0, writes release_id and asset_ids' {
         $fixture = New-ReleaseFixture
         $api = New-FakeApi $fixture

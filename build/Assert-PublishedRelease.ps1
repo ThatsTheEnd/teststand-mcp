@@ -104,7 +104,8 @@ Import-Module (Join-Path $PSScriptRoot 'BuildCommon.psm1') -Force
 # ConvertFrom-Json emits a JSON array as ONE object in Windows PowerShell 5.1 and unrolled in 7; this is always the items.
 function ConvertFrom-JsonList {
     param([string]$Text)
-    return @($Text | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $null -ne $_ })
+    # The comma keeps a one-release list an array: returned bare, it unrolls to a single object whose .Count throws under strict mode on 5.1.
+    return ,@($Text | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $null -ne $_ })
 }
 
 function Select-ReleaseByTag {
