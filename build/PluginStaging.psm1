@@ -81,13 +81,7 @@ function Get-StagedExePath {
 # ----------------------------------------------------------------------------
 function Get-GitPathList {
     param([string]$RepoRoot, [string[]]$GitArguments, [string]$Pathspec)
-    $git = Get-Command git -ErrorAction SilentlyContinue
-    if ($null -eq $git) {
-        Write-BuildFailure -What 'git was not found on the PATH.' -Why 'The archive stages only files git tracks, so it needs git to list them.' -Fix 'Install Git for Windows and open a new shell.'
-    }
-    $result = Invoke-ChildProcess -FilePath $git.Source -TimeoutSeconds $script:GitTimeoutSeconds `
-        -ArgumentList (@('-c', 'core.quotePath=off', '-C', $RepoRoot) + $GitArguments + @('--', $Pathspec))
-    Assert-ChildOutcome -Result $result -Name "git $($GitArguments -join ' ')" -TimeoutSeconds $script:GitTimeoutSeconds `
+    $result = Invoke-Git -RepoRoot $RepoRoot -Arguments (@($GitArguments) + @('--', $Pathspec)) -TimeoutSeconds $script:GitTimeoutSeconds `
         -Why 'The archive stages only files git tracks; without the list nothing can be staged.' `
         -Fix "Run it by hand in ${RepoRoot}: git $($GitArguments -join ' ') -- $Pathspec (the folder must be inside a git checkout)."
     return @($result.Stdout -split "`0" | Where-Object { $_ })

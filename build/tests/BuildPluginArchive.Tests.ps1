@@ -42,32 +42,12 @@ function Assert-FailsWith {
     param([scriptblock]$Body, [string[]]$Needles = @(), [string[]]$Fix = @())
     $text = Get-ThrownMessage $Body
     if ($null -eq $text) { throw 'expected a failure but none was thrown' }
-    foreach ($label in @('What', 'Why', 'Fix')) {
-        Assert-True ($text -cmatch "(?m)^${label}: +\S") "failure has no '${label}:' line with content. Failure was:`n$text"
-    }
+    Assert-ThreePartFailure $text
     foreach ($needle in $Needles) { Assert-Contains $text $needle 'failure text' }
     $fixPart = $text.Substring($text.IndexOf("`nFix:", [StringComparison]::Ordinal))
     foreach ($needle in $Fix) { Assert-Contains $fixPart $needle 'the Fix part' }
 }
 
-function Write-TextFile {
-    param([string]$Path, [string]$Text)
-    [void](New-Item -ItemType Directory -Path (Split-Path -Parent $Path) -Force)
-    [IO.File]::WriteAllText($Path, $Text, $Utf8NoBom)
-}
-
-# Runs a body with environment variables set (a $null value removes one), then restores them.
-function Use-Environment {
-    param([hashtable]$Values, [scriptblock]$Body)
-    $saved = @{}
-    foreach ($name in $Values.Keys) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
-    try {
-        foreach ($name in $Values.Keys) { [Environment]::SetEnvironmentVariable($name, $Values[$name]) }
-        & $Body
-    } finally {
-        foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
-    }
-}
 
 # Fails when a process with this command-line fragment is still running; stops such leftovers first.
 function Assert-NoProcessWithCommandLine {
@@ -85,7 +65,7 @@ function New-FakeExe {
     return $path
 }
 
-function Invoke-Git {
+function Invoke-TestGit {
     param([string]$Directory, [string[]]$Arguments)
     $result = Invoke-ChildProcess -FilePath 'git' -ArgumentList (@('-C', $Directory) + $Arguments) -TimeoutSeconds 60
     Assert-Equal 0 $result.ExitCode "git $($Arguments -join ' ') said: $($result.Stdout) $($result.Stderr)"
@@ -109,8 +89,8 @@ function New-RepoFixture {
         Get-ChildItem -LiteralPath $BuildDir -File | Where-Object { $_.Extension -in '.ps1', '.psm1' } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $root 'build') }
     }
     if ($null -ne $Mutate) { & $Mutate $root }
-    Invoke-Git $root @('init', '-q')
-    Invoke-Git $root @('add', '-A')
+    Invoke-TestGit $root @('init', '-q')
+    Invoke-TestGit $root @('add', '-A')
     return $root
 }
 
@@ -277,7 +257,7 @@ try {
     Invoke-Case 'commit time: the timestamp of a commit of this checkout, and a clear fix for one that is not' {
         $head = (Invoke-ChildProcess -FilePath 'git' -ArgumentList @('-C', $RepoRoot, 'rev-parse', 'HEAD') -TimeoutSeconds 30).Stdout.Trim()
         Assert-True ((Get-CommitTimestamp -RepoRoot $RepoRoot -Commit $head).Year -ge 2026) 'the commit time of HEAD'
-        Assert-FailsWith { Get-CommitTimestamp -RepoRoot $RepoRoot -Commit $SampleCommit } @("git show $SampleCommit") -Fix @('git rev-parse HEAD')
+        Assert-FailsWith { Get-CommitTimestamp -RepoRoot $RepoRoot -Commit $SampleCommit } @("git show", $SampleCommit) -Fix @('git rev-parse HEAD')
     }
 
     # ======================================================================
@@ -1014,7 +994,7 @@ try {
         $outDir = Join-Path (New-TempDir) 'out'
         $result = Invoke-BuildScript -ScriptPath $ScriptPath -TimeoutSeconds 120 -ArgumentList @('-Version', 'one.nine', '-OutDir', $outDir)
         Assert-Equal 1 $result.ExitCode 'exit code'
-        foreach ($label in @('What', 'Why', 'Fix')) { Assert-True ($result.Stdout -cmatch "(?m)^${label}: +\S") "no '${label}:' line in:`n$($result.Stdout)" }
+        Assert-ThreePartFailure $result.Stdout
         Assert-Contains $result.Stdout "'one.nine'" 'output'
         Assert-True (-not (Test-Path -LiteralPath $outDir)) 'nothing may be created for a refused input'
     }
@@ -1036,7 +1016,7 @@ try {
         $outDir = Join-Path (New-TempDir) 'out'
         $result = Invoke-BuildScript -ScriptPath (Join-Path $root 'build\Build-PluginArchive.ps1') -TimeoutSeconds 300 -ArgumentList @('-Version', '0.0.0-ci', '-Commit', $SampleCommit, '-OutDir', $outDir)
         Assert-Equal 1 $result.ExitCode "exit code; output was:`n$($result.Stdout)"
-        foreach ($label in @('What', 'Why', 'Fix')) { Assert-True ($result.Stdout -cmatch "(?m)^${label}: +\S") "no '${label}:' line in:`n$($result.Stdout)" }
+        Assert-ThreePartFailure $result.Stdout
         Assert-Contains $result.Stdout '[1/8]' 'step 1 started'
         Assert-Contains $result.Stdout 'plugin.json' 'the fault names the manifest'
         Assert-NotContains $result.Stdout '[2/8]' 'step 2 must not start'

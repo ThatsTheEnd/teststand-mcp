@@ -43,12 +43,6 @@ $CaseNegatives = @{ 'test id' = 'Pinned by t35.' }
 . (Join-Path $PSScriptRoot 'TestHarness.ps1')
 $script:TempDirPrefix = 'SkillSourcesTests_'
 
-function Write-FixtureText {
-    param([string]$Path, [string]$Text)
-    $parent = Split-Path -Parent $Path
-    if (-not (Test-Path -LiteralPath $parent)) { [void](New-Item -ItemType Directory -Path $parent -Force) }
-    [IO.File]::WriteAllText($Path, $Text, $Utf8NoBom)
-}
 
 # Fixtures are LF-only, so a checkout with CRLF working-tree files still gives the same text.
 function Read-FixtureText {
@@ -72,10 +66,10 @@ function New-ClaudeMdText {
 function New-Fixture {
     $root = New-TempDir
     foreach ($name in $SkillFileNames) {
-        Write-FixtureText (Get-SkillPath $root $name) (Read-FixtureText (Join-Path $RealSkillRoot $name))
+        Write-TextFile (Get-SkillPath $root $name) (Read-FixtureText (Join-Path $RealSkillRoot $name))
     }
-    Write-FixtureText (Join-Path $root 'CLAUDE.md') (New-ClaudeMdText)
-    Write-FixtureText (Join-Path $root 'README.md') "# Fixture readme`n`nNothing moved here.`n"
+    Write-TextFile (Join-Path $root 'CLAUDE.md') (New-ClaudeMdText)
+    Write-TextFile (Join-Path $root 'README.md') "# Fixture readme`n`nNothing moved here.`n"
     return $root
 }
 
@@ -84,12 +78,12 @@ function Edit-FixtureText {
     $text = Read-FixtureText $Path
     $edited = & $Edit $text
     Assert-True ($edited -ne $text) "the edit changed nothing in $Path"
-    Write-FixtureText $Path $edited
+    Write-TextFile $Path $edited
 }
 
 function Add-Line {
     param([string]$Path, [string]$Line)
-    Write-FixtureText $Path ((Read-FixtureText $Path).TrimEnd() + "`n" + $Line + "`n")
+    Write-TextFile $Path ((Read-FixtureText $Path).TrimEnd() + "`n" + $Line + "`n")
 }
 
 # Runs the checker against a fixture; returns exit code and the combined output.
@@ -341,8 +335,8 @@ try {
 
     Invoke-Case 'uniqueness: a moved heading quoted in docs/specs or plans is allowed' {
         $root = New-Fixture
-        Write-FixtureText (Join-Path $root 'docs\specs\quote.md') "# Spec`n`n## Sequence Design Rules`n"
-        Write-FixtureText (Join-Path $root 'plans\quote.md') "# Plan`n`n### Default Step Type When Unclear`n"
+        Write-TextFile (Join-Path $root 'docs\specs\quote.md') "# Spec`n`n## Sequence Design Rules`n"
+        Write-TextFile (Join-Path $root 'plans\quote.md') "# Plan`n`n### Default Step Type When Unclear`n"
         Assert-CheckerPasses (Invoke-Checker $root)
     }
 
@@ -373,7 +367,7 @@ try {
     Invoke-Case 'git: a tracked file with a moved heading fails and an untracked one is not scanned' {
         $root = New-Fixture
         Add-Line (Join-Path $root 'README.md') "`n### Default Step Type When Unclear"
-        Write-FixtureText (Join-Path $root 'notes.md') "# Notes`n`n## Sequence Design Rules`n"
+        Write-TextFile (Join-Path $root 'notes.md') "# Notes`n`n## Sequence Design Rules`n"
         Initialize-GitRepository $root @('README.md', 'CLAUDE.md')
         $run = Invoke-Checker $root
         Assert-CheckerFails $run 'uniqueness: no moved heading remains in CLAUDE.md or other tracked markdown' @('README.md:')

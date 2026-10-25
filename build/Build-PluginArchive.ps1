@@ -48,13 +48,8 @@ $GitTimeoutSeconds = 30
 
 # The commit of the checkout, when none was given.
 function Get-HeadCommit {
-    $git = Get-Command git -ErrorAction SilentlyContinue
-    if ($null -eq $git) {
-        Write-BuildFailure -What 'No -Commit was given and git was not found.' -Why 'The commit is stamped into the exe and VERSION.txt.' -Fix 'Pass -Commit with the 40-character SHA.'
-    }
-    $result = Invoke-ChildProcess -FilePath $git.Source -ArgumentList @('-C', $RepoRoot, 'rev-parse', 'HEAD') -TimeoutSeconds $GitTimeoutSeconds
-    Assert-ChildOutcome -Result $result -Name 'git rev-parse HEAD' -TimeoutSeconds $GitTimeoutSeconds `
-        -Why 'The commit is stamped into the exe and VERSION.txt.' -Fix 'Run from a git checkout, or pass -Commit with the 40-character SHA.'
+    $result = Invoke-Git -RepoRoot $RepoRoot -Arguments @('rev-parse', 'HEAD') -TimeoutSeconds $GitTimeoutSeconds `
+        -Why 'No -Commit was given, and the commit is stamped into the exe and VERSION.txt.' -Fix 'Run from a git checkout, or pass -Commit with the 40-character SHA.'
     return $result.Stdout.Trim()
 }
 

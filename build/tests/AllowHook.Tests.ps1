@@ -17,13 +17,6 @@ $AllowReason = 'no TestStand file is modified'
 $ExpectedToolPrefix = 'mcp__plugin_teststand-mcp_teststand__'
 $ProjectDir = 'C:\Work\Proj'
 
-# The hook input a tool call produces: tool name, tool_input and (unless $null) the session's cwd.
-function ConvertTo-HookInput {
-    param([string]$ToolName, $ToolInput = @{}, [AllowNull()][string]$Cwd = $null)
-    $request = [ordered]@{ hook_event_name = 'PreToolUse'; tool_name = $ToolName; tool_input = $ToolInput }
-    if ($null -ne $Cwd) { $request['cwd'] = $Cwd }
-    return ($request | ConvertTo-Json -Compress -Depth 6)
-}
 
 function Invoke-AllowHookProcess {
     param([AllowEmptyString()][string]$Stdin)

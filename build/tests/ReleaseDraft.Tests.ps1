@@ -191,10 +191,12 @@ try {
         Assert-Equal $SampleCommit $create[($create.IndexOf('--target') + 1)] 'target commit'
     }
 
-    Invoke-Case 'draft: a dry run without a commit, a dry run of a real tag and a real run of a rehearsal tag are refused before anything is created' {
+    Invoke-Case 'draft: a dry run without a full commit SHA, a dry run of a real tag and a real run of a rehearsal tag are refused before anything is created' {
         $fake = New-FakeGh
         foreach ($call in @(
             { New-ReleaseDraft -Repo $Repo -Tag 'v1.9.0-rehearsal' -AssetDir (New-AssetFolder) -DryRun -Gh $fake.Gh }
+            { New-ReleaseDraft -Repo $Repo -Tag 'v1.9.0-rehearsal' -AssetDir (New-AssetFolder) -Target 'main' -DryRun -Gh $fake.Gh }
+            { New-ReleaseDraft -Repo $Repo -Tag 'v1.9.0-rehearsal' -AssetDir (New-AssetFolder) -Target $SampleCommit.Substring(0, 12) -DryRun -Gh $fake.Gh }
             { New-ReleaseDraft -Repo $Repo -Tag 'v1.9.0' -AssetDir (New-AssetFolder) -Target $SampleCommit -DryRun -Gh $fake.Gh }
             { New-ReleaseDraft -Repo $Repo -Tag 'v1.9.0-rehearsal' -AssetDir (New-AssetFolder) -Target $SampleCommit -Gh $fake.Gh }
             { New-ReleaseDraft -Repo 'not a repo' -Tag 'v1.9.0' -AssetDir (New-AssetFolder) -Gh $fake.Gh }

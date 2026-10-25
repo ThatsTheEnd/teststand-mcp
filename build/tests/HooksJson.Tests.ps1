@@ -29,8 +29,7 @@ function Read-HooksJson { return ([IO.File]::ReadAllText($HooksJsonPath, $Utf8No
 # Runs New-HooksJson.ps1 in a child host; returns exit code and text.
 function Invoke-NewHooksJson {
     param([string[]]$ScriptArguments = @())
-    $arguments = (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $NewHooksJsonPath) + $ScriptArguments | ForEach-Object { ConvertTo-ArgumentElement $_ }) -join ' '
-    return Invoke-ProcessWithStdin -FileName $HostPath -Arguments $arguments -StdinText ''
+    return Invoke-HookProcess -FilePath $HostPath -ArgumentList (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $NewHooksJsonPath) + $ScriptArguments)
 }
 
 # The hook entry (type command) of a script, from the parsed hooks.json.
@@ -45,10 +44,10 @@ function Get-HookEntry {
 # placeholder substituted into every element.
 function Invoke-HookEntry {
     param($Entry, [string]$PluginRoot, [string]$StdinText, [hashtable]$EnvOverrides = @{})
-    $arguments = (@($Entry.args) | ForEach-Object { ConvertTo-ArgumentElement ([string]$_).Replace($PluginRootToken, $PluginRoot) }) -join ' '
+    $arguments = @(@($Entry.args) | ForEach-Object { ([string]$_).Replace($PluginRootToken, $PluginRoot) })
     $envMap = @{ CLAUDE_PLUGIN_ROOT = $PluginRoot }
     foreach ($key in $EnvOverrides.Keys) { $envMap[$key] = $EnvOverrides[$key] }
-    return Invoke-ProcessWithStdin -FileName ([string]$Entry.command).Replace($PluginRootToken, $PluginRoot) -Arguments $arguments -StdinText $StdinText -EnvOverrides $envMap
+    return Invoke-HookProcess -FilePath ([string]$Entry.command).Replace($PluginRootToken, $PluginRoot) -ArgumentList $arguments -StdinText $StdinText -EnvOverrides $envMap
 }
 
 # A copy of plugin/ under <guid> T<e-acute>st\plugin root, with a plugin.json that names the stub release server.
@@ -63,12 +62,6 @@ function New-StagedPlugin {
     return $pluginRoot
 }
 
-function ConvertTo-HookInput {
-    param([string]$ToolName, $ToolInput = @{}, [AllowNull()][string]$Cwd = $null)
-    $request = [ordered]@{ hook_event_name = 'PreToolUse'; tool_name = $ToolName; tool_input = $ToolInput }
-    if ($null -ne $Cwd) { $request['cwd'] = $Cwd }
-    return ($request | ConvertTo-Json -Compress -Depth 6)
-}
 
 try {
     Import-Module (Join-Path $RepoRoot 'build\ToolClassification.psm1') -Force   # Read-ToolClasses

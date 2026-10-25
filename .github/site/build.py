@@ -28,7 +28,7 @@ import net_installs as domain  # noqa: E402
 import stats_csv  # noqa: E402  (the CSV schema constants live there)
 
 # The asset names of build/ReleaseAssets.psm1; test_collect.py greps them out of it.
-INSTALL_ASSET_NAME = "teststand-mcp.zip"
+PLUGIN_ARCHIVE_NAME = "teststand-mcp.zip"
 VERSIONED_ARCHIVE_FORMAT = "teststand-mcp-v{}.zip"
 _VERSIONED_PREFIX, _VERSIONED_SUFFIX = VERSIONED_ARCHIVE_FORMAT.split("{}")
 VERSIONED_ARCHIVE_PATTERN = re.compile(re.escape(_VERSIONED_PREFIX) + r"\d+\.\d+\.\d+" + re.escape(_VERSIONED_SUFFIX))
@@ -83,7 +83,7 @@ class Chart:
 
 
 INSTALL_STYLES = {
-    "latest": SeriesStyle(INSTALL_ASSET_NAME, "latest", "", "circle"),
+    "latest": SeriesStyle(PLUGIN_ARCHIVE_NAME, "latest", "", "circle"),
     "versioned": SeriesStyle("Versioned archives", "versioned", "8 4", "square"),
 }
 TRAFFIC_STYLES = {
@@ -98,7 +98,7 @@ TRAFFIC_STYLES = {
 
 def install_series(installs: Mapping[date, Mapping[str, int]]) -> list[Series]:
     """Net installs per day: the latest-archive asset, and every versioned archive summed."""
-    latest = {day: assets.get(INSTALL_ASSET_NAME, 0) for day, assets in installs.items()}
+    latest = {day: assets.get(PLUGIN_ARCHIVE_NAME, 0) for day, assets in installs.items()}
     versioned = {
         day: sum(count for asset, count in assets.items() if VERSIONED_ARCHIVE_PATTERN.fullmatch(asset))
         for day, assets in installs.items()

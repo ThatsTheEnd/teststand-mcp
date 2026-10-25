@@ -267,19 +267,19 @@
   },
   "audit": {
     "find_in_file": {
-      "verdict": "allow",
+      "decision": "allow",
       "reason": "Runs the engine search over ONE sequence file already loaded by GetOrLoadSeqFile; the handler passes no replacement and saves nothing. It opens no file other than a sequence file (a non-sequence path fails to load)."
     },
     "get_report_text": {
-      "verdict": "allow",
+      "decision": "allow",
       "reason": "Reads Execution.ReportText of an execution held in memory; it takes an execution id, never a path."
     },
     "get_step_unique_id": {
-      "verdict": "allow",
+      "decision": "allow",
       "reason": "Reads Step.UniqueStepId with no setter, no save and no execution; the only engine-side effect is the file load every get_* file tool shares."
     },
     "read_csv_lines": {
-      "verdict": "prompt",
+      "decision": "prompt",
       "reason": "Opens the CSV input record stream on ANY path the caller names and returns its lines, so it is an arbitrary file read and not a read of a TestStand file."
     }
   },

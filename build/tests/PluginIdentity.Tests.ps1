@@ -140,9 +140,7 @@ try {
             $message = $null
             try { [void](Get-PluginIdentity @files) } catch { $message = $_.Exception.Message }
             Assert-True ($null -ne $message) "$name : expected a failure"
-            foreach ($label in @('What', 'Why', 'Fix')) {
-                Assert-True ($message -cmatch "(?m)^${label}: +\S") "$name : no '${label}:' line with content. Message was:`n$message"
-            }
+            Assert-ThreePartFailure $message
         }
     }
 

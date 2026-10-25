@@ -4,7 +4,7 @@
 #  still a draft, the same asset ids) and just AFTER the publish call (-Stage AfterPublish: no longer a
 #  draft, the same asset ids). Exit 0, or one three-part failure and exit 1; an AfterPublish failure says
 #  that the release is live and names the rollback. The comparison itself is Assert-ReleaseAssetSet in
-#  ReleaseAssets.psm1.
+#  ReleaseVerdict.psm1.
 #    -ReleaseId         the id the verifier reported (its release_id output); must be a number
 #    -ExpectedAssetIds  the verifier's step output asset_ids, {"<name>": <id>, ...}
 #    -Repo              owner/name: the release is read with gh (GET releases/{id}) by that id
@@ -29,6 +29,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'BuildCommon.psm1') -Force
 try {
     Import-Module (Join-Path $PSScriptRoot 'ReleaseAssets.psm1') -Force
+    Import-Module (Join-Path $PSScriptRoot 'ReleaseVerdict.psm1') -Force
     if ([string]::IsNullOrWhiteSpace($ReleaseJson) -and -not [string]::IsNullOrWhiteSpace($Repo)) {
         Import-Module (Join-Path $PSScriptRoot 'ReleaseDraft.psm1') -Force
         Assert-RepoSlug $Repo

@@ -50,7 +50,7 @@ try {
         Assert-Equal 0 $violations.Count ("violations: " + (($violations | ForEach-Object { $_.Message }) -join ' | '))
     }
 
-    Invoke-Case 'real classification: the audited verdicts and the named exclusions are kept' {
+    Invoke-Case 'real classification: the audited decisions and the named exclusions are kept' {
         $classes = Read-ToolClasses -Path $ToolClassesPath
         Assert-True ($classes.allow -ccontains 'get_step_unique_id') 'get_step_unique_id is audited as read-only'
         Assert-True ($classes.prompt -ccontains 'read_csv_lines') 'read_csv_lines is an arbitrary file read, so it prompts'
@@ -154,13 +154,24 @@ try {
         Assert-OneViolation (New-FixtureClasses -Allow @('get_a', 'get_b', 'get_a')) 'E_DUPLICATE' 'get_a'
     }
 
-    Invoke-Case 'classification fault: an audit verdict that disagrees with the list is named' {
-        $audit = [pscustomobject]@{ get_b = [pscustomobject]@{ verdict = 'prompt'; reason = 'r' } }
+    Invoke-Case 'classification fault: an audit decision that disagrees with the list is named' {
+        $audit = [pscustomobject]@{ get_b = [pscustomobject]@{ decision = 'prompt'; reason = 'r' } }
         Assert-OneViolation (New-FixtureClasses -Audit $audit) 'E_AUDIT_MISMATCH' 'get_b'
     }
 
+    Invoke-Case 'classification: the audit field is called decision; an entry that still says verdict is refused, and the real file has no verdict key' {
+        $old = [pscustomobject]@{ get_b = [pscustomobject]@{ verdict = 'allow'; reason = 'r' } }
+        Assert-OneViolation (New-FixtureClasses -Audit $old) 'E_AUDIT_MISMATCH' 'get_b'
+        $real = Read-ToolClasses -Path $ToolClassesPath
+        foreach ($tool in (Get-PropertyNames $real.audit)) {
+            $entry = $real.audit.$tool
+            Assert-True ($null -ne $entry.PSObject.Properties['decision']) "audit entry $tool has no decision"
+            Assert-True ($null -eq $entry.PSObject.Properties['verdict']) "audit entry $tool still has the old verdict key"
+        }
+    }
+
     Invoke-Case 'classification: an audit entry without a reason is refused' {
-        $audit = [pscustomobject]@{ get_b = [pscustomobject]@{ verdict = 'allow'; reason = ' ' } }
+        $audit = [pscustomobject]@{ get_b = [pscustomobject]@{ decision = 'allow'; reason = ' ' } }
         Assert-OneViolation (New-FixtureClasses -Audit $audit) 'E_AUDIT_NO_REASON' 'get_b'
     }
 

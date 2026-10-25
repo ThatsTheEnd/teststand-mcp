@@ -171,8 +171,8 @@ function New-ReleaseDraft {
         Write-BuildFailure -What "A dry run was asked to create a draft for the tag $Tag, which is not a rehearsal tag." `
             -Why 'A dry run must never create or delete anything under the tag of a real release.' -Fix 'Pass a tag of the form v<X.Y.Z>-rehearsal.'
     }
-    if ($DryRun -and [string]::IsNullOrWhiteSpace($Target)) {
-        Write-BuildFailure -What 'A dry run needs the commit to point its draft at, and none was given.' -Why 'The rehearsal tag does not exist, so the draft names it and targets this commit.' -Fix 'Pass -Target with the commit SHA of the run.'
+    if ($DryRun -and $Target -cnotmatch $ReleaseCommitPattern) {
+        Write-BuildFailure -What "A dry run needs the full 40-character commit SHA to point its draft at, and got '$(Get-PrintableTag $Target)'." -Why 'The rehearsal tag does not exist, so the draft names it and targets this commit; an abbreviation or a branch name could resolve to another commit.' -Fix 'Pass -Target with the commit SHA of the run (github.sha).'
     }
     Assert-ReleaseAssetFiles -Directory $AssetDir -Version $parsed.Version
 

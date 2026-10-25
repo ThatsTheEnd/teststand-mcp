@@ -8,7 +8,9 @@
 #    - Add-GitHubOutput: a step output for later workflow steps;
 #    - Remove-BuildTempTree: temp cleanup that retries and warns;
 #    - Invoke-ChildProcess / Invoke-BuildScript / Assert-ChildOutcome / Stop-ChildProcess: a child program with a
-#      timeout, array arguments and captured output (its process tree is stopped by id, never by image name);
+#      timeout, array arguments, optional stdin text and environment overrides, and captured output (its
+#      process tree is stopped by id, never by image name);
+#    - Invoke-Git: git in a repository, with the three-part failure of a missing git, a timeout or a bad exit;
 #    - Get-RelativeFileList: the files of a tree, refusing junctions and symbolic links.
 #  Compatible with Windows PowerShell 5.1 and PowerShell 7.
 #  Text is written with explicit .NET UTF-8 (no BOM) APIs: never use
@@ -169,14 +171,20 @@ function ConvertTo-ArgumentElement {
     return '"' + $escaped + '"'
 }
 
-# A start-info with all three streams redirected, no window and UTF-8 text.
+# A start-info with all three streams redirected, no window and UTF-8 text. $EnvOverrides: name -> value;
+# a $null value REMOVES the variable from the child.
 function New-ChildProcessStartInfo {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$FilePath, [string[]]$ArgumentList = @(), [string]$WorkingDirectory)
+    param([Parameter(Mandatory)][string]$FilePath, [string[]]$ArgumentList = @(), [string]$WorkingDirectory, [hashtable]$EnvOverrides = @{})
     $info = New-Object System.Diagnostics.ProcessStartInfo
     $info.FileName = $FilePath
     $info.Arguments = (@($ArgumentList | ForEach-Object { ConvertTo-ArgumentElement $_ })) -join ' '
     if ($WorkingDirectory) { $info.WorkingDirectory = Resolve-BuildPath $WorkingDirectory }
+    # UseShellExecute is false below, which is what makes the variables of the child settable.
+    foreach ($name in $EnvOverrides.Keys) {
+        if ($null -eq $EnvOverrides[$name]) { [void]$info.EnvironmentVariables.Remove($name) }
+        else { $info.EnvironmentVariables[$name] = [string]$EnvOverrides[$name] }
+    }
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
     $info.RedirectStandardInput = $true
@@ -215,22 +223,34 @@ function Stop-ChildProcess {
     [void]$Process.WaitForExit($script:ProcessSettleMilliseconds)
 }
 
-# Runs a program to completion with stdin closed (the program sees EOF), a hard timeout and both
-# output streams captured. A non-zero exit does not throw; a timeout stops that process and says so.
+# Runs a program to completion with a hard timeout and both output streams captured. Its stdin gets
+# -StdinText (UTF-8, no BOM) when that is given, and is then closed: without it the program sees EOF at once.
+# -EnvOverrides changes the child's environment (a $null value removes a variable). A non-zero exit does not
+# throw; a timeout stops that process and says so.
 function Invoke-ChildProcess {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$FilePath,
         [string[]]$ArgumentList = @(),
         [string]$WorkingDirectory,
-        [int]$TimeoutSeconds = 120
+        [int]$TimeoutSeconds = 120,
+        [AllowEmptyString()][string]$StdinText,
+        [hashtable]$EnvOverrides = @{}
     )
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $process = [Diagnostics.Process]::Start((New-ChildProcessStartInfo -FilePath $FilePath -ArgumentList $ArgumentList -WorkingDirectory $WorkingDirectory))
+    $process = [Diagnostics.Process]::Start((New-ChildProcessStartInfo -FilePath $FilePath -ArgumentList $ArgumentList -WorkingDirectory $WorkingDirectory -EnvOverrides $EnvOverrides))
     try {
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
-        $process.StandardInput.Close()
+        try {
+            if ($PSBoundParameters.ContainsKey('StdinText')) {
+                $stdinBytes = $script:Utf8NoBom.GetBytes($StdinText)
+                $process.StandardInput.BaseStream.Write($stdinBytes, 0, $stdinBytes.Length)
+            }
+            $process.StandardInput.Close()
+        } catch [System.IO.IOException] {
+            # the program stopped reading (an oversized input) and exited first: that is its answer, not a failure here
+        }
         $finished = $process.WaitForExit($TimeoutSeconds * 1000)
         if (-not $finished) { Stop-ChildProcess $process }
         # A grandchild that inherited the pipes can hold them open after the program has exited: take what arrived.
@@ -290,6 +310,39 @@ function Invoke-BuildScript {
 }
 
 # ----------------------------------------------------------------------------
+#  Git
+# ----------------------------------------------------------------------------
+# Runs git against a repository ("git -C <RepoRoot> <Arguments>", quote-path off so file names stay raw).
+# A missing git, a timeout or a non-zero exit is a three-part failure: What names the command and carries
+# its own output, Why and Fix are the caller's (what the result is needed for, and how to get it by hand).
+# -SoftFail is for a caller that has a fallback: any such problem returns $null instead of failing.
+function Invoke-Git {
+    [CmdletBinding(DefaultParameterSetName = 'Fail')]
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory, ParameterSetName = 'Fail')][string]$Why,
+        [Parameter(Mandatory, ParameterSetName = 'Fail')][string]$Fix,
+        [Parameter(Mandatory, ParameterSetName = 'Soft')][switch]$SoftFail,
+        [int]$TimeoutSeconds = 60
+    )
+    $git = Get-Command git -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $git) {
+        if ($SoftFail) { return $null }
+        Write-BuildFailure -What 'git was not found on the PATH.' -Why $Why -Fix "Install Git for Windows and open a new shell. $Fix"
+    }
+    $gitArguments = @('-c', 'core.quotePath=off', '-C', $RepoRoot) + $Arguments
+    if ($SoftFail) {
+        try { $result = Invoke-ChildProcess -FilePath $git.Source -TimeoutSeconds $TimeoutSeconds -ArgumentList $gitArguments } catch { return $null }
+        if ($result.TimedOut -or $result.ExitCode -ne 0) { return $null }
+        return $result
+    }
+    $result = Invoke-ChildProcess -FilePath $git.Source -TimeoutSeconds $TimeoutSeconds -ArgumentList $gitArguments
+    Assert-ChildOutcome -Result $result -Name "git $($Arguments -join ' ')" -TimeoutSeconds $TimeoutSeconds -Why $Why -Fix $Fix
+    return $result
+}
+
+# ----------------------------------------------------------------------------
 #  Files
 # ----------------------------------------------------------------------------
 # The names (relative to $Dir, forward slashes, ordinal order) of every file below a directory, empty
@@ -339,4 +392,4 @@ function Remove-BuildTempTree {
 Export-ModuleMember -Function Get-Utf8NoBomEncoding, Resolve-BuildPath, Write-BuildFailure, Get-ScriptFailureText,
     Read-Utf8Text, Read-JsonFile, Get-JsonProperty, Get-PropertyNames, Add-GitHubOutput, Remove-BuildTempTree,
     ConvertTo-ArgumentElement, New-ChildProcessStartInfo, Stop-ChildProcess, Invoke-ChildProcess,
-    Get-OutputExcerpt, Assert-ChildOutcome, Invoke-BuildScript, Get-RelativeFileList
+    Get-OutputExcerpt, Assert-ChildOutcome, Invoke-BuildScript, Invoke-Git, Get-RelativeFileList

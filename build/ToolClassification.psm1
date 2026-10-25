@@ -141,11 +141,11 @@ function Test-AuditRules {
     param($Audit, [string[]]$Allow, [string[]]$Prompt)
     foreach ($tool in (Get-PropertyNames $Audit)) {
         $entry = Get-JsonProperty $Audit $tool
-        $verdict = Get-JsonProperty $entry 'verdict'
+        $decision = Get-JsonProperty $entry 'decision'
         $reason = Get-JsonProperty $entry 'reason'
         $actualList = if ($Allow -ccontains $tool) { 'allow' } elseif ($Prompt -ccontains $tool) { 'prompt' } else { 'none' }
-        if ($verdict -cne $actualList) {
-            New-Violation $tool 'E_AUDIT_MISMATCH' "is audited as '$verdict' but is in the '$actualList' list"
+        if ($decision -cne $actualList) {
+            New-Violation $tool 'E_AUDIT_MISMATCH' "is audited as '$decision' but is in the '$actualList' list"
         }
         if ([string]::IsNullOrWhiteSpace($reason)) {
             New-Violation $tool 'E_AUDIT_NO_REASON' 'has an audit entry without a reason'
