@@ -57,3 +57,22 @@ registration and plugin files were hash-checked before and stayed untouched.
 - **Draft downloads (AC-18 measurement): still open.** Right after the rehearsal every asset reported
   `download_count` 0, including the two plugin installs and the public `latest` fetches, so GitHub's
   counter lags. Re-read the counts later before deciding `SUBTRACT_DRAFT_DOWNLOADS`.
+
+## Second round, after the backstop review fixes (2026-10-25)
+
+The fixes moved the draft creation, the publish decision and the rehearsal cleanup out of the
+YAML into tested scripts (`New-ReleaseDraft.ps1`, `Publish-Release.ps1`,
+`Remove-RehearsalRelease.ps1`), which until then had run only against a fake `gh`. The branch was
+merged into the fork branch and run again:
+
+| Step | Run | Result |
+|---|---|---|
+| `ci.yml` on push | (run of e900794) | Pass in 11 min. |
+| Dry run, no fault | 40190471705 | Pass: draft verified, then deleted by its own id; no tag left. |
+| Dry run, `corrupt-zip` | 40190667906 | Fails as intended at the listing check; nothing published; this run's draft deleted. |
+| Tag push `v1.9.2` | (run after the tag) | Pass: verified, published by id, marked latest (`v1.9.1` was latest before); no stray drafts. |
+
+Running the suites against the fork also exposed one test that called the real GitHub API: the
+`-Latest -Repo` argument row passed only because `Zuehlke/teststand-mcp` has no plugin archive yet,
+so CI would have turned red with the first release. It was removed
+(`test: no live GitHub call in the verifier argument checks`).
