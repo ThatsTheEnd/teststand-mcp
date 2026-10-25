@@ -49,7 +49,8 @@ agents/                         plugin flavour (mcp__plugin_teststand-mcp_testst
 hooks/
 skills/teststand-rules/
 VERSION.txt                     tag, version, commit, build time, run URL
-bin/TestStandMCP.exe            self-contained, single-file, win-x86
+bin/TestStandMCP.exe            self-contained FOLDER layout, win-x86: the exe, its runtimeconfig.json and the
+                                runtime beside it (about 400 files; docs/validation/self-contained-x86.md)
 bin/appsettings.json
 bin/scripts/                    doc/presentation generators + template (AppContext.BaseDirectory\scripts)
 bin/.claude/agents/             direct-registration flavour (mcp__teststand__*) + link-agents.bat
@@ -59,16 +60,19 @@ bin/CLAUDE.md                   the user rules of the skill, generated; no READM
 ### Constraints
 
 - **x86 only.** The TestStand engine COM server is 32-bit. Publish with `-r win-x86 --self-contained
-  -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:PublishTrimmed=false`.
-  The `Microsoft.WindowsDesktop.App` and `Microsoft.AspNetCore.App` framework references stay.
-- **Self-contained is unproven against the engine.** The engine loads .NET in-process and checks
-  the host's runtimeconfig. No GitHub runner has TestStand, so CI cannot prove that a
-  self-contained host works. Before the first plugin release, a person validates the published
-  exe on a TestStand station (see AC-2). If validation fails, the archive ships the
-  framework-dependent build at the same `bin/TestStandMCP.exe` path, and the README keeps the
-  .NET runtime prerequisite.
-- **The isolated prototype worker re-launches `Environment.ProcessPath`.** Single-file publishing
-  keeps that path valid. No change is expected, but AC-2 covers it.
+  true` into a folder (the FOLDER layout; no `PublishSingleFile`). The `Microsoft.WindowsDesktop.App` and
+  `Microsoft.AspNetCore.App` framework references stay.
+- **The layout is the folder layout, measured on a station.** The engine loads .NET in-process and
+  resolves the runtime from the host's `runtimeconfig.json`, so a layout without that file on disk is
+  not self-contained against the engine: the single-file exe passed the four flows only because the
+  engine fell back to the installed runtime. The folder layout ships the runtime and the runtimeconfig
+  beside the exe, and the loaded `coreclr.dll` is the bundled one. No GitHub runner has TestStand, so CI
+  cannot repeat that measurement; the record is
+  [docs/validation/self-contained-x86.md](../validation/self-contained-x86.md), and `-Layout` of
+  `build/Build-PluginArchive.ps1` still builds the other two layouts.
+- **The isolated prototype worker re-launches `Environment.ProcessPath`.** In the folder layout that
+  path is the apphost next to the runtime, and AC-2 flow 3 measured the relaunch (see
+  `docs/validation/self-contained-x86.md`).
 - **CI cannot run the integration tests.** All of `Test/TestExecution` needs a live engine. The
   pre-push hook (`.githooks/run-tests.ps1`) stays the test gate. CI gates on build, packaging
   assertions and executable smoke tests.
@@ -183,6 +187,10 @@ bin/CLAUDE.md                   the user rules of the skill, generated; no READM
 
   One retry, after a 30 s wait, is allowed only when the first attempt cannot download an asset
   (HTTP error or timeout). A hash, manifest, missing-asset or uploader failure is not retried.
+  The one exception is the check after publishing: `releases/latest` can serve the previous release
+  for a short while, so the comparison of the public latest download with the hash of the verified
+  archive (`-Latest -ExpectedArchiveSha256`) is tried up to six times, 15 seconds apart. That
+  propagation retry is the only retried hash comparison.
   CONTRIBUTING documents the rollback for a release that
   turns out bad after it was published: delete it, so `latest` falls back to the previous release,
   or cut `vX.Y.(Z+1)`. Deleting is safe only once an earlier workflow-built release exists, so the
@@ -259,7 +267,9 @@ bin/CLAUDE.md                   the user rules of the skill, generated; no READM
   patterns) run without a permission prompt, and the decision carries the reason "no TestStand file
   is modified". Every other `mcp__plugin_teststand-mcp_teststand__*` tool still prompts.
   - The allow-list contains only tools that modify no file, engine, station or execution state and
-    start no child process.
+    start no child process. An allow-listed tool may still connect the engine lazily on its first
+    call (`EnsureConnected`): that starts the engine in the server process and can take seconds,
+    but it changes no file or station state, so it does not count as a modification.
   - It excludes `evaluate_expression` and `evaluate_in_thread_context`, because an expression can
     assign.
   - It excludes the analyzer, `diff_sequence_files` and `compare_sequence_files`, because they spawn
@@ -336,14 +346,17 @@ bin/CLAUDE.md                   the user rules of the skill, generated; no READM
   - a check: ask Claude to call `get_engine_paths`, and `environmentActive` must be true;
   - the per-session alternative `connect_engine(tsenv_path=…)`.
 
-  It states that edits to the plugin's own `bin/appsettings.json` are lost on update. The AC-2 spike
-  confirmed that Claude Code `userConfig` can feed the server's environment. The plugin's
-  `tsenv_path` therefore goes to its own variable `TestStand:PluginEnvironmentPath`, which wins over
-  `TestStand:EnvironmentPath` only when it is non-blank and not an unexpanded `${…}` placeholder. A
-  machine-wide setting therefore survives a plugin install with the field left empty. The README
-  shows `userConfig` as the plugin route and keeps `setx` as the machine-wide alternative. If the `environmentActive` check
-  could not be run because no `.tsenv` station was available, the README marks the route
-  "unverified" and the PR records it. That is an accepted outcome for this criterion.
+  It states that edits to the plugin's own `bin/appsettings.json` are lost on update. The `userConfig`
+  route is **unverified**: the documentation says `${user_config.KEY}` is substituted in the server's
+  environment (`claude-code-plugin-facts.md`, fact 8), but no run has observed a filled-in value reach
+  the server. The fork install (`docs/validation/fork-rehearsal.md`) only showed the prompt for the
+  unset option ("1 userConfig option not yet set"). The README says so. The plugin's `tsenv_path`
+  goes to its own variable `TestStand:PluginEnvironmentPath`, which wins over `TestStand:EnvironmentPath`
+  only when it is non-blank and not an unexpanded `${…}` placeholder. A machine-wide setting therefore
+  survives a plugin install with the field left empty, whichever way Claude Code treats the unset
+  option. The README shows `userConfig` as the plugin route (marked "unverified") and keeps `setx` as
+  the machine-wide alternative that has been observed to work. The `environmentActive` check settles
+  it on a `.tsenv` station; until then "unverified" is an accepted outcome for this criterion.
 
 ### Stats
 
@@ -410,9 +423,9 @@ bin/CLAUDE.md                   the user rules of the skill, generated; no READM
 |------|------------|--------|--------|
 | Plugin archive | `teststand-mcp.zip`, the release asset that is the plugin's whole install payload | `verified` | labview-mcp `release.yml`; user request |
 | Marketplace | The `zuehlke-teststand` catalogue in `.claude-plugin/marketplace.json` that Claude Code adds by repo name | `unverified` | named by analogy with `zuehlke-labview` |
-| Hand-cut release | A release whose asset was uploaded by a person, not `github-actions[bot]` | `verified` | `gh api` on v1.8.6 (uploader `JCMengisen`) |
+| Hand-cut release | A release whose asset was uploaded by a person, not `github-actions[bot]` | `verified` | `gh api` on v1.8.6 (uploader: a maintainer account) |
 | Plugin flavour / direct flavour | Agent files whose tool names use the plugin prefix (generated while staging) vs. the `mcp__teststand__` prefix (the committed source) | `unverified` | labview-mcp `Sync-PluginAgents.ps1`; plan review |
-| Self-contained build | Single-file win-x86 exe bundling the .NET runtime and both required shared frameworks | `verified` | human choice (packaging question) |
+| Self-contained build | win-x86 exe in the FOLDER layout: the exe, its `runtimeconfig.json` and the .NET runtime with both required shared frameworks beside it | `verified` | station measurement, `docs/validation/self-contained-x86.md` |
 
 ## Ambiguity Log
 
