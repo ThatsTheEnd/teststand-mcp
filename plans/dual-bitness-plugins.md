@@ -2,7 +2,7 @@
 
 **Created**: 2026-10-25
 **Branch**: claude/mcp-installation-workflow-88cdb4
-**Status**: draft
+**Status**: approved
 **Gherkin persistence**: plan-file-only
 **Spec**: [docs/specs/dual-bitness-plugins.md](../docs/specs/dual-bitness-plugins.md)
 **Builds on**: [plugin-install-and-release-workflow.md](plugin-install-and-release-workflow.md) (slices 0–10 built, PR A not pushed)

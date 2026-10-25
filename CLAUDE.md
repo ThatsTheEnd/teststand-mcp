@@ -153,7 +153,8 @@ Never cut: validation at trust boundaries, error handling that prevents data los
   `taskkill //F //IM TestStandMCP.exe` + `dotnet build --configuration Debug --framework net8.0-windows -p:Platform=x86`
   (Target framework is **net8.0-windows / x86**. The TestStand engine requires the host's
   runtimeconfig to declare `Microsoft.WindowsDesktop.App` + `Microsoft.AspNetCore.App` — both
-  are wired via `FrameworkReference` in the .csproj. Output: `bin\x86\Debug\net8.0-windows\`.)
+  are wired via `FrameworkReference` in the .csproj. Output: `bin\x86\Debug\net8.0-windows\`.
+  For 64-bit TestStand build with `-p:Platform=x64`; output `bin\x64\Debug\net8.0-windows\`.)
 - **New tool NAMES, enum values and optional params need a FRESH MCP session.** The client caches
   the tool catalog and argument schema at session start and rejects the new values with
   `invalid_enum_value` until then. This applies to every batch below.
